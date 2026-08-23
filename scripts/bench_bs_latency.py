@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark end-to-end BS latency (UDP ingest → TX send) across configurations.
 
-Requires root (for isolate_cpus.bash) and a connected USRP.
+Requires root for `isolate_cpus.bash` and a running ChannelSimulator session.
 
 Usage:
     sudo python3 scripts/bench_bs_latency.py --mod-config scripts/bench_bs_latency_template.yaml
@@ -118,8 +118,8 @@ def _find_base_config() -> dict:
     candidates = [
         Path("scripts/bench_bs_latency_template.yaml"),
         Path("build/BS.yaml"),
-        Path("config/BS_X310.yaml"),
-        Path("config/BS_B210.yaml"),
+        Path("config/BS_Sim.yaml"),
+        Path("config/BS_Sim_Duplex.yaml"),
     ]
     for p in candidates:
         if p.exists():

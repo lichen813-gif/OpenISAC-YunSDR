@@ -7,8 +7,9 @@ run_dir="${OPENISAC_RUN_DIR:-/work/build}"
 usage() {
     cat <<'EOF'
 Usage:
-  openisac-run BS [x310|b210] [extra args...]
-  openisac-run UE [x310|b210] [extra args...]
+  openisac-run ChannelSimulator [sim|sim_duplex|sim_ertm|sim_resourcemap]
+  openisac-run BS [sim|sim_duplex|sim_ertm|sim_resourcemap] [extra args...]
+  openisac-run UE [sim|sim_duplex|sim_ertm|sim_resourcemap] [extra args...]
   openisac-run bash
 
 Environment:
@@ -27,6 +28,11 @@ target="$1"
 shift || true
 
 case "$target" in
+    simulator|ChannelSimulator)
+        binary="${app_home}/bin/ChannelSimulator"
+        runtime_yaml="BS.yaml"
+        preset_prefix="BS"
+        ;;
     bs|BS)
         binary="${app_home}/bin/BS"
         runtime_yaml="BS.yaml"
@@ -42,15 +48,20 @@ case "$target" in
         ;;
 esac
 
-profile="${1:-${OPENISAC_PROFILE:-x310}}"
-if [[ "$profile" == "x310" || "$profile" == "X310" || "$profile" == "b210" || "$profile" == "B210" ]]; then
+profile="${1:-${OPENISAC_PROFILE:-sim}}"
+consume_profile=0
+case "$(printf '%s' "$profile" | tr '[:upper:]' '[:lower:]')" in
+    sim) profile_suffix="Sim"; consume_profile=1 ;;
+    sim_duplex) profile_suffix="Sim_Duplex"; consume_profile=1 ;;
+    sim_ertm) profile_suffix="Sim_eRTM"; consume_profile=1 ;;
+    sim_resourcemap) profile_suffix="Sim_ResourceMap"; consume_profile=1 ;;
+    *) profile="${OPENISAC_PROFILE:-sim}"; profile_suffix="Sim" ;;
+esac
+if [[ $consume_profile -eq 1 && $# -gt 0 ]]; then
     shift || true
-else
-    profile="${OPENISAC_PROFILE:-x310}"
 fi
 
-profile_upper="$(printf '%s' "$profile" | tr '[:lower:]' '[:upper:]')"
-default_config="${app_home}/config/${preset_prefix}_${profile_upper}.yaml"
+default_config="${app_home}/config/${preset_prefix}_${profile_suffix}.yaml"
 source_config="${OPENISAC_CONFIG:-$default_config}"
 
 if [[ ! -x "$binary" ]]; then

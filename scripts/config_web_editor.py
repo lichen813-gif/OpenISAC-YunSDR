@@ -958,7 +958,7 @@ def tab_side(name: str) -> str:
 
 
 def configured_cpu_values(data: dict[str, Any], side: str = "bs") -> list[int]:
-    """Return default isolate cores: USRP TX/RX + main (+ BS sensing RX).
+    """Return default isolate cores: radio TX/RX + main (+ BS sensing RX).
 
     OFDM mod/demod, LDPC, UDP, sensing processing, and workers are omitted so
     only the most scheduling-sensitive threads get reserved cores.
@@ -1110,7 +1110,7 @@ def build_cpu_plan(
         "process_cpu_spec": format_cpu_spec(process),
         "assignments": assignments,
         "notes": [
-            "Isolated CPUs: most sensitive threads only (USRP TX/RX, main; BS sensing RX).",
+            "Isolated CPUs: most sensitive threads only (radio TX/RX, main; BS sensing RX).",
             "Bound CPUs: all non-negative YAML thread affinities.",
             "Process AllowedCPUs: all host logical CPUs (nproc --all) when isolation is enabled.",
         ],
@@ -1258,34 +1258,26 @@ def default_sensing_channel_item(
     data: dict[str, Any],
     index: int,
     base_item: dict[str, Any] | None = None,
-    preserve_usrp_channel: bool = False,
+    preserve_stream_channel: bool = False,
 ) -> dict[str, Any]:
     base = base_item if isinstance(base_item, dict) else {}
     fallback_item = {
-        "usrp_channel": 1,
-        "device_args": "",
-        "clock_source": "",
-        "time_source": "",
+        "stream_channel": 0,
         "wire_format": "",
         "rx_gain": 30,
         "alignment": 63,
-        "rx_antenna": "RX2",
         "enable_system_delay_estimation": False,
         "rx_cpu_core": -1,
         "processing_cpu_core": -1,
     }
-    base_usrp_channel = int_or_default(base.get("usrp_channel"), fallback_item["usrp_channel"])
-    usrp_channel = base_usrp_channel if preserve_usrp_channel else base_usrp_channel + index
+    base_stream_channel = int_or_default(base.get("stream_channel"), fallback_item["stream_channel"])
+    stream_channel = base_stream_channel if preserve_stream_channel else base_stream_channel + index
 
     return {
-        "usrp_channel": usrp_channel,
-        "device_args": str(base.get("device_args", fallback_item["device_args"])),
-        "clock_source": str(base.get("clock_source", fallback_item["clock_source"])),
-        "time_source": str(base.get("time_source", fallback_item["time_source"])),
+        "stream_channel": stream_channel,
         "wire_format": str(base.get("wire_format", fallback_item["wire_format"])),
         "rx_gain": int_or_default(base.get("rx_gain"), fallback_item["rx_gain"]),
         "alignment": int_or_default(base.get("alignment"), fallback_item["alignment"]),
-        "rx_antenna": str(base.get("rx_antenna", fallback_item["rx_antenna"])),
         "enable_system_delay_estimation": bool(base.get(
             "enable_system_delay_estimation",
             fallback_item["enable_system_delay_estimation"],
@@ -1530,7 +1522,7 @@ def normalized_sensing_channel_items(data: dict[str, Any], items: list[Any]) -> 
                 data,
                 index,
                 dict_items[index],
-                preserve_usrp_channel=True,
+                preserve_stream_channel=True,
             ))
             continue
         normalized.append(default_sensing_channel_item(data, index, base_item))
@@ -1623,7 +1615,7 @@ def build_form_payload(tab_name: str, data: dict[str, Any], layout: list[dict[st
                         data,
                         0,
                         base_item,
-                        preserve_usrp_channel=True,
+                        preserve_stream_channel=True,
                     )
                 if key == "data_resource_blocks":
                     field_payload["default_item"] = default_data_resource_block_item(data)
@@ -1778,7 +1770,7 @@ def render_yaml(tab_name: str, layout: list[dict[str, Any]], data: dict[str, Any
                     if field.get("optional") and not value:
                         continue
                 elif field["type"] == "simulation_mapping":
-                    if data.get("radio.radio_backend", data.get("radio_backend", "uhd")) != "sim":
+                    if data.get("radio.radio_backend", data.get("radio_backend", "sim")) != "sim":
                         continue
                     value = schema_mapping_value(field, value, include_extra=True, enabled_data=data)
                 elif field["type"] == "logging_mapping":
@@ -2099,7 +2091,7 @@ class ProcessController:
             if not isolated_spec:
                 raise RuntimeError(
                     "CPU isolation is enabled but no sensitive cores were found. "
-                    "Set main / USRP TX/RX cores in YAML, or override the isolate list."
+                    "Set main / radio TX/RX cores in YAML, or override the isolate list."
                 )
             self._run_checked(
                 [str(self._isolate_script), isolated_spec],
@@ -2254,8 +2246,8 @@ class ConfigEditorApp:
                     {"label": "CUDA BS", "command": "./CUDABS"},
                 ),
                 sample_candidates=(
-                    repo_root / "config" / "BS_X310.yaml",
-                    repo_root / "config" / "BS_B210.yaml",
+                    repo_root / "config" / "BS_Sim.yaml",
+                    repo_root / "config" / "BS_Sim_Duplex.yaml",
                 ),
             ),
             "ue": TabConfig(
@@ -2269,8 +2261,8 @@ class ConfigEditorApp:
                     {"label": "CUDA UE", "command": "./CUDAUE"},
                 ),
                 sample_candidates=(
-                    repo_root / "config" / "UE_X310.yaml",
-                    repo_root / "config" / "UE_B210.yaml",
+                    repo_root / "config" / "UE_Sim.yaml",
+                    repo_root / "config" / "UE_Sim_Duplex.yaml",
                 ),
             ),
         }
@@ -2683,12 +2675,12 @@ def standardize_config_templates(repo_root: Path) -> list[Path]:
     rewritten: list[Path] = []
     sample_candidates_by_tab = {
         "bs": (
-            config_dir / "BS_X310.yaml",
-            config_dir / "BS_B210.yaml",
+            config_dir / "BS_Sim.yaml",
+            config_dir / "BS_Sim_Duplex.yaml",
         ),
         "ue": (
-            config_dir / "UE_X310.yaml",
-            config_dir / "UE_B210.yaml",
+            config_dir / "UE_Sim.yaml",
+            config_dir / "UE_Sim_Duplex.yaml",
         ),
     }
     for path in sorted(config_dir.glob("*.yaml")):
@@ -2706,9 +2698,6 @@ def standardize_config_templates(repo_root: Path) -> list[Path]:
         if tab_name == "bs":
             data.setdefault("uplink.rx_channel", 0)
             data.setdefault("uplink.rx_wire_format", "sc16")
-            data.setdefault("uplink.rx_device_args", "")
-            data.setdefault("uplink.rx_clock_source", "")
-            data.setdefault("uplink.rx_time_source", "")
             data.setdefault("sensing.rx_wire_format", "sc16")
         if tab_name == "ue":
             data.setdefault("downlink.rx_wire_format", "sc16")

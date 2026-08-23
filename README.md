@@ -6,113 +6,138 @@
   </picture>
 </p>
 
-# OpenISAC
+# OpenISAC-YunSDR: build and usage guide
 
-[中文版本](README_zh.md) | [Changelog](CHANGELOG.md)
+[中文说明](README_zh.md) | [Design documents](docs/design/README.md) | [Changelog](CHANGELOG.md)
 
-OpenISAC is a real-time OFDM platform for integrated sensing and communication (ISAC), built for academic experiments and rapid PHY iteration.
+This repository contains the complete C++/Python source, configurations, and design documents for the first release. Video files are intentionally excluded.
 
-It is designed for the common gap between simulation code and full standard stacks: simple enough to modify quickly, but complete enough to run over the air with USRP hardware.
+> Current backend status: this revision is simulation-only. The previous UHD/USRP implementation, build dependency, and hardware presets have been removed. `RadioBackend` remains as a vendor-neutral boundary for future `libyunsdr` integration; concrete `libyunsdr` API names and configuration will be documented only after that backend is implemented and tested.
 
-If your goal is "idea -> OTA experiment" with a minimal and readable codebase, this repository is a good fit. If you need Wi-Fi/5G NR interoperability or a production-grade protocol stack, it is not.
+## Components
 
-## Highlights
+| Component | Entry point | Purpose |
+| --- | --- | --- |
+| Channel model | `ChannelSimulator` | Shared-memory communication, sensing, noise, CFO/SRO, delay, and target simulation |
+| Base station | `BS` | OFDM downlink, optional uplink receiver, monostatic sensing, UDP/ZMQ I/O |
+| User equipment | `UE` | Downlink synchronization/demodulation, optional uplink transmitter, bistatic sensing |
+| Runtime tools | `scripts/` | Sensing plots, diagnostics, configuration and control tools |
+| Formal PHY | `cpp_phy/`, `python_phy/` | Cross-language frame, MIMO, modulation, LDPC, and regression validation |
 
-- Real-time OFDM communication plus monostatic and bistatic sensing
-- Over-the-air synchronization support for bistatic experiments
-- C++ backend for the radio path and Python frontend tools for visualization
-- YAML-based runtime configuration with sample presets for X310/B210, adaptable to other UHD-supported USRPs
-- Included utilities for CPU isolation, plotting, web-based config editing, and process control
+## Requirements
 
-## At a Glance
+The main real-time programs target a C++17 Linux environment. Required libraries are Boost 1.66+, OpenMP, AFF3CT 3.0.2+, FFTW3f (including `fftw3f_threads`), yaml-cpp, libzmq, and cppzmq. DPDK is optional.
 
-| Component | Main entry points | Purpose |
-| :--- | :--- | :--- |
-| BS backend | `BS`, `config/BS_*.yaml` | Transmit OFDM frames, ingest UDP payloads, and output monostatic sensing data |
-| UE backend | `UE`, `config/UE_*.yaml` | Receive and decode frames, output payload data, and run bistatic sensing |
-| Frontend tools | `scripts/plot_*.py`, `scripts/config_web_editor.py` | Visualize sensing/channel results and edit runtime configs |
+For Ubuntu/Debian, install the packaged dependencies first:
 
-## Quick Navigation
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake pkg-config \
+  libboost-all-dev libfftw3-dev libyaml-cpp-dev \
+  libzmq3-dev cppzmq-dev nlohmann-json3-dev python3-venv
+```
 
-- Documentation: [English manual](https://openisac.zzw123app.top/docs/) and [Chinese manual](https://openisac.zzw123app.top/zh-cn/docs/)
-- Setup and installation: [Hardware](https://openisac.zzw123app.top/docs/getting-started/hardware/), [Installation](https://openisac.zzw123app.top/docs/getting-started/installation/), [Build](https://openisac.zzw123app.top/docs/getting-started/build/)
-- First end-to-end run: [First OTA Run](https://openisac.zzw123app.top/docs/getting-started/first-ota-run/)
-- Runtime configuration: [BS YAML Reference](https://openisac.zzw123app.top/docs/reference/bs-yaml/) and [UE YAML Reference](https://openisac.zzw123app.top/docs/reference/ue-yaml/)
-- USRP-free simulation: [Channel Simulator](https://openisac.zzw123app.top/docs/tools-workflows/channel-simulator/)
-- Web control UI: [Web Config Console](https://openisac.zzw123app.top/docs/tools-workflows/web-config-console/)
-- Design documents: [Design documentation index](docs/design/README.md)
-- Recent updates: [Changelog](CHANGELOG.md)
+Install AFF3CT 3.0.2 or newer separately and remember its installation prefix. No UHD package is required.
 
-## Repository Layout
+## Build
 
-| Path | Description |
-| :--- | :--- |
-| `src/`, `include/` | Core C++ PHY, sensing, threading, and runtime logic |
-| `config/` | Sample YAML presets for different roles, including X310/B210 examples that can be adapted to other USRPs |
-| `scripts/` | Python frontends, web config console, and Linux performance helpers |
-| `capture/` | Offline plotting helpers for saved sensing results |
-| `docs/` | Static project site and architecture/signal-processing pages |
+```bash
+git clone https://github.com/lichen813-gif/OpenISAC-YunSDR.git
+cd OpenISAC-YunSDR
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAFF3CT_ROOT=/path/to/aff3ct/prefix
+cmake --build build -j"$(nproc)"
+```
 
-## What it is - and what it is not
+If AFF3CT is installed in a standard prefix, omit `-DAFF3CT_ROOT`. The primary outputs are `build/ChannelSimulator`, `build/BS`, and `build/UE`.
 
-### What OpenISAC is
+Python tools use:
 
-- A minimal OFDM-based PHY for joint communication and sensing research
-- Designed for prototyping, academic experiments, and rapid algorithm validation
-- Focused on readability and modification speed rather than full-stack completeness
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
-### What OpenISAC is not
+## First simulation run
 
-- A standard-compliant implementation; it does not aim to match Wi-Fi or 5G NR
-- A replacement for full-stack systems such as openwifi or OpenAirInterface
-- A production-ready communications stack
+Use a matched BS/UE preset. From the repository root:
 
-### When to use it
+```bash
+cp config/BS_Sim.yaml build/BS.yaml
+cp config/UE_Sim.yaml build/UE.yaml
+```
 
-- Prototyping new OFDM/ISAC algorithms
-- Rapidly validating PHY, synchronization, or sensing ideas over the air
-- Research setups where interoperability is not required
+Open three terminals in `build/` and start them in this order:
 
-### When not to use it
+```bash
+# terminal 1
+./ChannelSimulator BS.yaml
 
-- Building a Wi-Fi/NR-compatible system
-- Requiring full MAC/stack behavior, interoperability, or certification-oriented behavior
+# terminal 2
+./BS BS.yaml
 
-## Citation
+# terminal 3
+./UE UE.yaml
+```
 
-If you find this repository useful, please cite our paper:
+The simulator must start first because BS and UE attach to its shared-memory session. For uplink/duplex or eRTM tests, use the matching pairs `BS_Sim_Duplex.yaml` + `UE_Sim_Duplex.yaml` or `BS_Sim_eRTM.yaml` + `UE_Sim_eRTM.yaml`. Resource-map examples are also paired by name.
 
-> Z. Zhou, C. Zhang, X. Xu, and Y. Zeng, "OpenISAC: An Open-Source Real-Time Experimentation Platform for OFDM-ISAC with Over-the-Air Synchronization," *arXiv preprint* arXiv:2601.03535, Jan. 2026.
->
-> [[arXiv](https://arxiv.org/pdf/2601.03535)]
+From the repository root, visualization examples include:
 
-## Authors
+```bash
+python scripts/plot_sensing_fast.py
+python scripts/plot_bi_sensing_fast.py
+```
 
-- Zhiwen Zhou (zhiwen_zhou@seu.edu.cn)
-- Chaoyue Zhang (chaoyue_zhang@seu.edu.cn)
-- Xiaoli Xu (Member, IEEE) (xiaolixu@seu.edu.cn)
-- Yong Zeng (Fellow, IEEE) (yong_zeng@seu.edu.cn)
+## Runtime PHY parameters
 
-## Affiliation
+The main `BS`/`UE` frame is controlled by YAML. Any TX/RX structural field must match on both sides.
 
-<img src="docs/images/SEUlogo.png" height="80" alt="SEU Logo" style="border:none; box-shadow:none;"> &nbsp;&nbsp; <img src="docs/images/PML.png" height="80" alt="PML Logo" style="border:none; box-shadow:none;">
+| YAML section | Adjustable fields | Notes |
+| --- | --- | --- |
+| `rf_sampling` | `sample_rate`, `bandwidth` | Determines sample clock and occupied bandwidth |
+| `ofdm_frame` | `fft_size`, `cp_length`, `num_symbols`, `sync_pos` | Basic OFDM frame structure |
+| `ofdm_frame` | `enable_sec_sync_symbol`, `enable_cfo_training_sequence`, `cfo_training_period_samples` | Synchronization/CFO training layout |
+| `ofdm_frame` | `zc_root`, `pilot_positions`, `midframe_pilot_symbols`, `midframe_pilot_seed` | Preamble and pilot layout |
+| `downlink` | `center_freq`, `modulation` | Modulation: `qpsk`, `16qam`, `64qam`, or `256qam` |
+| `uplink` | duplex enable/mode, `symbol_start`, `symbol_count`, `guard_symbols` | Selects TDD/FDD behavior and the TDD UL window in duplex presets |
+| `sensing` | `rx_channel_count`, `range_fft_size`, `doppler_fft_size`, `symbol_stride`, `output_mode` | Sensing array and processing dimensions |
+| `simulation` | `target_snr_db`, `noise_power_dbfs`, `cfo_hz`, `sample_rate_offset_ppm`, `timing_offset_samples` | Link impairment controls |
+| `simulation` | `comm_multipath_taps`, `targets`, `bistatic_targets`, array spacing | Multipath and sensing scene |
 
-**Yong Zeng Group at the National Mobile Communications Research Laboratory, Southeast University and the Purple Mountain Laboratories**
+Configuration rules:
 
-## Community
+- Keep BS and UE `sample_rate`, FFT/CP, frame-symbol count, synchronization layout, ZC root, pilot layout/seed, modulation, and duplex window identical.
+- Every pilot or synchronization index must lie inside the configured FFT/frame; `sensing_symbol_num` must not exceed `num_symbols`.
+- For TDD, `symbol_start + symbol_count` must not exceed `num_symbols`, and guard symbols consume part of the uplink window.
+- Set CP longer than the largest channel delay that must remain free of inter-symbol interference.
+- Use the same `simulation.session` for ChannelSimulator, BS, and UE. Do not reuse UDP/ZMQ ports across concurrent sessions.
 
-- [Join our QQ Group](https://qm.qq.com/q/NIQRNGb0kY)
-- [Bilibili Channel (Yong Zeng Group)](https://space.bilibili.com/627920129)
-- WeChat Official Account:
+The sample files in [`config/`](config/) are the authoritative runnable examples and contain field-level comments.
 
-  <img src="docs/images/WeChat.jpg" width="150" alt="WeChat QR Code">
+## Formal C++/Python PHY profile
 
-## Paid Services and Companion Hardware
+The standalone `cpp_phy` compatibility profile is intentionally stricter than the runtime YAML frame. Its validated structure is FFT 1024, CP 128, one ZC symbol plus two data symbols, 128 control RE, two physical transmit ports, and LDPC(1008,504). Rank 1/2 and QPSK/16/64/256-QAM are selectable. The user payload capacities are:
 
-For users who need higher real-time processing performance or a more complete experimental setup, we also plan to offer:
+| Rank | QPSK | 16-QAM | 64-QAM | 256-QAM |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 124 B | 250 B | 439 B | 565 B |
+| 2 | 250 B | 565 B | 880 B | 1195 B |
 
-- A CUDA-accelerated version of OpenISAC
-- A USB-controlled OCXO for clock calibration and frequency control
-- The SoftHertz phased-array controller for phased-array experiments and system integration
+In this formal path, FFT size and the 128-control-RE layout are compatibility constants, not runtime knobs. Changing them requires coordinated C++/Python implementation and test-vector updates. See [formal frame structure and usage](Windows_C++_PHY正式帧结构与使用说明.md), [C++ PHY guide](cpp_phy/README.md), and [Python PHY guide](python_phy/README.md).
 
-For inquiries about the GPU-accelerated version, hardware, system integration, or customization, please email [zhiwen_zhou@seu.edu.cn](mailto:zhiwen_zhou@seu.edu.cn) or [yong_zeng@seu.edu.cn](mailto:yong_zeng@seu.edu.cn), or contact us via WeChat at `wxid_9hvmm83maklc22`.
+## libyunsdr integration status
+
+There is currently no `libyunsdr` source, SDK dependency, device configuration, or claimed API compatibility in this repository. A later hardware release should implement the existing stream/device boundary against the verified SDK, add hardware presets, and update this guide with real initialization, clocking, streaming, error handling, and test results. See [the current PHY and libyunsdr roadmap](最新物理层感知验证与libyunsdr路线.md).
+
+## Tests
+
+```bash
+python -m pytest python_phy/tests -q
+```
+
+The C++ formal PHY has Windows helper scripts in `cpp_phy/`, including `build_windows_vs2019.cmd` and `run_cpp_tests.cmd`.
+
+## License and upstream reference
+
+This repository retains the applicable [license](LICENSE). The earlier open-source project description, authorship, community, and service information are not reproduced on this homepage; refer to the [original OpenISAC repository](https://github.com/zhouzhiwen2000/OpenISAC) and the [OpenISAC paper (arXiv:2601.03535)](https://arxiv.org/abs/2601.03535) for the original project and citation information.

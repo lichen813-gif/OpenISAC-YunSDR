@@ -156,90 +156,13 @@ const APP = window.__APP_STATE__;
       return String(field?.value_text ?? field?.value ?? '').trim().toLowerCase();
     }
 
-    const SIM_HARDWARE_SECTION_TITLES = new Set([
-      'USRP Device Args',
-      'Clock / Time Sources',
-      'Wire Format',
-      'USRP Device / Link',
-    ]);
-
-    const SIM_HARDWARE_FIELD_KEYS = new Set([
-      'device_args',
-      'clock_source',
-      'time_source',
-      'wire_format_tx',
-      'uplink.rx_wire_format',
-      'sensing.rx_wire_format',
-      'sensing.rx_device_args',
-      'sensing.rx_clock_source',
-      'sensing.rx_time_source',
-      'downlink.rx_wire_format',
-      'tx_gain',
-      'tx_channel',
-      'tx_device_args',
-      'tx_clock_source',
-      'tx_time_source',
-      'rx_gain',
-      'rx_device_args',
-      'rx_clock_source',
-      'rx_time_source',
-      'rx_channel',
-      'uplink.rx_channel',
-      'uplink.rx_device_args',
-      'uplink.rx_clock_source',
-      'uplink.rx_time_source',
-      'rx_agc_enable',
-      'rx_agc_low_threshold_db',
-      'rx_agc_high_threshold_db',
-      'rx_agc_max_step_db',
-      'rx_agc_update_frames',
-      'hardware_sync',
-      'hardware_sync_tty',
-      'ocxo_pi_kp_fast',
-      'ocxo_pi_ki_fast',
-      'ocxo_pi_kp_slow',
-      'ocxo_pi_ki_slow',
-      'ocxo_pi_switch_abs_error_ppm',
-      'ocxo_pi_switch_hold_s',
-      'ocxo_pi_max_step_fast_ppm',
-      'ocxo_pi_max_step_slow_ppm',
-      'akf_enable',
-      'akf_bootstrap_frames',
-      'akf_innovation_window',
-      'akf_max_lag',
-      'akf_adapt_interval',
-      'akf_gate_sigma',
-      'akf_tikhonov_lambda',
-      'akf_update_smooth',
-      'akf_q_wf_min',
-      'akf_q_wf_max',
-      'akf_q_rw_min',
-      'akf_q_rw_max',
-      'akf_r_min',
-      'akf_r_max',
-    ]);
-
-    const SIM_HARDWARE_MAPPING_ITEM_KEYS = new Set([
-      'device_args',
-      'clock_source',
-      'time_source',
-      'wire_format',
-      'rx_gain',
-      'rx_antenna',
-    ]);
-
-    function shouldHideFieldInSim(section, field, showSimulation) {
-      if (!showSimulation) return false;
-      if (field.type === 'simulation_mapping') return false;
-      if (SIM_HARDWARE_SECTION_TITLES.has(section.title)) return true;
-      return SIM_HARDWARE_FIELD_KEYS.has(field.key);
+    function shouldHideFieldInSim(_section, _field, _showSimulation) {
+      return false;
     }
 
     function visibleMappingItemFields(field, showSimulation) {
       const itemFields = Array.isArray(field.item_fields) ? field.item_fields : [];
-      if (!showSimulation) return itemFields;
-      if (field.key !== 'sensing.rx_channels') return itemFields;
-      return itemFields.filter((sub) => !SIM_HARDWARE_MAPPING_ITEM_KEYS.has(sub.key));
+      return itemFields;
     }
 
     // self_channel_* / self_scan_* live in Network but stay gated by the
@@ -284,9 +207,6 @@ const APP = window.__APP_STATE__;
       wire_format_tx: (model) => !fieldIsInSection(model, 'wire_format_tx', 'Uplink') || fieldBoolValue(model, 'uplink.enabled', false),
       'uplink.rx_channel': (model) => fieldBoolValue(model, 'uplink.enabled', false),
       'uplink.rx_wire_format': (model) => fieldBoolValue(model, 'uplink.enabled', false),
-      'uplink.rx_device_args': (model) => fieldBoolValue(model, 'uplink.enabled', false),
-      'uplink.rx_clock_source': (model) => fieldBoolValue(model, 'uplink.enabled', false),
-      'uplink.rx_time_source': (model) => fieldBoolValue(model, 'uplink.enabled', false),
       bs_dl_ul_timing_diff: (model) => fieldBoolValue(model, 'uplink.enabled', false),
       ue_timing_advance: (model) => fieldBoolValue(model, 'uplink.enabled', false),
       uplink_cpu_cores: (model) => fieldBoolValue(model, 'uplink.enabled', false),
@@ -564,15 +484,15 @@ const APP = window.__APP_STATE__;
       const side = tab === 'ue' ? 'ue' : 'bs';
 
       if (side === 'bs') {
-        pushRole(downlink[0], 'bs.tx_proc (USRP TX)');
-        pushRole(uplink[0], 'bs.rx_ingest (USRP RX)');
+        pushRole(downlink[0], 'bs.tx_proc (radio TX)');
+        pushRole(uplink[0], 'bs.rx_ingest (radio RX)');
         const sensingField = findField(model, 'sensing.rx_channels');
         (sensingField?.items || []).forEach((item, idx) => {
-          pushRole(parseCpuScalar(item.rx_cpu_core), `bs.sensing_rx[${idx}] (USRP RX)`);
+          pushRole(parseCpuScalar(item.rx_cpu_core), `bs.sensing_rx[${idx}] (radio RX)`);
         });
       } else {
-        pushRole(downlink[0], 'ue.rx_proc (USRP RX)');
-        pushRole(uplink[2], 'ue.tx_send (USRP TX)');
+        pushRole(downlink[0], 'ue.rx_proc (radio RX)');
+        pushRole(uplink[2], 'ue.tx_send (radio TX)');
       }
       const mainField = findField(model, 'main_cpu_core');
       if (mainField) {
@@ -1615,9 +1535,9 @@ const APP = window.__APP_STATE__;
           item[sub.key] = sub.kind === 'bool' ? false : '';
         }
       }
-      if (Object.prototype.hasOwnProperty.call(item, 'usrp_channel')) {
-        const baseChannel = parseIntOrNull(baseSource.usrp_channel);
-        item.usrp_channel = baseChannel === null ? index : baseChannel + index;
+      if (Object.prototype.hasOwnProperty.call(item, 'stream_channel')) {
+        const baseChannel = parseIntOrNull(baseSource.stream_channel);
+        item.stream_channel = baseChannel === null ? index : baseChannel + index;
       }
       return item;
     }
@@ -2853,12 +2773,9 @@ const APP = window.__APP_STATE__;
           rx_gain: 8,
           'uplink.rx_channel': 9,
           'uplink.rx_wire_format': 10,
-          'uplink.rx_device_args': 11,
-          'uplink.rx_clock_source': 12,
-          'uplink.rx_time_source': 13,
-          bs_dl_ul_timing_diff: 14,
-          ue_timing_advance: 15,
-          uplink_cpu_cores: 16,
+          bs_dl_ul_timing_diff: 11,
+          ue_timing_advance: 12,
+          uplink_cpu_cores: 13,
           data_resource_blocks: 0,
           'sensing.mask_blocks': 1,
         };

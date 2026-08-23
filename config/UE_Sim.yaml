@@ -1,6 +1,6 @@
 # ===== Radio backend =====
 radio:
-  radio_backend: sim  # Radio I/O backend; uhd = real USRP, sim = channel simulator
+  radio_backend: sim  # Current release supports the channel simulator backend only
 
 # ===== Channel simulator =====
 simulation:
@@ -14,11 +14,6 @@ rf_sampling:
   bandwidth: 50000000  # Analog bandwidth (Hz), usually same as sample_rate
   rx_agc_enable: false  # Enable hardware RX AGC driven by delay-spectrum peak
   rx_gain: 10  # RX gain (dB)
-
-# ===== USRP Device / Link =====
-usrp_device:
-  device_args: ""  # USRP args
-  clock_source: internal  # Clock source; internal/external/gpsdo
 
 # ===== OFDM Frame =====
 ofdm_frame:
@@ -41,7 +36,7 @@ downlink:
   center_freq: 2400000000  # RF center frequency (Hz)
   modulation: qpsk  # Must match BS payload modulation; mini-header also carries Qm for mismatch detection
   rx_wire_format: sc16  # Downlink RX wire format; sc16/sc8
-  rx_channel: 0  # RX channel index on USRP
+  rx_channel: 0  # Logical downlink RX stream channel
   equalizer_mode: mmse  # Communication equalizer inverse mode
   channel_tracking_mode: pilot_phase  # Per-symbol comb-pilot tracking mode
   equalizer_mag_floor: 1e-06  # Lower bound for |H|^2 during channel inversion

@@ -185,7 +185,6 @@ def launch_ue_with_isolation(
     env_args: list[str] = []
     home = os.environ.get("HOME")
     xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
-    uhd_config_file = os.environ.get("UHD_CONFIG_FILE")
     ld_library_path = os.environ.get("LD_LIBRARY_PATH")
     if home:
         env_args.extend(["--setenv", f"HOME={home}"])
@@ -193,8 +192,6 @@ def launch_ue_with_isolation(
         env_args.extend(["--setenv", f"XDG_CONFIG_HOME={xdg_config_home}"])
     elif home:
         env_args.extend(["--setenv", f"XDG_CONFIG_HOME={home}/.config"])
-    if uhd_config_file:
-        env_args.extend(["--setenv", f"UHD_CONFIG_FILE={uhd_config_file}"])
     if ld_library_path:
         env_args.extend(["--setenv", f"LD_LIBRARY_PATH={ld_library_path}"])
 

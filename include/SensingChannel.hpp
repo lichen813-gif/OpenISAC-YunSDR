@@ -90,17 +90,11 @@ public:
     int32_t target_alignment() const;
     const SensingRxChannelConfig& channel_cfg() const;
 
-    // Initialize every sensing channel's RX path and align device clocks, backend
-    // independently. For the real radio it resolves/dedups RX devices (sharing the
-    // BS TX device when args match), tunes/gains them and runs PPS time-sync; for
-    // the simulator it attaches each channel to the hub's "rx.sens<logical_id>"
-    // shared-memory ring. `tx_device` is the BS TX device (shared candidate);
-    // `tx_device_args` is its registry key.
+    // Attach each sensing channel to ChannelSimulator's
+    // "rx.sens<logical_id>" shared-memory ring.
     static void initialize_rx_and_sync(
         const Config& cfg,
-        const radio::TuneRequest& tune_req,
         radio::IDevicePtr tx_device,
-        const std::string& tx_device_args,
         std::vector<std::unique_ptr<SensingChannel>>& channels
     );
 

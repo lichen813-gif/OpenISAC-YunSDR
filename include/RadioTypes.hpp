@@ -1,14 +1,12 @@
 #ifndef RADIO_TYPES_HPP
 #define RADIO_TYPES_HPP
 
-// Native radio HAL value types.
+// Native radio I/O value types.
 //
 // These are the backend-independent vocabulary the BS/UE/sensing/uplink engines
-// speak. They deliberately mirror the subset of UHD value types the project used
-// to depend on (time_spec_t, tx/rx_metadata_t, stream_cmd_t, tune_request_t/...),
-// but carry ZERO dependency on UHD. The UHD backend translates radio:: <-> uhd::
-// at its boundary; the simulation backend (and any future backend) uses these
-// types directly and never includes a UHD header.
+// speak. They carry no hardware-vendor SDK dependency. The simulation backend
+// uses them directly; a future libyunsdr backend will translate them at its
+// boundary.
 //
 // Header-only and free of any heavy include so it is cheap to pull into hot-path
 // translation units and safe to include from CUDA (.cu/.cuh) sources.
@@ -23,18 +21,17 @@
 
 namespace radio {
 
-// Host-side sample type for every stream (matches the UHD "fc32" CPU format and
-// sim_shm::sample_t).
+// Host-side sample type for every stream and sim_shm::sample_t.
 using sample_t = std::complex<float>;
 
 // ---------------------------------------------------------------------------
-// TimeSpec — sample-precise time, mirroring uhd::time_spec_t semantics.
+// TimeSpec — sample-precise backend time.
 //
 // Stored as a full-seconds integer plus a fractional-seconds double so that
 // sample-accurate frame timing survives over long runtimes (a single double of
 // seconds would lose sub-sample precision after many hours at a high tick rate).
-// from_ticks/to_ticks reproduce UHD's exact algorithm so values round-trip
-// identically across the sim shared-memory boundary and the UHD backend.
+// from_ticks/to_ticks preserve integer tick round trips across the simulator
+// shared-memory boundary.
 // ---------------------------------------------------------------------------
 class TimeSpec {
 public:
@@ -43,8 +40,7 @@ public:
     // Construct from a real number of seconds.
     explicit TimeSpec(double secs) : _full_secs(0), _frac_secs(secs) { _normalize(); }
 
-    // Construct from explicit full + fractional seconds (used by the UHD backend
-    // translation, which preserves UHD's internal representation exactly).
+    // Construct from explicit full + fractional seconds.
     TimeSpec(int64_t full_secs, double frac_secs)
         : _full_secs(full_secs), _frac_secs(frac_secs) {
         _normalize();
@@ -231,9 +227,9 @@ struct GainRange {
     double step = 0.0;
 };
 
-// Stream construction arguments (mirrors uhd::stream_args_t for the subset used).
-// `args` carries free-form key/value hints; the sim backend reads "sim_suffix" to
-// pick the shared-memory ring name, which the UHD backend ignores.
+// Stream construction arguments shared by backend implementations. `args`
+// carries free-form hints; SimBackend reads "sim_suffix" to select the
+// shared-memory ring name.
 struct StreamArgs {
     std::string cpu_format = "fc32";
     std::string wire_format;

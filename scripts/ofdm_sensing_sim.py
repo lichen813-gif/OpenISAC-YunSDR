@@ -77,18 +77,18 @@ def parse_targets(text):
 def default_config_path():
     repo_root = Path(__file__).resolve().parents[1]
     candidates = [
-        repo_root / "config" / "UE_X310.yaml",
-        repo_root / "config" / "BS_X310.yaml",
-        repo_root / "config" / "UE_B210.yaml",
-        repo_root / "config" / "BS_B210.yaml",
-        Path("config") / "UE_X310.yaml",
-        Path("config") / "BS_X310.yaml",
-        Path("config") / "UE_B210.yaml",
-        Path("config") / "BS_B210.yaml",
-        Path("UE_X310.yaml"),
-        Path("BS_X310.yaml"),
-        Path("UE_B210.yaml"),
-        Path("BS_B210.yaml"),
+        repo_root / "config" / "UE_Sim.yaml",
+        repo_root / "config" / "BS_Sim.yaml",
+        repo_root / "config" / "UE_Sim_Duplex.yaml",
+        repo_root / "config" / "BS_Sim_Duplex.yaml",
+        Path("config") / "UE_Sim.yaml",
+        Path("config") / "BS_Sim.yaml",
+        Path("config") / "UE_Sim_Duplex.yaml",
+        Path("config") / "BS_Sim_Duplex.yaml",
+        Path("UE_Sim.yaml"),
+        Path("BS_Sim.yaml"),
+        Path("UE_Sim_Duplex.yaml"),
+        Path("BS_Sim_Duplex.yaml"),
     ]
     for c in candidates:
         if c.exists():

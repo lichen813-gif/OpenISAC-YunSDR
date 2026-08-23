@@ -4,7 +4,7 @@
 Default isolation reads ``BS.yaml`` / ``UE.yaml`` (or paths passed with
 ``--yaml``) and reserves only the most scheduling-sensitive threads:
 
-* USRP sample TX/RX (throughput) threads
+* radio sample TX/RX (throughput) threads
 * main thread
 * BS monostatic sensing RX ingest (``rx_cpu_core``)
 
@@ -50,20 +50,20 @@ RT_SLICE = "rt-workload.slice"
 # Role → list indices for cpu_cores.* vectors.
 # Default isolate: only the most sensitive sample I/O + main (not OFDM/LDPC).
 BS_DOWNLINK_ROLES = {
-    0: "bs.tx_proc (USRP TX)",
+    0: "bs.tx_proc (radio TX)",
     # 1 = OFDM modulation — intentionally not isolated by default
 }
 BS_UPLINK_ROLES = {
-    0: "bs.rx_ingest (USRP RX)",
+    0: "bs.rx_ingest (radio RX)",
     # 1 = OFDM/LLR demod — intentionally not isolated by default
 }
 UE_DOWNLINK_ROLES = {
-    0: "ue.rx_proc (USRP RX)",
+    0: "ue.rx_proc (radio RX)",
     # 1 = process_proc (OFDM demod) — intentionally not isolated by default
 }
 UE_UPLINK_ROLES = {
     # 1 = OFDM modulation — intentionally not isolated by default
-    2: "ue.tx_send (USRP TX)",
+    2: "ue.tx_send (radio TX)",
 }
 
 
@@ -277,7 +277,7 @@ def extract_critical_assignments(
             CoreAssignment(core=main_core_i, role=f"{side}.main", source=source)
         )
 
-    # Monostatic sensing USRP RX loops (sample ingest), BS-side primarily.
+    # Monostatic sensing RX loops (sample ingest), BS-side primarily.
     if side == "bs":
         sensing = data.get("sensing")
         channels: Any = None
@@ -297,7 +297,7 @@ def extract_critical_assignments(
                     assignments.append(
                         CoreAssignment(
                             core=rx_core,
-                            role=f"bs.sensing_rx[{ch_idx}] (USRP RX)",
+                            role=f"bs.sensing_rx[{ch_idx}] (radio RX)",
                             source=source,
                         )
                     )
@@ -459,8 +459,8 @@ def resolve_role_yaml_paths(
         f"No YAML found in {(cwd or Path.cwd())} for role={role}.\n"
         f"Expected one of: {', '.join(wanted)} (or CUDABS.yaml / CUDAUE.yaml).\n"
         "Copy a preset into the working directory, e.g.:\n"
-        "  cp ../config/BS_X310.yaml BS.yaml\n"
-        "  cp ../config/UE_X310.yaml UE.yaml\n"
+        "  cp ../config/BS_Sim.yaml BS.yaml\n"
+        "  cp ../config/UE_Sim.yaml UE.yaml\n"
         "Or pass --yaml /path/to/file.yaml ..."
     )
 
@@ -507,7 +507,7 @@ def plan_from_yaml_files(
     if not reserved:
         raise RuntimeError(
             "No sensitive CPU cores could be derived from the given YAML files. "
-            "Set main_cpu_core and USRP TX/RX cores (downlink/uplink sample roles; "
+            "Set main_cpu_core and radio TX/RX cores (downlink/uplink sample roles; "
             "optional BS sensing rx_cpu_core) to non-negative values, "
             "or pass an explicit CPU set (e.g. 4 or 0,2,4)."
         )
@@ -723,7 +723,7 @@ def run_application(
 
     workdir = str((cwd or Path.cwd()).resolve())
     run_env_args: list[str] = []
-    for key in ("HOME", "XDG_CONFIG_HOME", "UHD_CONFIG_FILE", "LD_LIBRARY_PATH"):
+    for key in ("HOME", "XDG_CONFIG_HOME", "LD_LIBRARY_PATH"):
         val = os.environ.get(key)
         if val:
             run_env_args.extend([f"--setenv={key}={val}"])

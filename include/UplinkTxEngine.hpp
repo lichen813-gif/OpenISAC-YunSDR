@@ -77,7 +77,7 @@ public:
             reinterpret_cast<fftwf_complex*>(_fft_out.data()),
             FFTW_BACKWARD, FFTW_MEASURE);
         // Deeper queue than the historical depth-2 design: absorb modulation
-        // jitter so the TX thread can keep the USRP continuously fed (mirrors
+        // jitter so the TX thread can keep the radio stream continuously fed (mirrors
         // BS _circular_buffer prefill philosophy).
         _period_queue.reset(kPeriodQueueDepth, [this]() {
             AlignedVector frame;
@@ -102,7 +102,7 @@ public:
     void set_tx_stream(radio::ITxStreamPtr stream) { _tx_stream = std::move(stream); }
     radio::ITxStreamPtr tx_stream() const { return _tx_stream; }
 
-    // Enable timed (real-USRP) transmission scheduled on the radio clock. When
+    // Enable timed transmission scheduled on the radio clock. When
     // not enabled (sim), frames are streamed back-to-back, paced by the shm ring.
     void set_timed_tx(radio::TimeSpec start_time, double tick_rate, double tx_sample_rate) {
         std::lock_guard<std::mutex> lock(_timing_mutex);
@@ -694,7 +694,7 @@ private:
 
     void _mod_proc() {
         async_logger::LoggerThreadModeGuard log_mode_guard(async_logger::LoggerThreadMode::Realtime);
-        // Below TX priority so IFFT work cannot starve USRP send (mirrors BS).
+        // Below TX priority so IFFT work cannot starve radio send (mirrors BS).
         radio::set_thread_priority(0.6f, true);
         if (!bind_current_thread_from_uplink_hint(_link_cfg, 1)) {
             LOG_G_WARN_M(UlTx) << "[UL-TX] modulation thread unbound "
@@ -799,7 +799,7 @@ private:
             AlignedVector* frame = _period_queue.consumer_slot();
             const bool has_frame = (frame != nullptr);
             // Like BS blank-frame path: if the queue is empty, still submit one
-            // full period (zeros) so the USRP never starves. Modulation may be
+            // full period (zeros) so the radio stream never starves. Modulation may be
             // catching up after restart or under load.
             const AlignedVector& period_src = has_frame ? *frame : _blank_period_frame;
             if (!has_frame) {
@@ -929,7 +929,7 @@ private:
     {
         size_t sent_total = 0;
         radio::TxMetadata md = first_md;
-        // Hard-RT TX path: never yield/sleep on short send. UHD may block inside
+        // Hard-RT TX path: never yield/sleep on short send. The backend may block inside
         // send() up to the timeout while waiting for device buffer space; when it
         // returns 0 we stay on-core and retry with a CPU relax only.
         SPSCBusySpin spin;

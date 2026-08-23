@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark UE end-to-end latency across configurations.
 
-Requires root (for isolate_cpus.bash/systemd-run) and connected TX/RX USRPs.
+Requires root for `isolate_cpus.bash`/`systemd-run` and a running ChannelSimulator session.
 
 Usage:
     sudo python3 scripts/bench_ue_latency.py

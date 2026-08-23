@@ -562,7 +562,7 @@ public:
 
     void _rx_ingest_proc(radio::TimeSpec start_time) {
         async_logger::LoggerThreadModeGuard log_mode_guard(async_logger::LoggerThreadMode::Realtime);
-        // Hard-RT sample ingest: must keep up with USRP RX continuous stream.
+        // Hard-RT sample ingest: must keep up with the continuous RX stream.
         // Downstream signal/decode have queue cushions and may backoff.
         radio::set_thread_priority(1.0f, true);
         bind_current_thread_from_uplink_hint(_link_cfg, 0);

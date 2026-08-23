@@ -1,4 +1,3 @@
-#include <uhd/utils/safe_main.hpp>  // UHD_SAFE_MAIN entry macro only
 #include <fftw3.h>
 #include <iostream>
 #include <vector>
@@ -126,7 +125,7 @@ struct QueuedTxFrame {
  * Main class for OFDM Modulation and Sensing Transmission.
  * Implements a multi-threaded architecture:
  * - mod_thread: Generates OFDM symbols (IFFT) from data and pilots.
- * - tx_thread: Streams generated time-domain frames to USRP.
+ * - tx_thread: Streams generated time-domain frames to the selected radio I/O backend.
  * - rx_thread: Receives self-reflected signals (for sensing).
  * - sensing_thread: Processes received signals for further analysis.
  * - ldpc_encode_thread: Converts payload packets into LDPC/QAM symbols.
@@ -1372,43 +1371,19 @@ private:
         });
     }
 
-    radio::IDevicePtr _make_device(const std::string& device_args,
-                                   const std::string& clock_source,
-                                   const std::string& time_source) {
+    radio::IDevicePtr _make_device() {
         radio::DeviceConfig dcfg;
         dcfg.backend = _cfg.radio.radio_backend;
-        dcfg.device_args = device_args;
-        dcfg.clock_source = clock_source;
-        dcfg.time_source = time_source;
         dcfg.sim_session = _cfg.simulation.session;
         dcfg.sim_tick_rate = _cfg.rf_sampling.sample_rate;
         dcfg.sim_center_freq = _cfg.downlink.center_freq;
         return radio::make_device(dcfg);
     }
 
-    // Backend-independent radio init. The real radio tunes/gains a USRP and runs
-    // PPS sync; the simulator attaches TX + sensing RX streams to the hub's
-    // shared-memory rings. Branches collapse onto IDevice capability queries.
+    // Attach TX, sensing RX, and optional uplink RX streams to ChannelSimulator.
     void _init_radio() {
-        const bool is_sim = radio_is_sim(_cfg);
-        const std::string tx_device_args = _cfg.downlink.tx_device_args.empty() ? _cfg.usrp_device.device_args : _cfg.downlink.tx_device_args;
-        const std::string tx_clock_source = _cfg.downlink.tx_clock_source.empty() ? _cfg.clock_time.clock_source : _cfg.downlink.tx_clock_source;
-        const std::string tx_time_source = _cfg.downlink.tx_time_source.empty() ?
-            (_cfg.clock_time.time_source.empty() ? tx_clock_source : _cfg.clock_time.time_source) :
-            _cfg.downlink.tx_time_source;
-
-        _tx_dev = _make_device(tx_device_args, tx_clock_source, tx_time_source);
+        _tx_dev = _make_device();
         _tx_dev->set_tx_rate(_cfg.rf_sampling.sample_rate);
-
-        if (!is_sim) {
-            const size_t usrp_tx_channels = _tx_dev->get_tx_num_channels();
-            if (_cfg.downlink.tx_channel >= usrp_tx_channels) {
-                throw std::runtime_error(
-                    "Configured TX channel out of range: " +
-                    std::to_string(_cfg.downlink.tx_channel) +
-                    " (USRP supports " + std::to_string(usrp_tx_channels) + " TX channels)");
-            }
-        }
 
         const radio::TuneRequest tune_req(_cfg.downlink.center_freq);
         const radio::TuneResult tx_tune = _tx_dev->set_tx_freq(tune_req, _cfg.downlink.tx_channel);
@@ -1423,58 +1398,26 @@ private:
         tx_stream_args.args["sim_suffix"] = "tx";
         tx_stream_args.channels = {_cfg.downlink.tx_channel};
         _tx_stream = _tx_dev->get_tx_stream(tx_stream_args);
-        _tx_chunk_samps = is_sim ? _cfg.samples_per_frame() : _tx_stream->max_num_samps();
+        _tx_chunk_samps = _cfg.samples_per_frame();
         if (_tx_chunk_samps == 0) {
             _tx_chunk_samps = _cfg.samples_per_frame();
             LOG_G_WARN_M(Config) << "TX streamer reported max_num_samps=0, falling back to frame-sized chunks: "
                          << _tx_chunk_samps;
-        } else if (!is_sim) {
-            LOG_G_INFO_M(Radio) << "TX streamer chunk size: " << _tx_chunk_samps << " samples";
         }
-        if (is_sim) {
-            LOG_G_INFO_M(Sensing) << "TX radio backend: SIMULATION (session='" << _cfg.simulation.session
-                         << "', no USRP). Sensing channels: " << _sensing_channels.size();
-        }
+        LOG_G_INFO_M(Sensing) << "TX radio backend: SIMULATION (session='"
+                     << _cfg.simulation.session << "'). Sensing channels: "
+                     << _sensing_channels.size();
 
         SensingChannel::initialize_rx_and_sync(
-            _cfg, tune_req, _tx_dev, tx_device_args, _sensing_channels);
+            _cfg, _tx_dev, _sensing_channels);
 
         if (uplink_enabled(_cfg)) {
-            _init_uplink_rx(tx_device_args, tx_clock_source, tx_time_source);
+            _init_uplink_rx();
         }
     }
 
-    void _init_uplink_rx(const std::string& tx_device_args,
-                         const std::string& tx_clock_source,
-                         const std::string& tx_time_source) {
-        const bool is_sim = radio_is_sim(_cfg);
-        radio::IDevicePtr ul_rx_dev;
-        bool shared_tx_device = true;
-        if (is_sim) {
-            ul_rx_dev = _tx_dev;
-        } else {
-            // Resolve the uplink RX device. Empty overrides reuse the shared TX
-            // device (and its clock/time sources); a non-empty uplink.rx_device_args
-            // selects a dedicated USRP, mirroring the sensing RX device scheme.
-            const std::string ul_rx_device_args = _cfg.uplink.rx_device_args.empty()
-                ? tx_device_args : _cfg.uplink.rx_device_args;
-            const std::string ul_rx_clock = _cfg.uplink.rx_clock_source.empty()
-                ? tx_clock_source : _cfg.uplink.rx_clock_source;
-            const std::string ul_rx_time = _cfg.uplink.rx_time_source.empty()
-                ? tx_time_source : _cfg.uplink.rx_time_source;
-            if (ul_rx_device_args == tx_device_args) {
-                if (ul_rx_clock != tx_clock_source || ul_rx_time != tx_time_source) {
-                    throw std::runtime_error(
-                        "Uplink RX clock/time source conflicts with the shared TX device. "
-                        "Set uplink.rx_device_args to select a separate uplink RX USRP.");
-                }
-                ul_rx_dev = _tx_dev;
-            } else {
-                _uplink_rx_dev = _make_device(ul_rx_device_args, ul_rx_clock, ul_rx_time);
-                ul_rx_dev = _uplink_rx_dev;
-                shared_tx_device = false;
-            }
-        }
+    void _init_uplink_rx() {
+        radio::IDevicePtr ul_rx_dev = _tx_dev;
 
         // Full-duplex uplink RX on the BS device. TDD: same carrier as TX.
         // FDD: the uplink carrier (duplex.ul_center_freq).
@@ -1482,15 +1425,6 @@ private:
                                 _cfg.uplink.duplex.ul_center_freq > 0.0)
             ? _cfg.uplink.duplex.ul_center_freq : _cfg.downlink.center_freq;
         const size_t ul_rx_ch = _cfg.uplink.rx_channel;
-        if (!is_sim) {
-            const size_t usrp_rx_channels = ul_rx_dev->get_rx_num_channels();
-            if (ul_rx_ch >= usrp_rx_channels) {
-                throw std::runtime_error(
-                    "Configured uplink_rx_channel out of range: " +
-                    std::to_string(ul_rx_ch) +
-                    " (USRP supports " + std::to_string(usrp_rx_channels) + " RX channels)");
-            }
-        }
         ul_rx_dev->set_rx_rate(_cfg.rf_sampling.sample_rate);
         ul_rx_dev->set_rx_freq(radio::TuneRequest(ul_freq), ul_rx_ch);
         ul_rx_dev->set_rx_gain(_cfg.uplink.rx_gain, ul_rx_ch);
@@ -1535,8 +1469,7 @@ private:
                          << "using fixed uplink RX gain " << _cfg.uplink.rx_gain << " dB";
         }
         LOG_G_INFO_M(UlRx) << "[UL-RX] uplink receive enabled on RX ch " << ul_rx_ch
-                     << " @ " << format_freq_hz(ul_freq) << " Hz on "
-                     << (is_sim ? "simulation" : (shared_tx_device ? "shared TX device" : "dedicated device")) << ", "
+                     << " @ " << format_freq_hz(ul_freq) << " Hz on simulation, "
                      << _uplink_rx->uplink_config().ofdm.num_symbols << " UL symbols/frame, "
                      << "zc_root=" << _uplink_rx->uplink_config().ofdm.zc_root;
     }
@@ -2710,7 +2643,7 @@ private:
     /**
      * @brief Tx Streamer Thread.
      * 
-     * Continuous loop that sends frames from the circular buffer to the USRP.
+     * Continuous loop that sends frames from the circular buffer to the radio backend.
      * Handles underflow by sending blank frames if no data is available.
      * Ensures continuous transmission for stable sensing and communication.
      */
@@ -2920,7 +2853,7 @@ private:
 std::atomic<bool> stop_signal(false);
 void signal_handler(int) { stop_signal.store(true); }
 
-int UHD_SAFE_MAIN(int argc, char *[]) {
+int main(int argc, char *[]) {
     async_logger::AsyncLoggerGuard async_logger_guard;
     std::signal(SIGINT, &signal_handler);
     radio::set_thread_priority();
@@ -2945,7 +2878,7 @@ int UHD_SAFE_MAIN(int argc, char *[]) {
     if (!path_exists(default_config_file)) {
         LOG_G_ERROR_M(Config) << "Config file '" << default_config_file
                       << "' not found. Copy a sample file from the repository config directory, "
-                      << "such as 'BS_X310.yaml' or 'BS_B210.yaml', to '" << default_config_file
+                      << "such as 'BS_Sim.yaml', to '" << default_config_file
                       << "' and edit it before starting BS.";
         return 1;
     }

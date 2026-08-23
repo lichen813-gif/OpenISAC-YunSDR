@@ -2,7 +2,7 @@
 #define SIM_BACKEND_HPP
 
 // Simulation radio backend — implements the radio:: HAL over the shared-memory
-// channel simulator (ShmRing / ShmControl). Contains ZERO dependency on UHD:
+// channel simulator (ShmRing / ShmControl), with no hardware SDK dependency:
 // it speaks only radio:: native types and POSIX shared memory.
 //
 // The simulator is a peer backend behind radio::IDevice, selected by
@@ -25,7 +25,7 @@ IDevicePtr make_sim_device(const DeviceConfig& cfg);
 
 // TX stream: producer into a named shared-memory ring. The first timed sample
 // establishes the ring's absolute position on the shared simulator clock;
-// later samples in the same burst remain continuous, like a USRP TX streamer.
+// later samples in the same burst remain continuous.
 class SimTxStream : public ITxStream {
 public:
     SimTxStream(std::shared_ptr<sim_shm::ShmRing> ring,

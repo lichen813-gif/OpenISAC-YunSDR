@@ -21,8 +21,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Find required libraries
-find_package(UHD REQUIRED)
-
 set(Boost_NO_BOOST_CMAKE ON)
 find_package(Boost 1.66 REQUIRED)
 
@@ -263,7 +261,6 @@ set(OPENISAC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 add_executable(BS
     ${OPENISAC_SRC_DIR}/BS.cpp
     ${OPENISAC_SRC_DIR}/SensingChannel.cpp
-    ${OPENISAC_SRC_DIR}/UhdBackend.cpp
     ${OPENISAC_SRC_DIR}/SimBackend.cpp
     ${OPENISAC_SRC_DIR}/AsyncLogger.cpp
     ${OPENISAC_SRC_DIR}/LDPCCodec.cpp
@@ -271,7 +268,6 @@ add_executable(BS
 )
 
 target_include_directories(BS PRIVATE
-    ${UHD_INCLUDE_DIRS}
     ${LIBDPDK_INCLUDE_DIRS}
     ${FFTW3f_INCLUDE_DIRS}
     ${YAMLCPP_INCLUDE_DIRS}
@@ -282,7 +278,6 @@ target_include_directories(BS PRIVATE
 )
 
 target_link_libraries(BS PRIVATE
-    ${UHD_LIBRARIES}
     Threads::Threads
     OpenMP::OpenMP_CXX
     ${LIBDPDK_LIBRARIES}
@@ -305,7 +300,6 @@ target_compile_options(BS PRIVATE
 add_executable(UE
     ${OPENISAC_SRC_DIR}/UE.cpp
     ${OPENISAC_SRC_DIR}/SensingChannel.cpp
-    ${OPENISAC_SRC_DIR}/UhdBackend.cpp
     ${OPENISAC_SRC_DIR}/SimBackend.cpp
     ${OPENISAC_SRC_DIR}/AsyncLogger.cpp
     ${OPENISAC_SRC_DIR}/LDPCCodec.cpp
@@ -313,7 +307,6 @@ add_executable(UE
 )
 
 target_include_directories(UE PRIVATE
-    ${UHD_INCLUDE_DIRS}
     ${Boost_INCLUDE_DIRS}
     ${FFTW3f_INCLUDE_DIRS}
     ${YAMLCPP_INCLUDE_DIRS}
@@ -323,7 +316,6 @@ target_include_directories(UE PRIVATE
 )
 
 target_link_libraries(UE PRIVATE
-    ${UHD_LIBRARIES}
     ${FFTW3f_LIBRARIES}
     ${FFTW3f_THREADS_LIBRARY}
     Threads::Threads
@@ -341,7 +333,7 @@ target_compile_options(UE PRIVATE
 )
 
 #===========================================================
-# ChannelSimulator Executable (run the system without USRP)
+# ChannelSimulator executable
 #===========================================================
 add_executable(ChannelSimulator
     ${OPENISAC_SRC_DIR}/ChannelSimulator.cpp
@@ -349,7 +341,6 @@ add_executable(ChannelSimulator
 )
 
 target_include_directories(ChannelSimulator PRIVATE
-    ${UHD_INCLUDE_DIRS}
     ${YAMLCPP_INCLUDE_DIRS}
     ${OPENISAC_ZMQ_INCLUDE_DIRS}
     ${OPENISAC_INCLUDE_DIR}
@@ -358,7 +349,6 @@ target_include_directories(ChannelSimulator PRIVATE
 )
 
 target_link_libraries(ChannelSimulator PRIVATE
-    ${UHD_LIBRARIES}
     Threads::Threads
     OpenMP::OpenMP_CXX
     ${OPENISAC_YAMLCPP_TARGET}

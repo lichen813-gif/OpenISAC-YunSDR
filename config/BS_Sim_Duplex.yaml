@@ -1,6 +1,6 @@
 # ===== Radio backend =====
 radio:
-  radio_backend: sim  # Radio I/O backend; uhd = real USRP, sim = channel simulator
+  radio_backend: sim  # Current release supports the channel simulator backend only
 
 # ===== Channel simulator =====
 simulation:
@@ -52,11 +52,6 @@ rf_sampling:
   sample_rate: 50000000  # Baseband sample rate (Hz)
   bandwidth: 50000000  # Analog bandwidth (Hz), usually same as sample_rate
 
-# ===== Clock / Time Sources =====
-clock_time:
-  clock_source: internal  # Global clock source; internal/external/gpsdo
-  time_source: internal  # Global time source; empty follows clock_source
-
 # ===== OFDM Frame =====
 ofdm_frame:
   fft_size: 1024  # FFT size (subcarrier count)
@@ -76,7 +71,7 @@ ofdm_frame:
 downlink:
   center_freq: 2400000000  # RF center frequency (Hz)
   tx_gain: 60  # TX gain (dB)
-  tx_channel: 0  # TX channel index on USRP
+  tx_channel: 0  # Logical TX stream channel
   wire_format_tx: sc16  # TX wire format; sc16/sc8
   arq_enabled: false  # Enable downlink ARQ on the BS transmitter
   arq_window_packets: 256  # Downlink ARQ outstanding packet window [1, 32767]
@@ -93,11 +88,8 @@ uplink:
   bs_dl_ul_timing_diff: -10  # Simulation timing calibration: delay the BS uplink RX window by 10 samples
   ertm_to_enable: false  # Enable eRTM TO estimation payloads and UE-side TO logs
   ertm_report_interval_frames: 32  # BS eRTM payload/report cadence in downlink frames
-  rx_channel: 0  # Uplink RX channel index on USRP
+  rx_channel: 0  # Logical uplink RX stream channel
   rx_wire_format: sc16  # Uplink RX wire format; sc16/sc8
-  rx_device_args: ""  # Uplink RX-specific args (empty = use TX/shared device)
-  rx_clock_source: ""  # Uplink RX clock source override (optional)
-  rx_time_source: ""  # Uplink RX time source override (optional)
   rx_agc_enable: false  # Enable uplink hardware RX AGC driven by delay-spectrum peak
   rx_agc_low_threshold_db: 14.0  # Increase uplink RX gain when filtered delay-spectrum peak falls below this threshold (dB)
   rx_agc_high_threshold_db: 16.0  # Decrease uplink RX gain when filtered delay-spectrum peak rises above this threshold (dB)
@@ -113,47 +105,31 @@ sensing:
   rx_wire_format: sc16  # Sensing RX default wire format; sc16/sc8
   rx_channel_count: 4  # Number of sensing RX channels (0 disables sensing RX)
   rx_channels:
-    - usrp_channel: 0  # USRP RX channel index for this sensing path
-      device_args: ""  # Per-channel USRP args override (optional)
-      clock_source: ""  # Per-channel clock source override (optional)
-      time_source: ""  # Per-channel time source override (optional)
+    - stream_channel: 0  # Logical RX stream channel for this sensing path
       wire_format: ""  # Per-channel wire format override (optional)
       rx_gain: 0  # Per-channel RX gain (dB)
       alignment: 0  # Per-channel timing alignment offset (samples)
-      rx_antenna: ""  # RX antenna port (e.g. RX1/RX2/TX/RX)
       enable_system_delay_estimation: false  # If true, this channel runs delay estimation only and disables sensing pipeline
       rx_cpu_core: -1  # CPU core for SensingChannel::_rx_loop (-1 disables explicit binding)
       processing_cpu_core: -1  # CPU core for SensingChannel::_sensing_loop (-1 disables explicit binding)
-    - usrp_channel: 1  # USRP RX channel index for this sensing path
-      device_args: ""  # Per-channel USRP args override (optional)
-      clock_source: ""  # Per-channel clock source override (optional)
-      time_source: ""  # Per-channel time source override (optional)
+    - stream_channel: 1  # Logical RX stream channel for this sensing path
       wire_format: ""  # Per-channel wire format override (optional)
       rx_gain: 0  # Per-channel RX gain (dB)
       alignment: 0  # Per-channel timing alignment offset (samples)
-      rx_antenna: ""  # RX antenna port (e.g. RX1/RX2/TX/RX)
       enable_system_delay_estimation: false  # If true, this channel runs delay estimation only and disables sensing pipeline
       rx_cpu_core: -1  # CPU core for SensingChannel::_rx_loop (-1 disables explicit binding)
       processing_cpu_core: -1  # CPU core for SensingChannel::_sensing_loop (-1 disables explicit binding)
-    - usrp_channel: 2  # USRP RX channel index for this sensing path
-      device_args: ""  # Per-channel USRP args override (optional)
-      clock_source: ""  # Per-channel clock source override (optional)
-      time_source: ""  # Per-channel time source override (optional)
+    - stream_channel: 2  # Logical RX stream channel for this sensing path
       wire_format: ""  # Per-channel wire format override (optional)
       rx_gain: 0  # Per-channel RX gain (dB)
       alignment: 0  # Per-channel timing alignment offset (samples)
-      rx_antenna: ""  # RX antenna port (e.g. RX1/RX2/TX/RX)
       enable_system_delay_estimation: false  # If true, this channel runs delay estimation only and disables sensing pipeline
       rx_cpu_core: -1  # CPU core for SensingChannel::_rx_loop (-1 disables explicit binding)
       processing_cpu_core: -1  # CPU core for SensingChannel::_sensing_loop (-1 disables explicit binding)
-    - usrp_channel: 3  # USRP RX channel index for this sensing path
-      device_args: ""  # Per-channel USRP args override (optional)
-      clock_source: ""  # Per-channel clock source override (optional)
-      time_source: ""  # Per-channel time source override (optional)
+    - stream_channel: 3  # Logical RX stream channel for this sensing path
       wire_format: ""  # Per-channel wire format override (optional)
       rx_gain: 0  # Per-channel RX gain (dB)
       alignment: 0  # Per-channel timing alignment offset (samples)
-      rx_antenna: ""  # RX antenna port (e.g. RX1/RX2/TX/RX)
       enable_system_delay_estimation: false  # If true, this channel runs delay estimation only and disables sensing pipeline
       rx_cpu_core: -1  # CPU core for SensingChannel::_rx_loop (-1 disables explicit binding)
       processing_cpu_core: -1  # CPU core for SensingChannel::_sensing_loop (-1 disables explicit binding)

@@ -41,10 +41,11 @@
 #include <boost/circular_buffer.hpp>
 #include <functional>
 #include <unordered_map>
-#include "RadioTypes.hpp"
-#include <uhd/types/metadata.hpp>
-#include <uhd/utils/thread.hpp>
-#include <uhd/types/time_spec.hpp>
+#include "RadioBackend.hpp"
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 #include <fcntl.h>
 #include <termios.h>
 #include <fstream>
@@ -173,14 +174,10 @@ private:
  * Used by BS for multi-channel monostatic sensing reception.
  */
 struct SensingRxChannelConfig {
-    uint32_t usrp_channel = 0;          // USRP RX channel index
-    std::string device_args = "";       // Optional per-channel USRP args
-    std::string clock_source = "";      // Optional per-channel USRP clock/REF source override
-    std::string time_source = "";       // Optional per-channel USRP time/PPS source override
+    uint32_t stream_channel = 0;        // Logical backend stream channel index
     std::string wire_format = "";       // Optional per-channel RX wire format override
     double rx_gain = 0.0;               // RX gain for this channel
     int32_t alignment = 63;             // Per-channel alignment offset (samples)
-    std::string rx_antenna = "";        // RX antenna for this channel (e.g., TX/RX, RX1)
     bool enable_system_delay_estimation = false; // Enable per-channel system delay estimation mode
     bool enable_sensing_output = true;  // Enable ZMQ output for this sensing channel
     int rx_cpu_core = -1;               // Dedicated SensingChannel::_rx_loop core; -1 = no explicit binding
@@ -212,7 +209,7 @@ struct SimMultipathTap {
 };
 
 /**
- * @brief Channel simulator parameters (used when radio_backend == "sim").
+ * @brief Channel simulator parameters.
  *
  * Shared by the BS, UE, and the standalone ChannelSimulator hub.
  * The `session` string namespaces the POSIX shared-memory segments so all three
@@ -971,7 +968,7 @@ inline void rt_cpu_relax() {
 /**
  * @brief Busy-spin helper for hard real-time SPSC polling / short-send retry.
  *
- * Never yields or sleeps — the thread keeps the CPU. Use on USRP TX/RX threads
+ * Never yields or sleeps — the thread keeps the CPU. Use on radio I/O threads
  * that must meet timed deadlines. Prefer @ref SPSCBackoff on best-effort
  * workers (UDP, LDPC, etc.) where burning a core is undesirable.
  */
@@ -1086,20 +1083,11 @@ struct RfSamplingConfig {
     double sample_rate = 50e6;         // Sample rate
     double bandwidth = 50e6;           // Bandwidth
     double rx_gain = 0.0;              // UE downlink RX gain
-    bool rx_agc_enable = false;        // Enable hardware RX AGC via USRP gain control
+    bool rx_agc_enable = false;        // Enable hardware RX AGC when a future backend supports it
     double rx_agc_low_threshold_db = 11.0; // Increase gain when delay-spectrum peak is below this threshold
     double rx_agc_high_threshold_db = 13.0; // Decrease gain when delay-spectrum peak is above this threshold
     double rx_agc_max_step_db = 3.0;   // Maximum gain change per AGC update
     size_t rx_agc_update_frames = 4;   // Frame interval between AGC updates
-};
-
-struct UsrpDeviceConfig {
-    std::string device_args = "";
-};
-
-struct ClockTimeConfig {
-    std::string clock_source = "internal"; // Clock source
-    std::string time_source = "";         // Time source; empty means follow clock_source
 };
 
 struct SyncTrackingConfig {
@@ -1149,9 +1137,6 @@ struct DownlinkConfig {
     std::string modulation = kModulationQpsk; // Payload modulation; control header remains QPSK
     double tx_gain = 0.0;              // BS downlink TX gain
     uint32_t tx_channel = 0;           // BS downlink TX channel index
-    std::string tx_device_args = "";
-    std::string tx_clock_source = "";
-    std::string tx_time_source = "";
     std::string wire_format_tx = "sc16";
     size_t rx_channel = 0;             // UE downlink RX channel index
     std::string rx_wire_format = "sc16"; // UE downlink RX wire format
@@ -1182,9 +1167,6 @@ struct UplinkConfig {
     double rx_gain = 0.0;              // BS uplink RX gain
     size_t rx_channel = 0;             // BS uplink RX channel index
     std::string rx_wire_format = "sc16"; // BS uplink RX wire format
-    std::string rx_device_args = "";   // BS uplink RX device args override (empty = shared TX device)
-    std::string rx_clock_source = "";  // BS uplink RX clock source override (empty = TX clock source)
-    std::string rx_time_source = "";   // BS uplink RX time source override (empty = TX time source)
     double tx_gain = 0.0;              // UE uplink TX gain
     uint32_t tx_channel = 0;           // UE uplink TX channel index
     std::string wire_format_tx = "sc16"; // UE uplink TX wire format
@@ -1200,9 +1182,6 @@ struct SensingConfig {
     SensingOnWireFormat on_wire_format = SensingOnWireFormat::ComplexFloat32;
     bool backend_processing_enabled = false;
     std::vector<DataResourceBlock> mask_blocks;
-    std::string rx_device_args = "";
-    std::string rx_clock_source = "";
-    std::string rx_time_source = "";
     std::string rx_wire_format = "sc16";  // BS sensing RX default wire format
     uint32_t rx_channel_count = 1; // Number of sensing RX channels
     std::vector<SensingRxChannelConfig> rx_channels; // Per-channel sensing RX config
@@ -1213,7 +1192,7 @@ struct SensingConfig {
 };
 
 struct RadioConfig {
-    std::string radio_backend = "uhd";  // Radio I/O backend: "uhd" (real USRP) or "sim" (channel simulator)
+    std::string radio_backend = "sim";  // Current revision supports only ChannelSimulator
 };
 
 struct UdpEgressPacerConfig {
@@ -1351,8 +1330,6 @@ struct Config {
     CudaConfig cuda;
     SensingConfig sensing;
     RfSamplingConfig rf_sampling;
-    UsrpDeviceConfig usrp_device;
-    ClockTimeConfig clock_time;
     DownlinkConfig downlink;
     DownlinkPipelineConfig downlink_pipeline;
     UplinkConfig uplink;
@@ -2602,7 +2579,7 @@ inline bool measurement_mode_enabled(const Config& cfg) {
 }
 
 /**
- * @brief True when the radio I/O backend is the channel simulator (no USRP).
+ * @brief True when the radio I/O backend is the channel simulator.
  */
 inline bool radio_is_sim(const Config& cfg) {
     return cfg.radio.radio_backend == "sim";
@@ -2665,11 +2642,15 @@ inline void emit_simulation_config(YAML::Emitter& out, const Config& cfg) {
  * @brief Parse the radio_backend + simulation block from a YAML node.
  *
  * Shared by the BS and UE config loaders. Missing keys keep their
- * struct defaults so existing (hardware) configs are unaffected.
+ * struct defaults so omitted simulator keys remain backward compatible.
  */
 inline void load_simulation_config(const YAML::Node& config, Config& cfg) {
     if (config["radio"] && config["radio"].IsMap() && config["radio"]["radio_backend"]) {
         cfg.radio.radio_backend = config["radio"]["radio_backend"].as<std::string>();
+    }
+    if (cfg.radio.radio_backend != "sim") {
+        throw std::invalid_argument(
+            "radio.radio_backend must be 'sim' in this release; libyunsdr support is not implemented yet");
     }
     if (config["simulation"] && config["simulation"].IsMap()) {
         const YAML::Node& sim_node = config["simulation"];
@@ -3017,9 +2998,15 @@ inline bool bind_current_thread_to_core(const std::optional<size_t>& core) {
     if (!core.has_value()) {
         return false;
     }
-    std::vector<size_t> cpu_list = {*core};
-    uhd::set_thread_affinity(cpu_list);
-    return true;
+#if defined(__linux__)
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    CPU_SET(*core, &cpu_set);
+    return pthread_setaffinity_np(
+               pthread_self(), sizeof(cpu_set_t), &cpu_set) == 0;
+#else
+    return false;
+#endif
 }
 
 inline bool bind_current_thread_from_downlink_hint(const Config& cfg, size_t hint) {
@@ -3359,7 +3346,7 @@ inline Config make_default_bs_config() {
     cfg.sensing.paired_frame_queue_size = 16;
     cfg.network_output.udp_input_ip = "0.0.0.0";
     cfg.network_output.udp_input_port = 50000;
-    cfg.radio.radio_backend = "uhd";
+    cfg.radio.radio_backend = "sim";
     cfg.simulation = SimConfig{};
     cfg.measurement.measurement_enable = false;
     cfg.measurement.measurement_mode = "";
@@ -3452,8 +3439,6 @@ inline bool load_bs_config_from_yaml(Config& cfg, const std::string& filepath) {
         const YAML::Node cuda = config_detail::section_node(config, "cuda");
         const YAML::Node sensing = config_detail::section_node(config, "sensing");
         const YAML::Node rf = config_detail::section_node(config, "rf_sampling");
-        const YAML::Node usrp = config_detail::section_node(config, "usrp_device");
-        const YAML::Node clock = config_detail::section_node(config, "clock_time");
         const YAML::Node downlink = config_detail::section_node(config, "downlink");
         const YAML::Node downlink_pipeline = config_detail::section_node(config, "downlink_pipeline");
         const YAML::Node uplink = config_detail::section_node(config, "uplink");
@@ -3501,9 +3486,6 @@ inline bool load_bs_config_from_yaml(Config& cfg, const std::string& filepath) {
         }
         config_detail::load_value(
             sensing, "backend_processing_enabled", cfg.sensing.backend_processing_enabled);
-        config_detail::load_value(sensing, "rx_device_args", cfg.sensing.rx_device_args);
-        config_detail::load_value(sensing, "rx_clock_source", cfg.sensing.rx_clock_source);
-        config_detail::load_value(sensing, "rx_time_source", cfg.sensing.rx_time_source);
         config_detail::load_value(sensing, "rx_wire_format", cfg.sensing.rx_wire_format);
         config_detail::load_value(sensing, "symbol_stride", cfg.sensing.symbol_stride);
         config_detail::load_value(sensing, "paired_frame_queue_size", cfg.sensing.paired_frame_queue_size);
@@ -3515,14 +3497,10 @@ inline bool load_bs_config_from_yaml(Config& cfg, const std::string& filepath) {
             cfg.sensing.rx_channels.clear();
             for (const auto& node : sensing["rx_channels"]) {
                 SensingRxChannelConfig ch;
-                if (node["usrp_channel"]) ch.usrp_channel = node["usrp_channel"].as<uint32_t>();
-                if (node["device_args"]) ch.device_args = node["device_args"].as<std::string>();
-                if (node["clock_source"]) ch.clock_source = node["clock_source"].as<std::string>();
-                if (node["time_source"]) ch.time_source = node["time_source"].as<std::string>();
+                if (node["stream_channel"]) ch.stream_channel = node["stream_channel"].as<uint32_t>();
                 if (node["wire_format"]) ch.wire_format = node["wire_format"].as<std::string>();
                 if (node["rx_gain"]) ch.rx_gain = node["rx_gain"].as<double>();
                 if (node["alignment"]) ch.alignment = node["alignment"].as<int32_t>();
-                if (node["rx_antenna"]) ch.rx_antenna = node["rx_antenna"].as<std::string>();
                 if (node["enable_system_delay_estimation"]) {
                     ch.enable_system_delay_estimation =
                         node["enable_system_delay_estimation"].as<bool>();
@@ -3544,17 +3522,10 @@ inline bool load_bs_config_from_yaml(Config& cfg, const std::string& filepath) {
         config_detail::load_value(rf, "sample_rate", cfg.rf_sampling.sample_rate);
         config_detail::load_value(rf, "bandwidth", cfg.rf_sampling.bandwidth);
 
-        config_detail::load_value(usrp, "device_args", cfg.usrp_device.device_args);
-        config_detail::load_value(clock, "clock_source", cfg.clock_time.clock_source);
-        config_detail::load_value(clock, "time_source", cfg.clock_time.time_source);
-
         config_detail::load_value(downlink, "center_freq", cfg.downlink.center_freq);
         config_detail::load_value(downlink, "modulation", cfg.downlink.modulation);
         config_detail::load_value(downlink, "tx_gain", cfg.downlink.tx_gain);
         config_detail::load_value(downlink, "tx_channel", cfg.downlink.tx_channel);
-        config_detail::load_value(downlink, "tx_device_args", cfg.downlink.tx_device_args);
-        config_detail::load_value(downlink, "tx_clock_source", cfg.downlink.tx_clock_source);
-        config_detail::load_value(downlink, "tx_time_source", cfg.downlink.tx_time_source);
         config_detail::load_value(downlink, "wire_format_tx", cfg.downlink.wire_format_tx);
         config_detail::load_value(
             downlink_pipeline, "tx_circular_buffer_size", cfg.downlink_pipeline.tx_circular_buffer_size);
@@ -3564,9 +3535,6 @@ inline bool load_bs_config_from_yaml(Config& cfg, const std::string& filepath) {
         config_detail::load_value(uplink, "rx_gain", cfg.uplink.rx_gain);
         config_detail::load_value(uplink, "rx_channel", cfg.uplink.rx_channel);
         config_detail::load_value(uplink, "rx_wire_format", cfg.uplink.rx_wire_format);
-        config_detail::load_value(uplink, "rx_device_args", cfg.uplink.rx_device_args);
-        config_detail::load_value(uplink, "rx_clock_source", cfg.uplink.rx_clock_source);
-        config_detail::load_value(uplink, "rx_time_source", cfg.uplink.rx_time_source);
         config_detail::load_value(uplink, "rx_agc_enable", cfg.rf_sampling.rx_agc_enable);
         config_detail::load_value(uplink, "rx_agc_low_threshold_db", cfg.rf_sampling.rx_agc_low_threshold_db);
         config_detail::load_value(uplink, "rx_agc_high_threshold_db", cfg.rf_sampling.rx_agc_high_threshold_db);
@@ -3704,11 +3672,9 @@ inline void normalize_bs_sensing_channels(Config& cfg) {
 
     auto make_default_ch0 = [&cfg]() {
         SensingRxChannelConfig ch;
-        ch.usrp_channel = 0;
+        ch.stream_channel = 0;
         ch.rx_gain = 30.0;
         ch.alignment = SensingRxChannelConfig{}.alignment;
-        ch.clock_source = "";
-        ch.time_source = "";
         ch.wire_format = "";
         ch.enable_system_delay_estimation = false;
         ch.enable_sensing_output = cfg.network_output.mono_sensing_output_enabled;
@@ -3718,7 +3684,7 @@ inline void normalize_bs_sensing_channels(Config& cfg) {
         cfg.sensing.rx_channels.push_back(make_default_ch0());
         for (uint32_t i = 1; i < cfg.sensing.rx_channel_count; ++i) {
             auto ch = make_default_ch0();
-            ch.usrp_channel = i;
+            ch.stream_channel = i;
             cfg.sensing.rx_channels.push_back(ch);
         }
     }
@@ -3731,7 +3697,7 @@ inline void normalize_bs_sensing_channels(Config& cfg) {
         const auto base = cfg.sensing.rx_channels.empty() ? make_default_ch0() : cfg.sensing.rx_channels.front();
         for (size_t i = cfg.sensing.rx_channels.size(); i < cfg.sensing.rx_channel_count; ++i) {
             auto ch = base;
-            ch.usrp_channel = static_cast<uint32_t>(base.usrp_channel + i);
+            ch.stream_channel = static_cast<uint32_t>(base.stream_channel + i);
             cfg.sensing.rx_channels.push_back(ch);
         }
     }
@@ -3805,7 +3771,6 @@ inline Config make_default_ue_config() {
     cfg.rf_sampling.rx_agc_max_step_db = 3.0;
     cfg.rf_sampling.rx_agc_update_frames = 4;
     cfg.ofdm.zc_root = 29;
-    cfg.usrp_device.device_args = "";
     cfg.sensing.bi_enabled = true;
     cfg.network_output.bi_sensing_output_enabled = true;
     cfg.network_output.bi_sensing_ip = "";
@@ -3848,7 +3813,7 @@ inline Config make_default_ue_config() {
     cfg.sensing.on_wire_format = SensingOnWireFormat::ComplexFloat32;
     cfg.sensing.backend_processing_enabled = false;
     cfg.sensing.symbol_stride = 20;
-    cfg.radio.radio_backend = "uhd";
+    cfg.radio.radio_backend = "sim";
     cfg.simulation = SimConfig{};
     cfg.measurement.measurement_enable = false;
     cfg.measurement.measurement_mode = "";
@@ -3874,7 +3839,6 @@ inline bool load_ue_config_from_yaml(Config& cfg, const std::string& filepath) {
         const YAML::Node cuda = config_detail::section_node(config, "cuda");
         const YAML::Node sensing = config_detail::section_node(config, "sensing");
         const YAML::Node rf = config_detail::section_node(config, "rf_sampling");
-        const YAML::Node usrp = config_detail::section_node(config, "usrp_device");
         const YAML::Node downlink = config_detail::section_node(config, "downlink");
         const YAML::Node uplink = config_detail::section_node(config, "uplink");
         const YAML::Node sync = config_detail::section_node(config, "sync_tracking");
@@ -3948,9 +3912,6 @@ inline bool load_ue_config_from_yaml(Config& cfg, const std::string& filepath) {
         config_detail::load_value(rf, "rx_agc_high_threshold_db", cfg.rf_sampling.rx_agc_high_threshold_db);
         config_detail::load_value(rf, "rx_agc_max_step_db", cfg.rf_sampling.rx_agc_max_step_db);
         config_detail::load_value(rf, "rx_agc_update_frames", cfg.rf_sampling.rx_agc_update_frames);
-
-        config_detail::load_value(usrp, "device_args", cfg.usrp_device.device_args);
-        config_detail::load_value(usrp, "clock_source", cfg.clock_time.clock_source);
 
         config_detail::load_value(downlink, "center_freq", cfg.downlink.center_freq);
         config_detail::load_value(downlink, "modulation", cfg.downlink.modulation);
@@ -4238,11 +4199,11 @@ inline void log_ue_agc_mode(const Config& cfg) {
 }
 
 /**
- * @brief Synchronization search batch with source USRP timestamp.
+ * @brief Synchronization search batch with source-stream timestamp.
  */
 struct SyncBatch {
     AlignedVector data;
-    int64_t usrp_time_ns = -1;
+    int64_t source_time_ns = -1;
     uint64_t generation = 0;
 };
 
@@ -4250,18 +4211,7 @@ inline int64_t time_spec_to_ns(const radio::TimeSpec& time_spec) {
     return static_cast<int64_t>(std::llround(time_spec.get_real_secs() * 1e9));
 }
 
-inline int64_t time_spec_to_ns(const uhd::time_spec_t& time_spec) {
-    return static_cast<int64_t>(std::llround(time_spec.get_real_secs() * 1e9));
-}
-
 inline int64_t metadata_time_to_ns(const radio::RxMetadata& md) {
-    if (!md.has_time_spec) {
-        return -1;
-    }
-    return time_spec_to_ns(md.time_spec);
-}
-
-inline int64_t metadata_time_to_ns(const uhd::rx_metadata_t& md) {
     if (!md.has_time_spec) {
         return -1;
     }
@@ -4276,7 +4226,7 @@ inline int64_t metadata_time_to_ns(const uhd::rx_metadata_t& md) {
 struct RxFrame {
     AlignedVector frame_data;  // Received symbol collection
     int Alignment;
-    int64_t usrp_time_ns = -1; // USRP timestamp of the frame start sample
+    int64_t source_time_ns = -1; // Backend timestamp of the frame start sample
     int64_t host_enqueue_time_ns = 0; // Host timestamp after full-frame RX, before queue push
     uint64_t generation = 0;   // Sync generation used to drop stale frames after a hard resync
 };
@@ -4284,7 +4234,7 @@ struct RxFrame {
 /**
  * @brief Per-command timestamp gates for demod control actions.
  *
- * Each control action type keeps an independent "last executed" USRP timestamp.
+ * Each control action type keeps an independent last-executed backend timestamp.
  * A frame is allowed to issue a control action only if its source timestamp is
  * newer than the last execution timestamp of that same action type.
  */
@@ -4326,15 +4276,7 @@ public:
         mark_reset(time_spec_to_ns(now));
     }
 
-    void mark_reset_now(const uhd::time_spec_t& now) {
-        mark_reset(time_spec_to_ns(now));
-    }
-
     void mark_alignment_now(const radio::TimeSpec& now) {
-        mark_alignment(time_spec_to_ns(now));
-    }
-
-    void mark_alignment_now(const uhd::time_spec_t& now) {
         mark_alignment(time_spec_to_ns(now));
     }
 
@@ -4342,15 +4284,7 @@ public:
         mark_freq_adjust(time_spec_to_ns(now));
     }
 
-    void mark_freq_adjust_now(const uhd::time_spec_t& now) {
-        mark_freq_adjust(time_spec_to_ns(now));
-    }
-
     void mark_rx_gain_adjust_now(const radio::TimeSpec& now) {
-        mark_rx_gain_adjust(time_spec_to_ns(now));
-    }
-
-    void mark_rx_gain_adjust_now(const uhd::time_spec_t& now) {
         mark_rx_gain_adjust(time_spec_to_ns(now));
     }
 
@@ -5970,7 +5904,7 @@ private:
 
     void run() {
         async_logger::LoggerThreadModeGuard log_mode_guard(async_logger::LoggerThreadMode::NonRealtime);
-        uhd::set_thread_priority_safe();
+        radio::set_thread_priority();
 
         while (_running.load(std::memory_order_acquire)) {
             FrameData frame_data;
@@ -6548,7 +6482,7 @@ private:
 
     void run() {
         async_logger::LoggerThreadModeGuard log_mode_guard(async_logger::LoggerThreadMode::NonRealtime);
-        uhd::set_thread_priority_safe();
+        radio::set_thread_priority();
         SPSCBackoff backoff;
 
         while (_running.load(std::memory_order_acquire)) {

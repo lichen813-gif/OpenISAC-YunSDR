@@ -1,4 +1,4 @@
-// ChannelSimulator — the simulated "air" for running UHD_OFDM without USRP.
+// ChannelSimulator — the shared-memory simulated air interface.
 //
 // Reads the same YAML config as BS. Creates the shared-memory rings
 // and control block for the session, then continuously:
@@ -343,11 +343,6 @@ int main(int argc, char** argv) {
     apply_logging_config(cfg.logging);
     normalize_bs_sensing_channels(cfg);
 
-    if (!radio_is_sim(cfg)) {
-        LOG_G_WARN_M(ChannelSim) << "[ChannelSim] radio_backend is not 'sim' in " << config_file
-                     << "; running the simulator anyway.";
-    }
-
     const SimConfig& sim = cfg.simulation;
     const double fs = cfg.rf_sampling.sample_rate;
     const double sample_rate_offset_ppm = sim.sample_rate_offset_ppm;
@@ -642,7 +637,7 @@ int main(int argc, char** argv) {
 
         // Every simulated RX stream uses the same absolute origin as the first
         // downlink air sample. Consumers may seek forward from this point using
-        // timed stream commands, exactly like device-clock anchored UHD RX.
+        // timed stream commands anchored to the shared device clock.
         for (auto& r : sens_rings) {
             if (!r->timeline_origin_is_set() &&
                 !r->set_timeline_origin(chunk_start_sample)) {

@@ -11,11 +11,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         libboost-dev \
         libfftw3-dev \
-        libuhd-dev \
         libyaml-cpp-dev \
+        libzmq3-dev \
+        cppzmq-dev \
         nlohmann-json3-dev \
         pkg-config \
-        uhd-host \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --branch "${AFF3CT_REF}" --depth 1 https://github.com/aff3ct/aff3ct.git /tmp/aff3ct \
@@ -52,10 +52,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libfftw3-single3 \
         libgomp1 \
         libpython3.12t64 \
-        libuhd4.6.0t64 \
-        libusb-1.0-0 \
         libyaml-cpp0.8 \
-        uhd-host \
+        libzmq5 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local /usr/local
@@ -67,7 +65,6 @@ COPY PEGReg504x1008_Gen.alist /opt/openisac/
 COPY docker-entrypoint.sh /usr/local/bin/openisac-run
 
 RUN ldconfig \
-    && uhd_images_downloader \
     && chmod +x /usr/local/bin/openisac-run \
     && mkdir -p /work/build
 
@@ -76,4 +73,4 @@ ENV OPENISAC_HOME=/opt/openisac
 ENV OPENISAC_RUN_DIR=/work/build
 
 ENTRYPOINT ["openisac-run"]
-CMD ["modulator", "x310"]
+CMD ["ChannelSimulator", "sim"]

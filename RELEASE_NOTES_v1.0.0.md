@@ -13,11 +13,12 @@
 - SISO 高阶调制、2x2 与可扩展 MIMO、链路自适应相关设计和实现路线。
 - Windows C++ PHY 正式帧结构、VLC 视频信道仿真与运行说明。
 - 英文和中文 README、文档站源码以及构建后的静态手册。
-- X310、B210 与仿真后端的示例配置。
+- 成对的基础、双工、eRTM 与资源映射仿真配置。
+- 可复现 C++ 正式帧测试所需的非视频金向量。
 
 ### 说明
 
-该版本面向科研原型与算法验证，不以 Wi-Fi/5G NR 标准兼容或生产部署为目标。硬件运行前请根据实际射频前端、采样率、时钟与网络环境调整 YAML 配置。
+该版本面向科研原型与算法验证，不以 Wi-Fi/5G NR 标准兼容或生产部署为目标。当前版本仅支持 ChannelSimulator；原 UHD/USRP 实现与配置已移除，`libyunsdr` 接口将在真实后端完成并验证后更新。
 
 ## English
 
@@ -30,8 +31,9 @@ This is the first public release of OpenISAC-YunSDR. It packages the current int
 - Design and implementation roadmaps for higher-order SISO modulation, 2x2 and scalable MIMO, and link adaptation.
 - Windows C++ PHY framing, VLC video-channel simulation, and operating guides.
 - English and Chinese READMEs, documentation-site sources, and generated static manuals.
-- Example configurations for X310, B210, and simulation backends.
+- Paired baseline, duplex, eRTM, and resource-map simulation configurations.
+- Non-video golden vectors required to reproduce the formal C++ frame tests.
 
 ### Notes
 
-This release targets research prototyping and algorithm validation. It does not aim for Wi-Fi/5G NR standards compliance or production deployment. Before running with hardware, adapt the YAML configuration to the actual RF front end, sample rate, clocking, and network environment.
+This release targets research prototyping and algorithm validation. It does not aim for Wi-Fi/5G NR standards compliance or production deployment. It currently supports ChannelSimulator only; the former UHD/USRP implementation and presets are removed, and the `libyunsdr` interface will be documented after a real backend is implemented and verified.

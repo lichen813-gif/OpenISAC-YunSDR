@@ -53,9 +53,9 @@ inline int fftshift_index(int original_index, int N) {
 }
 
 /**
- * @brief Calculate effective RX center frequency in Hz for UHD tuning.
+ * @brief Calculate effective RX center frequency from backend tune results.
  *
- * UHD RX path effective center is RF - DSP.
+ * The receive path effective center is RF - DSP.
  */
 inline double rx_effective_center_hz(double actual_rf_freq_hz, double actual_dsp_freq_hz) {
     return actual_rf_freq_hz - actual_dsp_freq_hz;

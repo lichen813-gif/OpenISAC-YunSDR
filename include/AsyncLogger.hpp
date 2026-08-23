@@ -50,7 +50,7 @@ enum class LogModule : uint16_t {
     Root = 0,
     Config,
     Radio,
-    RadioUhd,
+    RadioDevice,
     RadioSim,
     Sync,
     Demod,

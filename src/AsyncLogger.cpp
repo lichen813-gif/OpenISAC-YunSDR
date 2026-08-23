@@ -77,7 +77,7 @@ constexpr LogModuleInfo kModuleTable[] = {
     {LogModule::Root, LogModule::Root, "", "root"},
     {LogModule::Config, LogModule::Root, "config", "Config / YAML"},
     {LogModule::Radio, LogModule::Root, "radio", "Radio"},
-    {LogModule::RadioUhd, LogModule::Radio, "radio.uhd", "UHD / USRP"},
+    {LogModule::RadioDevice, LogModule::Radio, "radio.device", "Radio device"},
     {LogModule::RadioSim, LogModule::Radio, "radio.sim", "Sim backend"},
     {LogModule::Sync, LogModule::Root, "sync", "Sync / CFO / align (debug)"},
     {LogModule::Demod, LogModule::Root, "demod", "Demodulator (debug)"},

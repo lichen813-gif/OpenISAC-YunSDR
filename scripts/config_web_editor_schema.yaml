@@ -6,11 +6,10 @@ common:
   - type: scalar
     key: radio_backend
     kind: string
-    comment: Radio I/O backend; uhd = real USRP, sim = channel simulator
-    default: uhd
+    comment: Radio I/O backend; current release supports the channel simulator only
+    default: sim
     optional: true
     options:
-    - uhd
     - sim
 - title: Channel simulator
   yaml_key: simulation
@@ -204,10 +203,6 @@ common:
       title: Radio
       comment: Radio backend (debug)
       depth: 0
-    - path: radio.uhd
-      title: UHD / USRP
-      comment: Real USRP path (debug)
-      depth: 1
     - path: radio.sim
       title: Sim backend
       comment: Simulation HAL (debug)
@@ -626,37 +621,6 @@ bs:
     - sc16
     - sc8
   - type: scalar
-    key: rx_device_args
-    data_key: sensing.rx_device_args
-    kind: string
-    comment: Default sensing RX args (empty = use device_args)
-    default: ''
-    optional: true
-  - type: scalar
-    key: rx_clock_source
-    data_key: sensing.rx_clock_source
-    kind: string
-    comment: Sensing RX clock source override (optional)
-    default: ''
-    optional: true
-    options:
-    - ''
-    - internal
-    - external
-    - gpsdo
-  - type: scalar
-    key: rx_time_source
-    data_key: sensing.rx_time_source
-    kind: string
-    comment: Sensing RX time source override (optional)
-    default: ''
-    optional: true
-    options:
-    - ''
-    - internal
-    - external
-    - gpsdo
-  - type: scalar
     key: rx_channel_count
     data_key: sensing.rx_channel_count
     kind: int
@@ -669,32 +633,10 @@ bs:
     comment: ''
     optional: false
     item_fields:
-    - key: usrp_channel
-      comment: USRP RX channel index for this sensing path
+    - key: stream_channel
+      comment: Logical RX stream channel for this sensing path
       kind: int
-      default: 1
-    - key: device_args
-      comment: Per-channel USRP args override (optional)
-      kind: string
-      default: ''
-    - key: clock_source
-      comment: Per-channel clock source override (optional)
-      kind: string
-      default: ''
-      options:
-      - ''
-      - internal
-      - external
-      - gpsdo
-    - key: time_source
-      comment: Per-channel time source override (optional)
-      kind: string
-      default: ''
-      options:
-      - ''
-      - internal
-      - external
-      - gpsdo
+      default: 0
     - key: wire_format
       comment: Per-channel wire format override (optional)
       kind: string
@@ -711,14 +653,6 @@ bs:
       comment: Per-channel timing alignment offset (samples)
       kind: int
       default: 63
-    - key: rx_antenna
-      comment: RX antenna port (e.g. RX1/RX2/TX/RX)
-      kind: string
-      default: RX2
-      options:
-      - RX1
-      - RX2
-      - TX/RX
     - key: enable_system_delay_estimation
       comment: If true, this channel runs delay estimation only and disables sensing pipeline
       kind: bool
@@ -813,41 +747,6 @@ bs:
     comment: Analog bandwidth (Hz), usually same as sample_rate
     default: 50000000
     optional: true
-- title: USRP Device Args
-  yaml_key: usrp_device
-  order: 13
-  fields:
-  - type: scalar
-    key: device_args
-    kind: string
-    comment: Shared fallback args
-    default: addr=192.168.40.2, master_clock_rate=200e6, num_recv_frames=2048, num_send_frames=2048
-    optional: true
-- title: Clock / Time Sources
-  yaml_key: clock_time
-  order: 14
-  fields:
-  - type: scalar
-    key: clock_source
-    kind: string
-    comment: Global clock source; internal/external/gpsdo
-    default: external
-    optional: true
-    options:
-    - internal
-    - external
-    - gpsdo
-  - type: scalar
-    key: time_source
-    kind: string
-    comment: Global time source; empty follows clock_source
-    default: internal
-    optional: true
-    options:
-    - ''
-    - internal
-    - external
-    - gpsdo
 - title: Downlink
   yaml_key: downlink
   order: 30
@@ -878,37 +777,9 @@ bs:
   - type: scalar
     key: tx_channel
     kind: int
-    comment: TX channel index on USRP
+    comment: Logical TX stream channel
     default: 67.0
     optional: true
-  - type: scalar
-    key: tx_device_args
-    kind: string
-    comment: TX-specific args (empty = use device_args)
-    default: ''
-    optional: true
-  - type: scalar
-    key: tx_clock_source
-    kind: string
-    comment: TX clock source override (optional)
-    default: ''
-    optional: true
-    options:
-    - ''
-    - internal
-    - external
-    - gpsdo
-  - type: scalar
-    key: tx_time_source
-    kind: string
-    comment: TX time source override (optional)
-    default: ''
-    optional: true
-    options:
-    - ''
-    - internal
-    - external
-    - gpsdo
   - type: scalar
     key: wire_format_tx
     kind: string
@@ -1064,7 +935,7 @@ bs:
     key: rx_channel
     data_key: uplink.rx_channel
     kind: int
-    comment: Uplink RX channel index on USRP
+    comment: Logical uplink RX stream channel
     default: 67.0
     optional: true
   - type: scalar
@@ -1077,37 +948,6 @@ bs:
     options:
     - sc16
     - sc8
-  - type: scalar
-    key: rx_device_args
-    data_key: uplink.rx_device_args
-    kind: string
-    comment: Uplink RX-specific args (empty = use TX/shared device)
-    default: ''
-    optional: true
-  - type: scalar
-    key: rx_clock_source
-    data_key: uplink.rx_clock_source
-    kind: string
-    comment: Uplink RX clock source override (optional)
-    default: ''
-    optional: true
-    options:
-    - ''
-    - internal
-    - external
-    - gpsdo
-  - type: scalar
-    key: rx_time_source
-    data_key: uplink.rx_time_source
-    kind: string
-    comment: Uplink RX time source override (optional)
-    default: ''
-    optional: true
-    options:
-    - ''
-    - internal
-    - external
-    - gpsdo
   - type: scalar
     key: rx_agc_enable
     kind: bool
@@ -1704,26 +1544,6 @@ ue:
     comment: RX gain (dB)
     default: 10
     optional: true
-- title: USRP Device / Link
-  yaml_key: usrp_device
-  order: 13
-  fields:
-  - type: scalar
-    key: device_args
-    kind: string
-    comment: USRP args
-    default: addr=192.168.40.2, master_clock_rate=200e6, num_recv_frames=2048, num_send_frames=2048
-    optional: true
-  - type: scalar
-    key: clock_source
-    kind: string
-    comment: Clock source; internal/external/gpsdo
-    default: external
-    optional: true
-    options:
-    - internal
-    - external
-    - gpsdo
 - title: Downlink
   yaml_key: downlink
   order: 30
@@ -1758,7 +1578,7 @@ ue:
   - type: scalar
     key: rx_channel
     kind: int
-    comment: RX channel index on USRP
+    comment: Logical downlink RX stream channel
     default: 0
     optional: true
   - type: scalar
@@ -1919,7 +1739,7 @@ ue:
   - type: scalar
     key: tx_channel
     kind: int
-    comment: Uplink TX channel index on USRP
+    comment: Logical uplink TX stream channel
     default: 0
     optional: true
   - type: scalar

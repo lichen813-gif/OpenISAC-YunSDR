@@ -6,113 +6,138 @@
   </picture>
 </p>
 
-# OpenISAC
+# OpenISAC-YunSDR：搭建与使用说明
 
-[English Version](README.md) | [更新日志](CHANGELOG.md)
+[English](README.md) | [设计文档](docs/design/README.md) | [更新日志](CHANGELOG.md)
 
-OpenISAC 是一个面向实时实验的 OFDM 通信感知一体化（ISAC）平台，重点服务于学术研究和 PHY 层快速迭代。
+本仓库第一版包含完整的 C++/Python 程序源码、配置文件和中英文设计说明，不包含视频文件。
 
-它试图填补“纯仿真代码”和“完整标准协议栈”之间的空档：既尽量保持代码简洁、容易修改，又能基于 USRP 直接开展空口实验。
+> 当前后端状态：本版本仅支持软件信道仿真。原 UHD/USRP 实现、编译依赖和硬件配置已全部移除。仓库保留厂商无关的 `RadioBackend` 边界，供后续接入 `libyunsdr`；只有在真实后端实现并验证后，才会更新具体接口名称和配置，当前不预设或虚构 `libyunsdr` API。
 
-如果你的目标是用一个足够轻量、易读、可快速改造的系统，把算法思路尽快跑到 OTA 实验里，这个仓库适合你；如果你需要 Wi-Fi/5G NR 互操作性或生产级协议栈，它并不适合。
+## 组成
 
-## 项目亮点
+| 组件 | 入口 | 作用 |
+| --- | --- | --- |
+| 信道仿真 | `ChannelSimulator` | 通信/感知共享内存链路、噪声、CFO/SRO、时延、多径和目标模拟 |
+| 基站 | `BS` | OFDM 下行、可选上行接收、单站感知、UDP/ZMQ 输入输出 |
+| 终端 | `UE` | 下行同步解调、可选上行发送、双站感知 |
+| 前端工具 | `scripts/` | 感知绘图、诊断、配置与控制工具 |
+| 正式 PHY | `cpp_phy/`、`python_phy/` | 跨语言帧结构、MIMO、调制、LDPC 和回归验证 |
 
-- 支持实时 OFDM 通信，以及单站和双站感知
-- 支持双站实验所需的空口同步机制
-- 后端采用 C++ 实时链路，前端提供 Python 可视化与工具脚本
-- 基于 YAML 的运行时配置，仓库内提供 X310/B210 样例，也可扩展到其他 UHD 支持的 USRP
-- 自带 CPU 隔离、绘图分析、网页配置与进程控制工具
+## 环境依赖
 
-## 一眼看懂
+主实时程序面向 C++17 Linux 环境，依赖 Boost 1.66+、OpenMP、AFF3CT 3.0.2+、FFTW3f（含 `fftw3f_threads`）、yaml-cpp、libzmq 和 cppzmq；DPDK 可选。
 
-| 组件 | 主要入口 | 作用 |
-| :--- | :--- | :--- |
-| BS 后端 | `BS`、`config/BS_*.yaml` | 发送 OFDM 帧、接收业务 UDP，并输出单站感知结果 |
-| UE 后端 | `UE`、`config/UE_*.yaml` | 接收解调 OFDM 帧、输出业务数据，并运行双站感知 |
-| 前端工具 | `scripts/plot_*.py`、`scripts/config_web_editor.py` | 显示感知/信道结果，并编辑运行时配置 |
+Ubuntu/Debian 可先安装系统依赖：
 
-## 快速导航
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake pkg-config \
+  libboost-all-dev libfftw3-dev libyaml-cpp-dev \
+  libzmq3-dev cppzmq-dev nlohmann-json3-dev python3-venv
+```
 
-- 文档站点：[英文手册](https://openisac.zzw123app.top/docs/) 和 [中文手册](https://openisac.zzw123app.top/zh-cn/docs/)
-- 环境准备与安装：[硬件准备](https://openisac.zzw123app.top/zh-cn/docs/getting-started/hardware/)、[软件安装](https://openisac.zzw123app.top/zh-cn/docs/getting-started/installation/)、[编译](https://openisac.zzw123app.top/zh-cn/docs/getting-started/build/)
-- 先跑起来：[首次 OTA 运行](https://openisac.zzw123app.top/zh-cn/docs/getting-started/first-ota-run/)
-- 运行参数说明：[BS YAML 参考](https://openisac.zzw123app.top/zh-cn/docs/reference/bs-yaml/) 和 [UE YAML 参考](https://openisac.zzw123app.top/zh-cn/docs/reference/ue-yaml/)
-- 无 USRP 仿真：[信道仿真器](https://openisac.zzw123app.top/zh-cn/docs/tools-workflows/channel-simulator/)
-- 网页控制台：[Web Config Console](https://openisac.zzw123app.top/zh-cn/docs/tools-workflows/web-config-console/)
-- 设计文档：[设计说明索引](docs/design/README.md)
-- 最近更新：[更新日志](CHANGELOG.md)
+另外安装 AFF3CT 3.0.2 或更高版本并记下安装前缀。本版本不需要安装 UHD。
 
-## 仓库结构
+## 编译
 
-| 路径 | 说明 |
-| :--- | :--- |
-| `src/`、`include/` | 核心 C++ PHY、感知、线程与运行时逻辑 |
-| `config/` | 不同角色的 YAML 样例配置，内含 X310/B210 示例，也可作为其他 USRP 的起点 |
-| `scripts/` | Python 前端、网页配置控制台、Linux 性能调优脚本 |
-| `capture/` | 离线感知结果绘图工具 |
-| `docs/` | 项目静态站点，以及架构/信号处理说明页 |
+```bash
+git clone https://github.com/lichen813-gif/OpenISAC-YunSDR.git
+cd OpenISAC-YunSDR
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAFF3CT_ROOT=/path/to/aff3ct/prefix
+cmake --build build -j"$(nproc)"
+```
 
-## 它是什么，又不是什么？
+AFF3CT 位于系统标准路径时可省略 `-DAFF3CT_ROOT`。主要产物为 `build/ChannelSimulator`、`build/BS` 和 `build/UE`。
 
-### OpenISAC 是什么？
+Python 工具环境：
 
-- 一个面向通信感知一体化研究的极简 OFDM PHY
-- 适合原型验证、学术实验与快速算法迭代
-- 更强调代码可读性、易改性和实验效率，而不是全栈完备性
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
-### OpenISAC 不是什么？
+## 第一次运行仿真
 
-- 不是标准兼容实现，不以 Wi-Fi 或 5G NR 兼容为目标
-- 不是 openwifi、OpenAirInterface 这类全栈系统的替代品
-- 不是生产级通信协议栈
+BS 和 UE 必须使用成对配置。从仓库根目录执行：
 
-### 何时使用它
+```bash
+cp config/BS_Sim.yaml build/BS.yaml
+cp config/UE_Sim.yaml build/UE.yaml
+```
 
-- 快速验证新的 OFDM/ISAC 算法
-- 将同步、感知或 PHY 思路尽快跑到空口实验
-- 不要求互操作性的科研环境
+在 `build/` 下打开三个终端，按顺序启动：
 
-### 何时不使用它
+```bash
+# 终端 1
+./ChannelSimulator BS.yaml
 
-- 需要构建兼容 Wi-Fi/NR 的系统
-- 需要完整 MAC/协议栈、互操作性或面向认证的行为
+# 终端 2
+./BS BS.yaml
 
-## 引用
+# 终端 3
+./UE UE.yaml
+```
 
-如果您觉得这个仓库有用，请引用我们的论文：
+仿真器必须先启动，BS 和 UE 会连接它创建的共享内存会话。上行/双工实验使用 `BS_Sim_Duplex.yaml` + `UE_Sim_Duplex.yaml`，eRTM 使用 `BS_Sim_eRTM.yaml` + `UE_Sim_eRTM.yaml`；ResourceMap 配置也应按文件名成对使用。
 
-> Z. Zhou, C. Zhang, X. Xu, and Y. Zeng, "OpenISAC: An Open-Source Real-Time Experimentation Platform for OFDM-ISAC with Over-the-Air Synchronization," *arXiv preprint* arXiv:2601.03535, Jan. 2026.
->
-> [[arXiv](https://arxiv.org/pdf/2601.03535)]
+在仓库根目录可启动感知前端：
 
-## 作者
+```bash
+python scripts/plot_sensing_fast.py
+python scripts/plot_bi_sensing_fast.py
+```
 
-- 周智文 (zhiwen_zhou@seu.edu.cn)
-- 张超越 (chaoyue_zhang@seu.edu.cn)
-- 徐晓莉 (Member, IEEE) (xiaolixu@seu.edu.cn)
-- 曾勇 (Fellow, IEEE) (yong_zeng@seu.edu.cn)
+## 运行时物理层可调参数
 
-## 所属机构
+主程序 `BS`/`UE` 的帧结构由 YAML 控制。所有收发双方共享的结构参数必须一致。
 
-<img src="docs/images/SEUlogo.png" height="80" alt="SEU Logo" style="border:none; box-shadow:none;"> &nbsp;&nbsp; <img src="docs/images/PML.png" height="80" alt="PML Logo" style="border:none; box-shadow:none;">
+| YAML 区域 | 可调整字段 | 作用 |
+| --- | --- | --- |
+| `rf_sampling` | `sample_rate`、`bandwidth` | 采样时钟和占用带宽 |
+| `ofdm_frame` | `fft_size`、`cp_length`、`num_symbols`、`sync_pos` | 基本 OFDM 帧格式 |
+| `ofdm_frame` | `enable_sec_sync_symbol`、`enable_cfo_training_sequence`、`cfo_training_period_samples` | 同步与 CFO 训练格式 |
+| `ofdm_frame` | `zc_root`、`pilot_positions`、`midframe_pilot_symbols`、`midframe_pilot_seed` | 前导和导频布局 |
+| `downlink` | `center_freq`、`modulation` | 调制支持 `qpsk`、`16qam`、`64qam`、`256qam` |
+| `uplink` | 双工开关/模式、`symbol_start`、`symbol_count`、`guard_symbols` | 双工预设中的 TDD/FDD 和上行时隙 |
+| `sensing` | `rx_channel_count`、`range_fft_size`、`doppler_fft_size`、`symbol_stride`、`output_mode` | 感知阵列与处理维度 |
+| `simulation` | `target_snr_db`、`noise_power_dbfs`、`cfo_hz`、`sample_rate_offset_ppm`、`timing_offset_samples` | 链路损伤 |
+| `simulation` | `comm_multipath_taps`、`targets`、`bistatic_targets`、阵元间距 | 多径和感知场景 |
 
-**东南大学移动通信国家重点实验室 & 紫金山实验室 曾勇课题组**
+配置约束：
 
-## 社区
+- BS/UE 的采样率、FFT/CP、帧符号数、同步格式、ZC 根、导频位置/种子、调制方式和双工窗口必须匹配。
+- 导频与同步索引必须在 FFT/帧范围内；`sensing_symbol_num` 不得大于 `num_symbols`。
+- TDD 下 `symbol_start + symbol_count` 不得超过 `num_symbols`，保护符号会占用上行窗口。
+- CP 应长于需要避免符号间干扰的最大信道时延。
+- ChannelSimulator、BS、UE 必须使用相同的 `simulation.session`；同时运行多组实例时不能复用 UDP/ZMQ 端口。
 
-- [加入我们的 QQ 群](https://qm.qq.com/q/NIQRNGb0kY)
-- [Bilibili 频道 (曾勇课题组)](https://space.bilibili.com/627920129)
-- 微信公众号:
+[`config/`](config/) 中的样例是可直接运行的权威配置，并带字段级注释。
 
-  <img src="docs/images/WeChat.jpg" width="150" alt="WeChat QR Code">
+## C++/Python 正式帧
 
-## 付费服务与配套硬件
+独立的 `cpp_phy` 兼容配置比运行时 YAML 更严格：FFT 1024、CP 128、1 个 ZC 符号 + 2 个数据符号、128 个控制 RE、两个物理发射端口和 LDPC(1008,504)。可动态选择 Rank 1/2 与 QPSK/16/64/256-QAM，对应用户载荷容量为：
 
-如需更高的实时处理性能或更完整的实验系统，我们还计划提供：
+| Rank | QPSK | 16-QAM | 64-QAM | 256-QAM |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 124 B | 250 B | 439 B | 565 B |
+| 2 | 250 B | 565 B | 880 B | 1195 B |
 
-- OpenISAC CUDA 加速版本
-- USB Controlled OCXO，用于时钟校准与频率控制
-- 软赫（SoftHertz）相控阵控制板，用于相控阵实验与系统集成
+在正式帧路径中，FFT 大小和 128 控制 RE 是兼容常量，不是运行时旋钮；修改时必须同步更新 C++/Python 实现与测试向量。详见[正式帧结构与使用说明](Windows_C++_PHY正式帧结构与使用说明.md)、[C++ PHY](cpp_phy/README.md)和 [Python PHY](python_phy/README.md)。
 
-如需了解GPU加速版本、硬件、系统集成或定制服务，请发送邮件至 [zhiwen_zhou@seu.edu.cn](mailto:zhiwen_zhou@seu.edu.cn) 或 [yong_zeng@seu.edu.cn](mailto:yong_zeng@seu.edu.cn)，或通过微信 `wxid_9hvmm83maklc22` 联系。
+## libyunsdr 接入状态
+
+仓库当前没有 `libyunsdr` 源码、SDK 依赖、设备配置或接口兼容声明。后续硬件版本应基于已验证的 SDK 实现现有设备/流边界，增加硬件预设，并补充初始化、时钟、收发流、错误处理和实测结果。路线说明见[最新物理层感知验证与 libyunsdr 路线](最新物理层感知验证与libyunsdr路线.md)。
+
+## 测试
+
+```bash
+python -m pytest python_phy/tests -q
+```
+
+C++ 正式 PHY 的 Windows 辅助脚本位于 `cpp_phy/`，包括 `build_windows_vs2019.cmd` 和 `run_cpp_tests.cmd`。
+
+## 许可与原项目引用
+
+本仓库保留适用的[许可证](LICENSE)。原有开源项目介绍、作者、社区和服务信息不再放在首页；原项目与引用信息请查看[原始 OpenISAC 仓库](https://github.com/zhouzhiwen2000/OpenISAC)和 [OpenISAC 论文（arXiv:2601.03535）](https://arxiv.org/abs/2601.03535)。

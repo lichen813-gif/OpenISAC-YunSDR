@@ -4,8 +4,15 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 #include "AsyncLogger.hpp"
 
@@ -176,7 +183,7 @@ size_t SimRxStream::recv(sample_t* buff, size_t nsamps, RxMetadata& metadata,
     const int64_t first_sample = _ring->absolute_consumed();
     const double tick_rate = _ctrl->tick_rate() > 0.0 ? _ctrl->tick_rate() : 1.0;
 
-    // Honor the timeout (like a real USRP) so the caller's loop can re-check its
+    // Honor the timeout so the caller's loop can re-check its
     // own running flag and shut down even while the hub is still alive.
     const size_t got = _ring->pop_block(buff, nsamps, running, timeout);
 
@@ -260,7 +267,7 @@ TuneResult SimDevice::set_tx_freq(const TuneRequest& req, size_t /*chan*/) {
         req.dsp_freq_policy == TunePolicy::Manual;
     const double dsp = (req.dsp_freq_policy == TunePolicy::Manual) ? req.dsp_freq : 0.0;
     if (manual_retune && _ctrl) {
-        // Share the logical emitted-carrier shift, not UHD's TX DSP sign. The UE
+        // Share the logical emitted-carrier shift. The UE
         // constructs manual requests with target_freq = rf_freq + correction.
         _ctrl->set_uplink_tx_freq_correction_hz(req.target_freq - req.rf_freq);
     }
@@ -325,6 +332,49 @@ bool SimDevice::running() const {
 
 IDevicePtr make_sim_device(const DeviceConfig& cfg) {
     return std::make_shared<SimDevice>(cfg);
+}
+
+IDevicePtr make_device(const DeviceConfig& cfg) {
+    if (cfg.backend != "sim") {
+        throw std::invalid_argument(
+            "Unsupported radio backend '" + cfg.backend +
+            "'. This revision ships only the simulator backend; libyunsdr is pending.");
+    }
+    if (cfg.sim_session.empty()) {
+        throw std::invalid_argument("Simulator session must not be empty.");
+    }
+
+    static std::mutex registry_mutex;
+    static std::map<std::string, std::weak_ptr<IDevice>> registry;
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    auto& slot = registry[cfg.sim_session];
+    if (auto existing = slot.lock()) {
+        return existing;
+    }
+    auto device = make_sim_device(cfg);
+    slot = device;
+    return device;
+}
+
+void set_thread_priority(float priority, bool realtime) {
+#if defined(__linux__) || defined(__APPLE__)
+    if (!realtime) {
+        return;
+    }
+    const int minimum = sched_get_priority_min(SCHED_FIFO);
+    const int maximum = sched_get_priority_max(SCHED_FIFO);
+    if (minimum < 0 || maximum < minimum) {
+        return;
+    }
+    const float bounded = std::max(0.0f, std::min(1.0f, priority));
+    sched_param params{};
+    params.sched_priority = minimum + static_cast<int>(
+        std::lround(bounded * static_cast<float>(maximum - minimum)));
+    (void)pthread_setschedparam(pthread_self(), SCHED_FIFO, &params);
+#else
+    (void)priority;
+    (void)realtime;
+#endif
 }
 
 }  // namespace radio

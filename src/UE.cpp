@@ -1,4 +1,3 @@
-#include <uhd/utils/safe_main.hpp>  // UHD_SAFE_MAIN entry macro only
 #include <algorithm>
 #include <complex>
 #include <vector>
@@ -209,9 +208,9 @@ AlignedVector make_cfo_training_sequence(const Config& cfg)
  * @brief OFDM Receiver Engine.
  * 
  * Main class for OFDM Demodulation and ISAC Sensing Receiver.
- * Integrates UHD for USRP control, FFTW for signal processing, and aff3ct for LDPC decoding.
+ * Integrates the simulator radio I/O abstraction, FFTW signal processing, and aff3ct LDPC decoding.
  * Implements a multi-threaded architecture:
- * - rx_thread: Receives raw samples from USRP.
+ * - rx_thread: Receives raw samples from the radio I/O backend.
  * - process_thread: Performs OFDM FFT, Channel Estimation, Equalization.
  * - sensing_thread: Accumulated channel response for further analysis.
  * - bit_processing_thread: Soft Demodulation, LDPC Decoding, and UDP output.
@@ -233,7 +232,7 @@ public:
           sync_queue_(cfg.sync_tracking.sync_queue_size, [&cfg]() {
               SyncBatch batch;
               batch.data.resize(cfg.sync_samples());
-              batch.usrp_time_ns = -1;
+              batch.source_time_ns = -1;
               batch.generation = 0;
               return batch;
           }),
@@ -527,7 +526,7 @@ private:
     double _uplink_tx_gain_restore_db = 0.0;
     std::atomic<bool> _uplink_tx_gain_muted{false};
 
-    // Current radio time: real USRP clock, or the simulator's shared sample clock.
+    // Current radio time from the simulator's shared sample clock.
     radio::TimeSpec radio_time_now() const {
         return dev_->time_now();
     }
@@ -543,7 +542,7 @@ private:
         // seconds, so several restarts landing in the same lead window (e.g.
         // back-to-back underflows) would otherwise all pick the same timestamp;
         // the later burst then collides with the earlier one on the radio and
-        // the USRP rejects it with a TIME_ERROR, which triggers yet another
+        // the backend rejects it with a TIME_ERROR, which triggers yet another
         // restart -- a self-sustaining storm. Force each start strictly after
         // the previous one so restarts serialize cleanly instead.
         if (_last_scheduled_stream_start_s > 0.0 &&
@@ -2615,11 +2614,6 @@ private:
     radio::IDevicePtr _make_device() {
         radio::DeviceConfig dcfg;
         dcfg.backend = cfg_.radio.radio_backend;
-        dcfg.device_args = cfg_.usrp_device.device_args;
-        dcfg.clock_source = cfg_.clock_time.clock_source;
-        // The UE only ever set the clock source (never the time source); leave it
-        // empty so the UHD backend does not apply one.
-        dcfg.time_source = "";
         dcfg.sim_session = cfg_.simulation.session;
         dcfg.sim_tick_rate = cfg_.rf_sampling.sample_rate;
         dcfg.sim_center_freq = cfg_.downlink.center_freq;
@@ -2627,17 +2621,14 @@ private:
         return radio::make_device(dcfg);
     }
 
-    // Backend-independent radio init. The real radio tunes/gains a USRP; the
-    // simulator attaches RX (and uplink TX) to the hub's shared-memory rings.
-    // Hardware-only behavior is gated on IDevice capability queries.
+    // Attach downlink RX and optional uplink TX to ChannelSimulator.
     void init_radio() {
-        const bool is_sim = radio_is_sim(cfg_);
         dev_ = _make_device();
         dev_->set_rx_rate(cfg_.rf_sampling.sample_rate);
         dev_->set_rx_bandwidth(cfg_.rf_sampling.bandwidth, cfg_.downlink.rx_channel);
         current_rx_tune_ = dev_->set_rx_freq(radio::TuneRequest(cfg_.downlink.center_freq), cfg_.downlink.rx_channel);
         tune_initialized_ = true;
-        dev_->set_rx_freq_correction(0.0);  // reset comm correction (sim); no-op on real
+        dev_->set_rx_freq_correction(0.0);  // reset simulator communication correction
         LOG_G_INFO_M(Radio) << "Actual RX RF Freq: " << format_freq_hz(current_rx_tune_.actual_rf_freq)
                      << " Hz, DSP: " << format_freq_hz(current_rx_tune_.actual_dsp_freq)
                      << " Hz";
@@ -2672,10 +2663,8 @@ private:
         args.channels = {cfg_.downlink.rx_channel};
         rx_stream_ = dev_->get_rx_stream(args);
 
-        if (is_sim) {
-            LOG_G_INFO_M(Radio) << "RX radio backend: SIMULATION (session='" << cfg_.simulation.session
-                         << "', no USRP).";
-        }
+        LOG_G_INFO_M(Radio) << "RX radio backend: SIMULATION (session='"
+                     << cfg_.simulation.session << "').";
 
         if (uplink_enabled(cfg_)) {
             _init_uplink_tx();
@@ -2683,7 +2672,6 @@ private:
     }
 
     void _init_uplink_tx() {
-        const bool is_sim = radio_is_sim(cfg_);
         // Full-duplex uplink TX on the UE device. TDD: same carrier as RX.
         // FDD: the uplink carrier (duplex.ul_center_freq).
         const double ul_freq = (cfg_.uplink.duplex.mode == DuplexMode::FDD &&
@@ -2719,7 +2707,7 @@ private:
         _uplink_tx->set_tx_stream(dev_->get_tx_stream(tx_args));
         _uplink_tx->timing_advance().store(cfg_.uplink.ue_timing_advance, std::memory_order_relaxed);
         if (LOG_MOD_ON(UlTx)) {
-            LOG_G_INFO_M(UlTx) << "[UL-TX] uplink transmit enabled" << (is_sim ? " (sim ul.tx)" : "")
+            LOG_G_INFO_M(UlTx) << "[UL-TX] uplink transmit enabled (sim ul.tx)"
                          << " on TX ch " << cfg_.uplink.tx_channel
                          << " @ " << format_freq_hz(ul_freq) << " Hz, "
                          << _uplink_tx->uplink_config().ofdm.num_symbols << " UL symbols/frame, "
@@ -3073,7 +3061,7 @@ private:
             tx_target_correction_hz *= ul_base_freq / cfg_.downlink.center_freq;
         }
 
-        // UHD applies DSP tune signs differently: RX target = RF + DSP, TX target = RF - DSP.
+        // RX and TX correction signs differ at the backend abstraction boundary.
         const double tx_dsp_correction_hz = -tx_target_correction_hz;
         radio::TuneRequest tx_tune_req;
         tx_tune_req.target_freq = ul_base_freq + tx_target_correction_hz;
@@ -3340,7 +3328,7 @@ private:
     /**
      * @brief Rx Streamer Thread Function.
      * 
-     * Continuous loop that receives baseband samples from the USRP.
+     * Continuous loop that receives baseband samples from the radio backend.
      * Implements a state machine (SYNC_SEARCH -> ALIGNMENT -> NORMAL) to handle
      * frame synchronization and alignment before normal reception.
      */
@@ -3542,7 +3530,7 @@ private:
                 << _sync_generation.load(std::memory_order_relaxed);
             return;
         }
-        sync_batch->usrp_time_ns = first_time_ns;
+        sync_batch->source_time_ns = first_time_ns;
         sync_batch->generation = batch_generation;
         sync_queue_.producer_commit();
     }
@@ -3605,7 +3593,7 @@ private:
         // Acquire pre-allocated RX frame from pool
         RxFrame frame = _rx_frame_pool.acquire();
         frame.Alignment = alignment_samples;
-        frame.usrp_time_ns = frame_time_ns;
+        frame.source_time_ns = frame_time_ns;
         frame.host_enqueue_time_ns = do_latency_profile ? host_now_ns() : 0;
         frame.generation = _sync_generation.load(std::memory_order_acquire);
         if (positive_shift > 0) {
@@ -3716,7 +3704,7 @@ private:
         // Acquire pre-allocated RX frame from pool
         RxFrame frame = _rx_frame_pool.acquire();
         frame.Alignment = 0;
-        frame.usrp_time_ns = -1;
+        frame.source_time_ns = -1;
         frame.host_enqueue_time_ns = 0;
         frame.generation = _sync_generation.load(std::memory_order_acquire);
         size_t received = 0;
@@ -3732,7 +3720,7 @@ private:
                 break;
             }
             if (received == 0 && got > 0) {
-                frame.usrp_time_ns = metadata_time_to_ns(md);
+                frame.source_time_ns = metadata_time_to_ns(md);
             }
             received += got;
         }
@@ -3750,7 +3738,7 @@ private:
             if (remaining > 0) {
                 _log_rx_timestamp_boundary(
                     "normal_frame_start",
-                    frame.usrp_time_ns,
+                    frame.source_time_ns,
                     0,
                     true);
             }
@@ -4082,7 +4070,7 @@ private:
         size_t launch_slot_idx = 0;
         size_t collect_slot_idx = 0;
         // process_proc has frame queues / pipeline slots as cushion — cooperative
-        // backoff is acceptable (only USRP sample ingest is hard-RT).
+        // backoff is acceptable (only sample ingest is hard-RT).
         SPSCBackoff sync_backoff;
         const bool do_latency_profile =
             LOG_MOD_ON(DemodProfiling);
@@ -4219,7 +4207,7 @@ private:
                     sync_queue_.consumer_pop();
                     continue;
                 }
-                process_sync_data(sync_batch->data, sync_batch->usrp_time_ns);
+                process_sync_data(sync_batch->data, sync_batch->source_time_ns);
                 sync_queue_.consumer_pop();
             } else {
                 if (_cpu_demod_slots.empty()) {
@@ -5029,7 +5017,7 @@ private:
         const bool do_latency_profile =
             LOG_MOD_ON(DemodProfiling);
         const RxFrame& frame = result.frame;
-        const bool allow_freq_adjust = _control_time_gates.allow_freq_adjust(frame.usrp_time_ns);
+        const bool allow_freq_adjust = _control_time_gates.allow_freq_adjust(frame.source_time_ns);
         bool issued_freq_adjust = false;
         bool cfo_observation_valid = result.cfo_sfo_estimate_valid;
         if (cfo_observation_valid && !allow_freq_adjust) {
@@ -5136,7 +5124,7 @@ private:
             predictive_delay_samples =
                 _predictive_delay_samples_from_cfo(
                     cfg_,
-                    frame.usrp_time_ns,
+                    frame.source_time_ns,
                     result.detected_freq_offset,
                     current_rx_tune_.actual_rf_freq,
                     current_rx_tune_.actual_dsp_freq,
@@ -5144,9 +5132,9 @@ private:
         }
         const int delay_index_err =
             result.adjusted_delay_index - cfg_.sync_tracking.desired_peak_pos + predictive_delay_samples;
-        const bool allow_reset = _control_time_gates.allow_reset(frame.usrp_time_ns);
-        const bool allow_alignment = _control_time_gates.allow_alignment(frame.usrp_time_ns);
-        const bool allow_rx_gain_adjust = _control_time_gates.allow_rx_gain_adjust(frame.usrp_time_ns);
+        const bool allow_reset = _control_time_gates.allow_reset(frame.source_time_ns);
+        const bool allow_alignment = _control_time_gates.allow_alignment(frame.source_time_ns);
+        const bool allow_rx_gain_adjust = _control_time_gates.allow_rx_gain_adjust(frame.source_time_ns);
         const bool log_agc = LOG_MOD_ON(Agc);
         const bool log_sync = LOG_MOD_ON(Sync);
         const bool log_sync_debug = LOG_MOD_DEBUG_ON(Sync);
@@ -5175,7 +5163,7 @@ private:
                 result.delay_average_mag,
                 sync_symbol_td,
                 sync_symbol_td_count,
-                frame.usrp_time_ns,
+                frame.source_time_ns,
                 _control_time_gates,
                 [this](double gain_db) {
                     dev_->set_rx_gain(gain_db, cfg_.downlink.rx_channel);
@@ -5273,7 +5261,7 @@ private:
         // *issuing* new corrections from measurement frames (stale pipeline
         // protection); it must not reject the one-shot feedback of a schedule we
         // already applied. mark_alignment_now(radio_time_now()) can land after
-        // the alignment frame's usrp_time_ns, which previously left the latch
+        // the alignment frame's source_time_ns, which previously left the latch
         // stuck until hard reset while delay slowly drifted.
         if (_sync_in_progress && frame.Alignment != 0) {
             _sync_in_progress = false;
@@ -6405,7 +6393,7 @@ void signal_handler(int) {
     stop_signal.store(true);
 }
 
-int UHD_SAFE_MAIN(int argc, char*[]) {
+int main(int argc, char*[]) {
     async_logger::AsyncLoggerGuard async_logger_guard;
     std::signal(SIGINT, &signal_handler);
     const std::string default_config_file = "UE.yaml";
@@ -6420,7 +6408,7 @@ int UHD_SAFE_MAIN(int argc, char*[]) {
     if (!path_exists(default_config_file)) {
         LOG_G_ERROR_M(Config) << "Config file '" << default_config_file
                       << "' not found. Copy a sample file from the repository config directory, "
-                      << "such as 'UE_X310.yaml' or 'UE_B210.yaml', to '" << default_config_file
+                      << "such as 'UE_Sim.yaml', to '" << default_config_file
                       << "' and edit it before starting UE.";
         return 1;
     }

@@ -34,15 +34,10 @@ rf_sampling:
   rx_agc_update_frames: 4  # Apply AGC at most once every N processed frames
   rx_gain: 10  # RX gain (dB)
 
-# ===== USRP Device / Link =====
-usrp_device:
-  device_args: "addr=192.168.40.2, master_clock_rate=200e6, num_recv_frames=512, num_send_frames=512"  # USRP args
-  clock_source: external  # Clock source; internal/external/gpsdo
-
 # ===== Downlink =====
 downlink:
   rx_wire_format: sc16  # Downlink RX wire format; sc16/sc8
-  rx_channel: 0  # RX channel index on USRP
+  rx_channel: 0  # Logical downlink RX stream channel
   equalizer_mode: mmse  # Communication equalizer inverse mode
   channel_tracking_mode: pilot_phase  # Per-symbol comb-pilot tracking mode
   equalizer_mag_floor: 1e-06  # Lower bound for |H|^2 during channel inversion

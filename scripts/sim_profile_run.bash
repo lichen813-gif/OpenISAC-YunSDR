@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the full BS<->UE pipeline in simulation mode (no USRP)
+# Run the full BS<->UE pipeline through ChannelSimulator.
 # and capture the UE per-stage profiling report.
 #
 # Usage: scripts/sim_profile_run.bash [duration_seconds] [out_tag]

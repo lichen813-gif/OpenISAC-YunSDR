@@ -322,7 +322,7 @@ uint64_t compute_rx_frame_seq_from_time(
 
     const int64_t pairing_samples =
         rounded_samples - static_cast<int64_t>(target_alignment_samples);
-    // Only round once when converting UHD time to integer samples; keep frame indexing in integer math.
+    // Only round once when converting backend time to integer samples.
     const int64_t rounded_frame_seq =
         round_divide_nearest_away_from_zero(pairing_samples, frame_samples);
     return rounded_frame_seq > 0 ? static_cast<uint64_t>(rounded_frame_seq) : 0;
@@ -1277,16 +1277,16 @@ bool SensingChannel::set_rx_gain(double requested_gain_db, double* applied_gain_
         return false;
     }
 
-    const radio::GainRange gain_range = _rx_io.rx_device->get_rx_gain_range(_rx_io.channel_cfg.usrp_channel);
+    const radio::GainRange gain_range = _rx_io.rx_device->get_rx_gain_range(_rx_io.channel_cfg.stream_channel);
     const double clamped_gain = std::clamp(requested_gain_db, gain_range.start, gain_range.stop);
     _rx_io.channel_cfg.rx_gain = clamped_gain;
-    _rx_io.rx_device->set_rx_gain(clamped_gain, _rx_io.channel_cfg.usrp_channel);
+    _rx_io.rx_device->set_rx_gain(clamped_gain, _rx_io.channel_cfg.stream_channel);
 
     if (applied_gain_db != nullptr) {
         *applied_gain_db = clamped_gain;
     }
     LOG_G_INFO_M(Sensing) << "Set RXGN for channel " << _rx_io.logical_id
-              << " (USRP ch " << _rx_io.channel_cfg.usrp_channel
+              << " (stream ch " << _rx_io.channel_cfg.stream_channel
               << "): " << clamped_gain << " dB";
     return true;
 }
@@ -1702,190 +1702,21 @@ const SensingRxChannelConfig& SensingChannel::channel_cfg() const {
 
 void SensingChannel::initialize_rx_and_sync(
     const Config& cfg,
-    const radio::TuneRequest& tune_req,
     radio::IDevicePtr tx_device,
-    const std::string& tx_device_args,
     std::vector<std::unique_ptr<SensingChannel>>& channels
 ) {
-    // Simulation backend: each sensing channel consumes its own hub ring
-    // ("rx.sens<id>"); there is no tuning, gain, or PPS time-sync to apply.
-    if (radio_is_sim(cfg)) {
-        for (auto& ch : channels) {
-            auto& io = ch->_rx_io;
-            radio::StreamArgs args("fc32", cfg.sensing.rx_wire_format);
-            args.args["sim_suffix"] = "rx.sens" + std::to_string(io.logical_id);
-            args.channels = {io.channel_cfg.usrp_channel};
-            io.rx_device = tx_device;
-            io.rx_stream = tx_device->get_rx_stream(args);
-            io.rx_sample_rate = cfg.rf_sampling.sample_rate;
-            io.rx_tick_rate = cfg.rf_sampling.sample_rate;
-        }
-        return;
+    if (!tx_device) {
+        throw std::invalid_argument("Simulator device is required for sensing RX initialization.");
     }
-
-    auto resolve_rx_device_args = [&cfg](const SensingRxChannelConfig& ch_cfg) -> std::string {
-        if (!ch_cfg.device_args.empty()) return ch_cfg.device_args;
-        if (!cfg.sensing.rx_device_args.empty()) return cfg.sensing.rx_device_args;
-        return cfg.usrp_device.device_args;
-    };
-
-    auto resolve_rx_clock_source = [&cfg](const SensingRxChannelConfig& ch_cfg) -> std::string {
-        if (!ch_cfg.clock_source.empty()) return ch_cfg.clock_source;
-        if (!cfg.sensing.rx_clock_source.empty()) return cfg.sensing.rx_clock_source;
-        return cfg.clock_time.clock_source;
-    };
-
-    auto resolve_rx_time_source = [&cfg](const SensingRxChannelConfig& ch_cfg, const std::string& resolved_clock_source) -> std::string {
-        if (!ch_cfg.time_source.empty()) return ch_cfg.time_source;
-        if (!cfg.sensing.rx_time_source.empty()) return cfg.sensing.rx_time_source;
-        if (!cfg.clock_time.time_source.empty()) return cfg.clock_time.time_source;
-        return resolved_clock_source;
-    };
-
-    auto resolve_rx_wire_format = [&cfg](const SensingRxChannelConfig& ch_cfg) -> std::string {
-        if (!ch_cfg.wire_format.empty()) return ch_cfg.wire_format;
-        return cfg.sensing.rx_wire_format;
-    };
-
-    // The per-process device registry inside make_device() dedups by device_args
-    // and enforces the clock/time-source conflict check, so a sensing RX that
-    // shares the BS TX device args transparently gets the same IDevice instance.
-    auto get_or_create_rx_device = [&](const std::string& rx_args,
-                                       const std::string& rx_clock_source,
-                                       const std::string& rx_time_source) -> radio::IDevicePtr {
-        radio::DeviceConfig dcfg;
-        dcfg.backend = "uhd";
-        dcfg.device_args = rx_args;
-        dcfg.clock_source = rx_clock_source;
-        dcfg.time_source = rx_time_source;
-        return radio::make_device(dcfg);
-    };
-
     for (auto& ch : channels) {
         auto& io = ch->_rx_io;
-        const std::string rx_device_args = resolve_rx_device_args(io.channel_cfg);
-        const std::string rx_clock_source = resolve_rx_clock_source(io.channel_cfg);
-        const std::string rx_time_source = resolve_rx_time_source(io.channel_cfg, rx_clock_source);
-        const std::string rx_wire_format = resolve_rx_wire_format(io.channel_cfg);
-        io.rx_device = get_or_create_rx_device(rx_device_args, rx_clock_source, rx_time_source);
-
-        if (!io.rx_device) {
-            throw std::runtime_error("Failed to initialize RX device for sensing channel " + std::to_string(io.logical_id));
-        }
-
-        const size_t usrp_rx_channels = io.rx_device->get_rx_num_channels();
-        if (io.channel_cfg.usrp_channel >= usrp_rx_channels) {
-            throw std::runtime_error(
-                "Configured sensing RX channel out of range: " +
-                std::to_string(io.channel_cfg.usrp_channel) +
-                " (USRP supports " + std::to_string(usrp_rx_channels) + " RX channels)");
-        }
-
-        io.rx_device->set_rx_rate(cfg.rf_sampling.sample_rate);
-        io.rx_device->set_rx_freq(tune_req, io.channel_cfg.usrp_channel);
-        io.rx_device->set_rx_gain(io.channel_cfg.rx_gain, io.channel_cfg.usrp_channel);
-        io.rx_device->set_rx_bandwidth(cfg.rf_sampling.bandwidth, io.channel_cfg.usrp_channel);
-        const double actual_rx_rate = io.rx_device->get_rx_rate(io.channel_cfg.usrp_channel);
-        io.rx_sample_rate = (actual_rx_rate > 0.0) ? actual_rx_rate : cfg.rf_sampling.sample_rate;
-        const double actual_tick_rate = io.rx_device->master_clock_rate();
-        io.rx_tick_rate = (actual_tick_rate > 0.0) ? actual_tick_rate : io.rx_sample_rate;
-        if (!io.channel_cfg.rx_antenna.empty()) {
-            io.rx_device->set_rx_antenna(io.channel_cfg.rx_antenna, io.channel_cfg.usrp_channel);
-        }
-
-        radio::StreamArgs rx_stream_args("fc32", rx_wire_format);
-        rx_stream_args.args["block_id"] = "radio";
-        rx_stream_args.channels = {io.channel_cfg.usrp_channel};
-        io.rx_stream = io.rx_device->get_rx_stream(rx_stream_args);
-    }
-
-    // PPS time sync across the distinct devices in use (including the shared TX
-    // device). Gated on the backend reporting PpsTimeSync support.
-    struct SyncEntry {
-        std::string args;
-        radio::IDevicePtr device;
-    };
-    struct SyncSnapshot {
-        double now_s = 0.0;
-        double last_pps_s = 0.0;
-    };
-    std::vector<SyncEntry> sync_devices;
-    auto add_sync_device = [&](const std::string& args, const radio::IDevicePtr& dev) {
-        if (!dev) return;
-        for (const auto& e : sync_devices) {
-            if (e.device.get() == dev.get()) return;
-        }
-        sync_devices.push_back(SyncEntry{args, dev});
-    };
-    add_sync_device(tx_device_args, tx_device);
-    for (auto& ch : channels) {
-        add_sync_device(resolve_rx_device_args(ch->_rx_io.channel_cfg), ch->_rx_io.rx_device);
-    }
-
-    auto collect_sync_snapshot = [&]() {
-        std::vector<SyncSnapshot> snapshots;
-        snapshots.reserve(sync_devices.size());
-        for (const auto& entry : sync_devices) {
-            SyncSnapshot s;
-            s.now_s = entry.device->time_now().get_real_secs();
-            s.last_pps_s = entry.device->time_last_pps().get_real_secs();
-            snapshots.push_back(s);
-        }
-        return snapshots;
-    };
-
-    auto print_last_pps_status = [&](const std::string& title, const std::vector<SyncSnapshot>& snapshots) {
-        if (sync_devices.empty()) return;
-        LOG_G_INFO_M(Sensing) << title;
-        for (size_t i = 0; i < sync_devices.size(); ++i) {
-            const auto& entry = sync_devices[i];
-            const double pps_s = snapshots[i].last_pps_s;
-            LOG_G_INFO_M(Radio) << std::fixed << std::setprecision(9)
-                      << "  [USRP " << i << "] args='" << entry.args
-                      << "', time_last_pps=" << pps_s << " s"
-                      << std::defaultfloat;
-        }
-    };
-
-    const bool pps_capable = tx_device && tx_device->supports(radio::Capability::PpsTimeSync);
-    auto latest_sync_snapshot = collect_sync_snapshot();
-    if (pps_capable && sync_devices.size() > 1) {
-        try {
-            for (const auto& entry : sync_devices) {
-                entry.device->set_time_next_pps(radio::TimeSpec(0.0));
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-            latest_sync_snapshot = collect_sync_snapshot();
-            LOG_G_INFO_M(Radio) << "Time synchronized across " << sync_devices.size()
-                         << " USRPs using next PPS.";
-            print_last_pps_status("Post-sync USRP PPS status:", latest_sync_snapshot);
-
-            bool all_zero_last_pps = true;
-            for (const auto& s : latest_sync_snapshot) {
-                if (std::abs(s.last_pps_s) > 1e-9) {
-                    all_zero_last_pps = false;
-                    break;
-                }
-            }
-            if (all_zero_last_pps) {
-                LOG_G_INFO_M(Radio) << "PPS verification success: all USRPs report time_last_pps == 0.";
-            } else {
-                LOG_G_WARN_M(Radio) << "Warning: PPS verification failed: not all USRPs report time_last_pps == 0."
-                             ;
-            }
-        } catch (const std::exception& e) {
-            LOG_G_WARN_M(Sensing) << "PPS time sync failed (" << e.what()
-                         << "), fallback to set_time_now per device.";
-            for (const auto& entry : sync_devices) {
-                entry.device->set_time_now(radio::TimeSpec(0.0));
-            }
-            latest_sync_snapshot = collect_sync_snapshot();
-            print_last_pps_status("Fallback set_time_now USRP PPS status:", latest_sync_snapshot);
-        }
-    } else if (!sync_devices.empty()) {
-        sync_devices.front().device->set_time_now(radio::TimeSpec(0.0));
-        latest_sync_snapshot = collect_sync_snapshot();
-        print_last_pps_status("Single-USRP PPS status:", latest_sync_snapshot);
+        radio::StreamArgs args("fc32", cfg.sensing.rx_wire_format);
+        args.args["sim_suffix"] = "rx.sens" + std::to_string(io.logical_id);
+        args.channels = {io.channel_cfg.stream_channel};
+        io.rx_device = tx_device;
+        io.rx_stream = tx_device->get_rx_stream(args);
+        io.rx_sample_rate = cfg.rf_sampling.sample_rate;
+        io.rx_tick_rate = cfg.rf_sampling.sample_rate;
     }
 }
 
