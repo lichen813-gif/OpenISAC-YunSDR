@@ -10,5 +10,6 @@ numba
 pyqtgraph>=0.14.0
 PyQt6>=6.0.0
 PyYAML>=6.0
+pytest>=7.0  # Python PHY and utility regression tests
 pyzmq>=24.0  # Backend<->Frontend transport (sensing streams + control channel)
 markdown-it-py>=3.0.0  # README-to-Astro docs sync

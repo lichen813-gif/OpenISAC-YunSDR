@@ -48,7 +48,7 @@ Python译码器用于清晰、确定的算法验证，不替代C++实时端AFF3C
 专项命令：
 
 ```bat
-cd /d E:\openisac\OpenISAC-main\python_phy
+cd /d C:\path\to\OpenISAC-YunSDR\python_phy
 .venv\Scripts\python.exe -m pytest tests\test_ldpc.py -q
 .venv\Scripts\python.exe experiments\validate_ldpc_cpp_alignment.py
 ```

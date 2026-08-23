@@ -33,7 +33,7 @@
 如果系统没有 `py` 命令，直接运行自动查找 Python 的批处理入口：
 
 ```bat
-cd /d E:\openisac\OpenISAC-main\python_phy
+cd /d C:\path\to\OpenISAC-YunSDR\python_phy
 run_validation_windows.cmd --frames 1000
 ```
 
@@ -55,7 +55,7 @@ py -m openisac_phy.cli --config configs/mimo_2x1_alamouti.yaml
 当前工作区已经建立项目虚拟环境时，也可以先激活再运行：
 
 ```bat
-cd /d E:\openisac\OpenISAC-main\python_phy
+cd /d C:\path\to\OpenISAC-YunSDR\python_phy
 .venv\Scripts\activate.bat
 python -m pytest -q
 python -m openisac_phy.cli --config configs\mimo_2x1_alamouti.yaml
@@ -170,7 +170,7 @@ SFBC已经支持频分正交导频和`ls_linear/ls_dft/lmmse`估计CSI。每个O
 生成 PNG 并弹出交互窗口：
 
 ```bat
-cd /d E:\openisac\OpenISAC-main\python_phy
+cd /d C:\path\to\OpenISAC-YunSDR\python_phy
 .venv\Scripts\activate.bat
 python experiments\show_constellation.py --modulation 64qam --nr 2 --snr-db 25 --show
 ```

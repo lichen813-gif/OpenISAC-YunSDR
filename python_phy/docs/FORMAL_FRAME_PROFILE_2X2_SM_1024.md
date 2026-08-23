@@ -179,7 +179,7 @@ Rx连续复采样
 ## 7. 手动复验
 
 ```bat
-cd /d E:\openisac\OpenISAC-main\python_phy
+cd /d C:\path\to\OpenISAC-YunSDR\python_phy
 .venv\Scripts\python.exe experiments\compare_spatial_sfo_resampling.py
 .venv\Scripts\python.exe experiments\compare_realtime_sfo_interpolators.py
 .venv\Scripts\python.exe experiments\validate_engineering_operating_region.py
@@ -190,9 +190,9 @@ cd /d E:\openisac\OpenISAC-main\python_phy
 输出目录：
 
 ```text
-E:\openisac\OpenISAC-main\measurement\spatial_sfo_closed_loop
-E:\openisac\OpenISAC-main\measurement\engineering_operating_region
-E:\openisac\OpenISAC-main\measurement\python_phy_explicit_validation
+C:\path\to\OpenISAC-YunSDR\measurement\spatial_sfo_closed_loop
+C:\path\to\OpenISAC-YunSDR\measurement\engineering_operating_region
+C:\path\to\OpenISAC-YunSDR\measurement\python_phy_explicit_validation
 ```
 
 ## 8. 当前边界
