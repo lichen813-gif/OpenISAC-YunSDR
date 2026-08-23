@@ -1,11 +1,3 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo_light.svg">
-    <source media="(prefers-color-scheme: light)" srcset="docs/images/logo.svg">
-    <img src="docs/images/logo.svg" alt="OpenISAC Logo" width="400">
-  </picture>
-</p>
-
 # OpenISAC-YunSDR：搭建与使用说明
 
 [English](README.md) | [设计文档](docs/design/README.md) | [更新日志](CHANGELOG.md)
