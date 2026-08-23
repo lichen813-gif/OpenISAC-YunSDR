@@ -1,0 +1,154 @@
+# eRTM-focused simulator preset. Pair with UE_Sim_eRTM.yaml.
+# Launch order: ChannelSimulator -> BS -> UE.
+
+# ===== Radio backend =====
+radio:
+  radio_backend: sim  # Radio I/O backend; uhd = real USRP, sim = channel simulator
+
+# ===== Channel simulator =====
+simulation:
+  session: oisac_ertm_sim  # Dedicated shared-memory namespace for the eRTM simulator preset
+  enable_comm_rx: true  # Produce the communication RX path for UE
+  enable_sensing_rx: false  # Disable BS monostatic sensing RX to keep this preset focused on eRTM
+  enable_uplink: true  # Route the UE->BS uplink stream through the simulator (duplex/eRTM)
+  pacing_enabled: true  # Pace simulator output to wall-clock sample time
+  noise_power_dbfs: -70.0  # AWGN power per RX channel in dBFS; very low disables effectively
+  snr_control_enable: true  # Scale the clean simulated signal before AWGN to maintain target_snr_db
+  target_snr_db: 40.0  # Initial target SNR in dB when snr_control_enable is true
+  control_port: 10002  # ChannelSimulator ZMQ control port for runtime SNR commands
+  cfo_hz: 0.0  # Keep CFO disabled in the eRTM baseline; add it only after timing is verified
+  sample_rate_offset_ppm: 0.0  # UE sample-clock offset relative to the BS clock in ppm
+  timing_offset_samples: 0  # Constant integer sample delay injected on RX
+  array_spacing_m: 0.04283  # Physical ULA element spacing in meters; set <=0 to use array_spacing_lambda
+  array_spacing_lambda: 0.5  # Legacy fixed ULA spacing in wavelengths
+  ring_capacity_samples: 262144  # Per-stream shared-memory ring capacity in complex samples
+  steering_override_file: ""  # Optional array-manifold matrix; when set, encode angle response in matrix (angle_deg ignored)
+  comm_multipath_taps:  # Communication-link tapped-delay-line channel taps
+    - delay_samples: 0
+      gain_db: -30.0
+      phase_deg: 0.0
+  targets: []  # Monostatic targets are unused because BS sensing RX is disabled
+  bistatic_targets:  # Bistatic / communication-channel point scatterers
+    - range_m: 30.0
+      velocity_mps: 5.0
+      gain_db: -50.0
+      angle_deg: 0.0
+    - range_m: 75.0
+      velocity_mps: -3.0
+      gain_db: -56.0
+      angle_deg: 0.0
+
+# ===== RF / Sampling =====
+rf_sampling:
+  sample_rate: 50000000  # Baseband sample rate (Hz)
+  bandwidth: 50000000  # Analog bandwidth (Hz), usually same as sample_rate
+
+# ===== Clock / Time Sources =====
+clock_time:
+  clock_source: internal  # Global clock source; internal/external/gpsdo
+  time_source: internal  # Global time source; empty follows clock_source
+
+# ===== OFDM Frame =====
+ofdm_frame:
+  fft_size: 1024  # FFT size (subcarrier count)
+  cp_length: 128  # Cyclic prefix length (samples)
+  sync_pos: 1  # Sync symbol index in one frame
+  enable_sec_sync_symbol: false  # Reserve sync_pos-1 as a duplicate ZC sync symbol
+  enable_cfo_training_sequence: false  # Reserve sync_pos+1 as a repeated CFO training field
+  cfo_training_period_samples: 16  # Repetition period of CFO training field in samples
+  num_symbols: 100  # Number of OFDM symbols per frame
+  sensing_symbol_num: 100  # Number of symbols used in sensing processing
+  zc_root: 29  # Zadoff-Chu root for sync/preamble
+  pilot_positions: [571, 631, 692, 752, 812, 872, 933, 993, 29, 89, 150, 210, 270, 330, 391, 451]  # Comb-pilot subcarrier indices
+  midframe_pilot_symbols: [19, 39, 59, 79]  # Mid-frame BPSK pilot symbol indices; comb-pilot RE keep comb-pilot sequence
+  midframe_pilot_seed: 1296453708  # Deterministic mid-frame BPSK pilot seed; must match TX/RX
+
+# ===== Downlink =====
+downlink:
+  center_freq: 2400000000  # RF center frequency (Hz)
+  tx_gain: 60  # TX gain (dB)
+  tx_channel: 0  # TX channel index on USRP
+  wire_format_tx: sc16  # TX wire format; sc16/sc8
+  arq_enabled: false  # Enable downlink ARQ on the BS transmitter
+  arq_window_packets: 256  # Downlink ARQ outstanding packet window [1, 32767]
+  arq_retransmit_timeout_ms: 100  # Downlink ARQ retransmit timeout in ms
+  arq_max_retries: 5  # Downlink ARQ max retransmit retries; 0 = unlimited within window
+
+# ===== Uplink =====
+uplink:
+  enabled: true  # Enable UE-to-BS uplink / duplex path
+  duplex_mode: tdd  # Uplink carrier/window scheme (tdd = shared downlink carrier with a symbol window, fdd = separate carrier with continuous full-frame uplink)
+  symbol_start: 90  # TDD only; first uplink symbol in the downlink frame
+  symbol_count: 10  # TDD only; uplink window length in OFDM symbols; 0 disables TDD uplink
+  guard_symbols: 1  # TDD only; leading guard symbols inside the uplink window
+  bs_dl_ul_timing_diff: -10  # Simulation timing calibration: delay the BS uplink RX window by 10 samples
+  ertm_to_enable: true  # Enable eRTM TO estimation payloads and UE-side TO logs
+  ertm_report_interval_frames: 8  # Report frequently enough for interactive eRTM validation
+  rx_channel: 0  # Uplink RX channel index on USRP
+  rx_wire_format: sc16  # Uplink RX wire format; sc16/sc8
+  rx_device_args: ""  # Uplink RX-specific args (empty = use TX/shared device)
+  rx_clock_source: ""  # Uplink RX clock source override (optional)
+  rx_time_source: ""  # Uplink RX time source override (optional)
+  rx_agc_enable: false  # Enable uplink hardware RX AGC driven by delay-spectrum peak
+  rx_agc_low_threshold_db: 14.0  # Increase uplink RX gain when filtered delay-spectrum peak falls below this threshold (dB)
+  rx_agc_high_threshold_db: 16.0  # Decrease uplink RX gain when filtered delay-spectrum peak rises above this threshold (dB)
+  rx_agc_max_step_db: 1.0  # Maximum uplink RX gain step per AGC update (dB)
+  rx_agc_update_frames: 4  # Apply uplink AGC at most once every N processed frames
+  arq_enabled: false  # Enable uplink ARQ on the BS receiver
+  arq_ordered_delivery: false  # Buffer uplink packets for in-order UDP delivery
+  arq_window_packets: 256  # Uplink ARQ receive/reorder window [1, 32767]
+  arq_feedback_interval_ms: 10  # Uplink ARQ ACK feedback interval in ms
+
+# ===== Sensing =====
+sensing:
+  rx_wire_format: sc16  # Sensing RX default wire format; sc16/sc8
+  rx_channel_count: 0  # Disable monostatic sensing RX in this eRTM-focused preset
+  rx_channels: []
+  range_fft_size: 1024  # Range FFT size
+  doppler_fft_size: 100  # Doppler FFT size
+  output_mode: dense  # dense or compact_mask
+  backend_processing_enabled: false  # true lets backend publish RD/CFAR/MD metadata sidecars
+  symbol_stride: 20  # Default STRD applied at startup before runtime commands
+  paired_frame_queue_size: 64  # Per-channel RX/TX pairing queue capacity; keep above tx_circular_buffer_size for RX startup/alignment headroom
+
+# ===== Measurement mode =====
+measurement:
+  measurement_enable: false  # Enable internal PRBS measurement traffic
+  measurement_mode: internal_prbs  # Measurement payload generator / checker mode
+  measurement_payload_bytes: 1024  # Bytes per generated measurement payload
+
+# ===== Network =====
+network_output:
+  udp_input_ip: 0.0.0.0  # BS downlink payload UDP bind IP
+  udp_input_port: 50000  # BS downlink payload UDP bind port
+  udp_output_ip: 127.0.0.1  # BS decoded uplink payload UDP destination IP
+  udp_output_port: 50003  # BS decoded uplink payload UDP destination port
+  udp_egress_pacer_enabled: false  # Enable queued pacing for decoded payload UDP output
+  udp_egress_pacer_target_mbps: 0  # UDP egress pacer target Mbps; 0 = auto-estimate
+  udp_egress_pacer_queue_packets: 10240  # UDP egress pacer queue capacity in datagrams
+  udp_egress_pacer_max_delay_ms: 0  # UDP egress pacer max queued packet age in ms; 0 disables age drops
+  mono_sensing_ip: 0.0.0.0  # Monostatic sensing ZMQ listen IP
+  mono_sensing_port: 8888  # Monostatic sensing ZMQ listen port
+  mono_sensing_output_enabled: false  # Monostatic sensing is disabled in this preset
+  uplink_channel_ip: 0.0.0.0  # Uplink channel-estimate ZMQ listen IP
+  uplink_channel_port: 12358  # Uplink channel-estimate output port
+  uplink_pdf_ip: 0.0.0.0  # Uplink delay-spectrum ZMQ listen IP
+  uplink_pdf_port: 12359  # Uplink delay-spectrum output port
+  uplink_constellation_ip: 0.0.0.0  # Uplink constellation ZMQ listen IP
+  uplink_constellation_port: 12356  # Uplink constellation output port
+  control_port: 9999  # ZMQ port for runtime control commands
+
+# ===== CPU Cores =====
+cpu_cores:
+  downlink_cpu_cores: [1, 2, 3, -1]  # BS downlink CPU cores: [TX thread, modulation thread, LDPC encode thread, UDP recv thread]
+  uplink_cpu_cores: [4, 5, 6]  # BS uplink CPU cores: [RX sample ingest, OFDM/LLR processing, LDPC decode + UDP output]
+  main_cpu_core: 7  # Main-thread CPU core (-1 disables explicit binding)
+
+# ===== Logging (hierarchical module filter) =====
+logging:
+  default_level: warn  # off|error|warn|info|debug — global default; Error always prints when force_error=true
+  timestamps: false  # Prefix each line with local HH:MM:SS.uuuuuu
+  force_error: true  # Always emit Error (unrecoverable failures only)
+  modules:
+    ertm: info  # Show eRTM TO estimation and report flow
+    ul_rx: info  # Show BS uplink receive timing information

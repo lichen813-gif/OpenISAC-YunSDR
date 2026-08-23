@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenISAC Config Console</title>
+  <script>
+    /* Apply saved theme before first paint to avoid a flash. */
+    (function () {
+      try {
+        var q = new URLSearchParams(location.search).get('theme');
+        var t = (q === 'dark' || q === 'light') ? q : localStorage.getItem('oisac.theme');
+        if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (e) { document.documentElement.setAttribute('data-theme', 'light'); }
+    })();
+  </script>
+  <link rel="stylesheet" href="config_web_editor.css">
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div>
+        <h1>OpenISAC Config Console</h1>
+        <p>Parameter/value configuration editing, CPU binding, and remote runtime control.</p>
+      </div>
+      <div class="hero-aside">
+        <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">
+          <span class="theme-toggle-icon" aria-hidden="true"></span>
+          <span class="theme-toggle-text">Theme</span>
+        </button>
+        <div class="subtle">
+          Runtime files are edited in-place from the build directory.<br>
+          <code id="buildDirLabel"></code>
+        </div>
+      </div>
+    </section>
+
+	    <div class="tabbar" role="tablist" aria-label="Console sections">
+	      <button class="tab active" data-target="bs" role="tab" aria-selected="true">BS</button>
+	      <button class="tab" data-target="ue" role="tab" aria-selected="false">UE</button>
+	      <button class="tab" data-target="planner" role="tab" aria-selected="false">Resource Map</button>
+	      <button class="tab" data-target="sensingPlanner" role="tab" aria-selected="false">Sensing Resource Map</button>
+	    </div>
+
+    <div class="grid" id="configRuntimeView">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 id="editorTitle">BS Config</h2>
+            <div class="subtle" id="configPathLabel"></div>
+          </div>
+          <div class="flash" id="flash"></div>
+        </div>
+        <div class="body">
+          <div class="config-search">
+            <input id="configSearch" type="search" autocomplete="off" spellcheck="false"
+                   placeholder="Filter fields by key, label, or description…" aria-label="Filter config fields">
+            <span class="config-search-count subtle" id="configSearchCount"></span>
+          </div>
+          <div class="config-scroll">
+            <div id="configSections"></div>
+          </div>
+          <div class="actions">
+            <button class="btn primary" id="saveBtn">Save Config</button>
+            <button class="btn" id="reloadBtn">Reload Disk</button>
+          </div>
+          <div class="meta">
+            <span id="mtimeLabel">mtime: -</span>
+            <span id="fileStateLabel">file: -</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 id="runtimeTitle">BS Runtime</h2>
+            <div class="subtle">Start/stop binaries and watch recent output.</div>
+          </div>
+          <div class="pill stopped" id="statusPill"><span class="dot"></span><span id="statusText">stopped</span></div>
+        </div>
+        <div class="body status-card">
+          <div class="row">
+            <div class="field">
+              <label for="presetSelect">Preset</label>
+              <select id="presetSelect"></select>
+            </div>
+            <div class="field">
+              <label for="commandInput">Command</label>
+              <input id="commandInput" type="text" autocomplete="off">
+            </div>
+          </div>
+          <div class="card">
+            <h3>CPU Plan</h3>
+            <div class="cpu-plan-grid">
+              <div class="cpu-plan-item cpu-plan-item-critical">
+                <label>Isolated CPUs</label>
+                <div class="mono cpu-plan-value" id="isolatedCpuDisplay">-</div>
+              </div>
+              <div class="cpu-plan-item">
+                <label>Bound CPUs</label>
+                <div class="mono cpu-plan-value" id="boundCpuDisplay">-</div>
+              </div>
+              <div class="cpu-plan-item">
+                <label>Process AllowedCPUs</label>
+                <div class="mono cpu-plan-value" id="processCpuDisplay">-</div>
+              </div>
+              <div class="cpu-plan-item">
+                <label>System CPUs</label>
+                <div class="mono cpu-plan-value" id="systemCpuDisplay">-</div>
+              </div>
+            </div>
+            <div class="mono cpu-role-list" id="cpuRoleList" style="margin-top: 10px;">-</div>
+          </div>
+          <div class="card">
+            <h3>Runtime Options</h3>
+            <label class="checkbox-row">
+              <input id="isolateToggle" type="checkbox" checked>
+              <span>Enable runtime CPU isolation</span>
+            </label>
+            <label class="checkbox-row" style="margin-top: 10px;">
+              <input id="isolateBothToggle" type="checkbox">
+              <span>BS+UE (isolate both sides)</span>
+            </label>
+            <label class="checkbox-row" style="margin-top: 10px;">
+              <input id="overrideIsolateToggle" type="checkbox">
+              <span>Override isolated CPU list</span>
+            </label>
+            <div class="field" style="margin-top: 10px;">
+              <label for="overrideIsolateInput">Isolated CPU List</label>
+              <input id="overrideIsolateInput" type="text" autocomplete="off" disabled placeholder="e.g. 1,5,6">
+            </div>
+            <div class="field" style="margin-top: 10px;">
+              <label for="sudoPasswordInput">Sudo Password</label>
+              <input id="sudoPasswordInput" type="password" autocomplete="current-password" placeholder="Optional; used for privileged runtime actions">
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn primary" id="startBtn">Save + Start</button>
+            <button class="btn" id="applyIsolationBtn">Apply Isolation</button>
+            <button class="btn danger" id="stopBtn">Stop</button>
+            <button class="btn warn" id="resetIsolationBtn">Reset Isolation</button>
+            <button class="btn" id="refreshBtn">Refresh</button>
+          </div>
+          <div class="card">
+            <h3>Process</h3>
+            <div class="mono" id="processMeta">-</div>
+          </div>
+          <div class="card">
+            <h3>Logs</h3>
+            <div class="logbox" id="logBox"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+	    <section class="planner-page hidden" id="plannerView">
+	      <section class="panel">
+	        <div class="panel-head">
+	          <div>
+	            <h2 id="plannerTitle">Resource Map</h2>
+	            <div class="subtle" id="plannerIntro">Plan `data_resource_blocks` on a large time-frequency canvas, snap selections to RE cells, then apply to TX or RX.</div>
+	          </div>
+	          <div class="flash" id="plannerFlash"></div>
+	        </div>
+	        <div class="body">
+	          <div class="planner-summary" id="plannerSummary"></div>
+	          <div id="plannerHost"></div>
+	          <div class="planner-targets">
+		            <button class="btn" id="loadPlannerTxBtn">Load from BS</button>
+		            <button class="btn" id="loadPlannerRxBtn">Load from UE</button>
+		            <button class="btn primary" id="applyPlannerTxBtn">Apply to BS</button>
+		            <button class="btn primary" id="applyPlannerRxBtn">Apply to UE</button>
+	          </div>
+          <div class="planner-target-note" id="plannerTargetNote"></div>
+        </div>
+      </section>
+    </section>
+  </div>
+  <div class="toast-stack" id="toastStack" aria-live="polite" aria-atomic="false"></div>
+  <script>window.__APP_STATE__ = {{APP_STATE_JSON}};</script>
+  <script src="config_web_editor.js"></script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+phy:
+  modulation: 64qam
+  fft_size: 256
+  cp_length: 32
+  subcarrier_spacing_hz: 15000
+
+resource_grid:
+  guard_left: 16
+  guard_right: 15
+  dc_null: true
+  pilots:
+    enabled: false
+
+synchronization:
+  enabled: false
+  preamble_enabled: false
+  timing_offset_samples: 0
+  timing_search_samples: 0
+  cfo_hz: 0
+  sfo_ppm: 0
+
+receiver:
+  channel_estimation: perfect
+  detector: mmse
+
+mimo:
+  mode: spatial_multiplexing
+  nt: 2
+  nr: 2
+  layers: 2
+  detector: mmse
+
+channel:
+  profile: rayleigh
+  doppler_hz: 0
+  tx_correlation: 0
+  rx_correlation: 0
+  spatial_rank: 0
+
+simulation:
+  frames: 200
+  snr_db: 40
+  seed: 23063
+  channel_seed: 33063
+  noise_seed: 43063

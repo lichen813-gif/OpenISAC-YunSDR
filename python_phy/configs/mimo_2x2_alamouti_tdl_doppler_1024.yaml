@@ -1,0 +1,58 @@
+phy:
+  modulation: 64qam
+  fft_size: 1024
+  cp_length: 128
+  subcarrier_spacing_hz: 15000
+
+resource_grid:
+  guard_left: 64
+  guard_right: 63
+  dc_null: true
+  pilots:
+    enabled: true
+    spacing: 8
+    offset: 0
+
+synchronization:
+  enabled: true
+  preamble_enabled: true
+  zc_root: 29
+  pilot_phase_tracking: false
+  phase_reference_tracking: false
+  timing_offset_samples: 20
+  timing_search_samples: 64
+  cfo_hz: 0
+  sfo_ppm: 0
+
+receiver:
+  channel_estimation: lmmse
+  channel_estimation_taps: 10
+
+mimo:
+  mode: stbc
+  scheme: alamouti
+  nt: 2
+  nr: 2
+  layers: 1
+  stbc:
+    pairing: time
+    tx_power_normalize: true
+
+channel:
+  profile: tdl
+  doppler_hz: 0
+  taps:
+    - delay_samples: 0
+      gain_db: 0.0
+      phase_deg: 0.0
+    - delay_samples: 3
+      gain_db: -4.0
+      phase_deg: 45.0
+    - delay_samples: 9
+      gain_db: -8.0
+      phase_deg: -80.0
+
+simulation:
+  frames: 100
+  snr_db: 30
+  seed: 23063

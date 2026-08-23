@@ -1,0 +1,84 @@
+---
+import SiteFooter from "../components/SiteFooter.astro";
+import SiteHeader from "../components/SiteHeader.astro";
+import "../styles/global.css";
+
+const {
+  title,
+  description,
+  lang = "en",
+  pageKey,
+  navItems = [],
+  langSwitch,
+  math = false,
+} = Astro.props;
+const isZh = String(lang).startsWith("zh");
+const pageTitle = title ?? "OpenISAC";
+const pageDescription =
+  description ??
+  (isZh ? "OpenISAC 文档站点" : "OpenISAC documentation site");
+const iconHref = `${import.meta.env.BASE_URL}images/icon.svg`;
+const year = 2025;
+const bodyClass =
+  pageKey === "home"
+    ? "home-page"
+    : pageKey === "documentation"
+      ? "docs-page"
+      : "article-page";
+---
+
+<!doctype html>
+<html lang={lang}>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{pageTitle}</title>
+    <meta name="description" content={pageDescription} />
+    <meta name="theme-color" content="#0f6b6a" />
+    <link rel="icon" type="image/svg+xml" href={iconHref} />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    {math && (
+      <>
+        <link
+          rel="stylesheet"
+          href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"
+        />
+        <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+        <script
+          defer
+          src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+        ></script>
+        <script is:inline>
+          document.addEventListener("DOMContentLoaded", function () {
+            if (typeof renderMathInElement === "function") {
+              renderMathInElement(document.body, {
+                delimiters: [
+                  { left: "$$", right: "$$", display: true },
+                  { left: "$", right: "$", display: false },
+                  { left: "\\(", right: "\\)", display: false },
+                  { left: "\\[", right: "\\]", display: true }
+                ],
+                throwOnError: false
+              });
+            }
+          });
+        </script>
+      </>
+    )}
+  </head>
+  <body class:list={[bodyClass, { "lang-zh": isZh }]}>
+    <SiteHeader
+      navItems={navItems}
+      pageKey={pageKey}
+      langSwitch={langSwitch}
+      lang={lang}
+    />
+    <slot />
+    <SiteFooter lang={lang} year={year} />
+  </body>
+</html>

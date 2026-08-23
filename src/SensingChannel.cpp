@@ -1,0 +1,3145 @@
+#include "SensingChannel.hpp"
+
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+#include <unordered_map>
+
+namespace {
+
+inline bool should_profile_sensing(const Config& /*cfg*/) {
+    // Gated explicitly by logging.modules.sensing_profiling.
+    return LOG_MOD_ON(SensingProfiling);
+}
+
+// Apply per-subcarrier CFO/SFO/delay phase compensation to a contiguous symbol row.
+//   phase_total[j] = ud[j]*delay + SFO*idx[j]*rel + CFO*rel
+//   rx[j] *= exp(-i * phase_total[j])
+// Because ud[j] = -2*pi*idx[j]/N and idx[] is a unit-step ramp (FFT-shift order),
+// the phase advances by a constant per unit index step, so the rotation is geometric.
+// We replace the per-element std::polar (sincos) with a running phasor advanced by a
+// constant `step`, re-anchored at index discontinuities (the FFT-shift wrap) and every
+// 256 samples to bound floating-point drift. Measured ~3.8x faster than the vectorized
+// std::polar loop under -ffast-math, matching it to ~1e-5.
+inline void apply_sensing_phase_compensation(
+    std::complex<float>* __restrict__ rx,
+    size_t n,
+    const int* __restrict__ idx,
+    const float* __restrict__ ud,
+    float CFO,
+    float SFO,
+    float delay_offset,
+    int relative_symbol_index)
+{
+    if (n == 0) {
+        return;
+    }
+    const float rel = static_cast<float>(relative_symbol_index);
+    const float c0 = CFO * rel;
+    const float sfo_rel = SFO * rel;
+    // Per unit-index phase step (ud[1]-ud[0] == -2*pi/N for the standard ramp).
+    const float ud_unit = (n > 1) ? (ud[1] - ud[0]) : 0.0f;
+    const std::complex<float> step = std::polar(1.0f, -(sfo_rel + ud_unit * delay_offset));
+    std::complex<float> rot(1.0f, 0.0f);
+    int prev_idx = 0;
+    for (size_t j = 0; j < n; ++j) {
+        if (j == 0 || idx[j] != prev_idx + 1 || (j & 0xFFu) == 0) {
+            const float phase_total =
+                ud[j] * delay_offset + sfo_rel * static_cast<float>(idx[j]) + c0;
+            rot = std::polar(1.0f, -phase_total);
+        }
+        rx[j] *= rot;
+        prev_idx = idx[j];
+        rot *= step;
+    }
+}
+
+constexpr size_t kDefaultSystemResponseCalibrationSymbols = 1000;
+constexpr uint32_t kSystemResponseCalibrationVersion = 1;
+constexpr uint32_t kSystemResponseRoleMonostatic = 1;
+constexpr uint32_t kSystemResponseRoleBistatic = 2;
+constexpr char kSystemResponseMagic[8] = {'O', 'I', 'S', 'A', 'C', 'H', '1', '\0'};
+
+#pragma pack(push, 1)
+struct SystemResponseCalibrationFileHeader {
+    char magic[8];
+    char mode[16];
+    uint32_t version = 0;
+    uint32_t role = 0;
+    uint32_t logical_id = 0;
+    uint32_t fft_size = 0;
+    double sample_rate = 0.0;
+    double center_freq = 0.0;
+    double bandwidth = 0.0;
+    uint64_t captured_symbols = 0;
+};
+#pragma pack(pop)
+
+const char* sensing_role_label(SensingChannel::SensingRole role) {
+    return role == SensingChannel::SensingRole::Bistatic ? "bistatic" : "monostatic";
+}
+
+uint32_t sensing_role_id(SensingChannel::SensingRole role) {
+    return role == SensingChannel::SensingRole::Bistatic
+        ? kSystemResponseRoleBistatic
+        : kSystemResponseRoleMonostatic;
+}
+
+std::string make_system_response_calibration_filename(
+    SensingChannel::SensingRole role,
+    uint32_t logical_id)
+{
+    std::ostringstream oss;
+    oss << "sensing_system_response_" << sensing_role_label(role)
+        << "_ch" << logical_id << ".bin";
+    return oss.str();
+}
+
+bool nearly_equal_config_value(double lhs, double rhs) {
+    const double scale = std::max(1.0, std::max(std::abs(lhs), std::abs(rhs)));
+    return std::abs(lhs - rhs) <= scale * 1e-9;
+}
+
+float compute_system_response_min_power(const AlignedVector& response) {
+    float max_power = 0.0f;
+    for (const auto& value : response) {
+        max_power = std::max(max_power, std::norm(value));
+    }
+    if (!(max_power > 0.0f) || !std::isfinite(max_power)) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return std::max(max_power * 1.0e-6f, 1.0e-20f);
+}
+
+bool normalize_system_response(AlignedVector& response) {
+    if (response.empty()) {
+        return false;
+    }
+
+    double power_sum = 0.0;
+    for (const auto& value : response) {
+        const double power = static_cast<double>(std::norm(value));
+        if (!std::isfinite(power)) {
+            return false;
+        }
+        power_sum += power;
+    }
+
+    if (!(power_sum > 0.0) || !std::isfinite(power_sum)) {
+        return false;
+    }
+
+    const float scale = static_cast<float>(
+        std::sqrt(static_cast<double>(response.size()) / power_sum));
+    for (auto& value : response) {
+        value *= scale;
+    }
+    return true;
+}
+
+AlignedVector compute_system_response_inverse(
+    const AlignedVector& response,
+    float min_valid_power)
+{
+    AlignedVector inverse_response(response.size(), std::complex<float>(1.0f, 0.0f));
+    for (size_t i = 0; i < response.size(); ++i) {
+        const float h_real = response[i].real();
+        const float h_imag = response[i].imag();
+        const float power = h_real * h_real + h_imag * h_imag;
+        if (power >= min_valid_power && std::isfinite(power)) {
+            const float inv_power = 1.0f / power;
+            inverse_response[i] = std::complex<float>(h_real * inv_power, -h_imag * inv_power);
+        }
+    }
+    return inverse_response;
+}
+
+SystemResponseCalibrationFileHeader make_system_response_header(
+    const Config& cfg,
+    SensingChannel::SensingRole role,
+    uint32_t logical_id,
+    size_t captured_symbols)
+{
+    SystemResponseCalibrationFileHeader header{};
+    std::memcpy(header.magic, kSystemResponseMagic, sizeof(header.magic));
+    const char* mode = sensing_role_label(role);
+    std::strncpy(header.mode, mode, sizeof(header.mode) - 1);
+    header.version = kSystemResponseCalibrationVersion;
+    header.role = sensing_role_id(role);
+    header.logical_id = logical_id;
+    header.fft_size = static_cast<uint32_t>(cfg.ofdm.fft_size);
+    header.sample_rate = cfg.rf_sampling.sample_rate;
+    header.center_freq = cfg.downlink.center_freq;
+    header.bandwidth = cfg.rf_sampling.bandwidth;
+    header.captured_symbols = static_cast<uint64_t>(captured_symbols);
+    return header;
+}
+
+std::string header_mode_string(const SystemResponseCalibrationFileHeader& header) {
+    const auto* begin = header.mode;
+    const auto* end = header.mode + sizeof(header.mode);
+    const auto* nul = std::find(begin, end, '\0');
+    return std::string(begin, nul);
+}
+
+void save_system_response_calibration_async(
+    std::string file_path,
+    SystemResponseCalibrationFileHeader header,
+    AlignedVector response)
+{
+    try {
+        std::thread(
+            [file_path = std::move(file_path),
+             header,
+             response = std::move(response)]() mutable {
+                async_logger::LoggerThreadModeGuard log_mode_guard(
+                    async_logger::LoggerThreadMode::NonRealtime);
+                std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+                if (!out) {
+                    LOG_G_WARN_M(Sensing) << "[Sensing Hsys " << header_mode_string(header)
+                                 << " CH " << header.logical_id
+                                 << "] failed to open calibration file for write: "
+                                 << file_path;
+                    return;
+                }
+
+                out.write(
+                    reinterpret_cast<const char*>(&header),
+                    static_cast<std::streamsize>(sizeof(header)));
+                if (!response.empty()) {
+                    out.write(
+                        reinterpret_cast<const char*>(response.data()),
+                        static_cast<std::streamsize>(
+                            response.size() * sizeof(std::complex<float>)));
+                }
+
+                if (!out) {
+                    LOG_G_WARN_M(Sensing) << "[Sensing Hsys " << header_mode_string(header)
+                                 << " CH " << header.logical_id
+                                 << "] failed while writing calibration file: "
+                                 << file_path;
+                    return;
+                }
+
+                LOG_G_INFO_M(Sensing) << "[Sensing Hsys " << header_mode_string(header)
+                             << " CH " << header.logical_id
+                             << "] saved system response calibration: "
+                             << file_path
+                             << " (" << header.captured_symbols << " symbols)";
+            })
+            .detach();
+    } catch (const std::exception& e) {
+        LOG_G_WARN_M(Sensing) << "[Sensing Hsys " << header_mode_string(header)
+                     << " CH " << header.logical_id
+                     << "] failed to start calibration save worker: "
+                     << e.what();
+    }
+}
+
+int64_t round_divide_nearest_away_from_zero(int64_t numerator, int64_t denominator) {
+    if (denominator <= 0) {
+        return 0;
+    }
+
+    const uint64_t denom_u = static_cast<uint64_t>(denominator);
+    const uint64_t half_u = denom_u / 2;
+    const uint64_t magnitude_u = (numerator < 0)
+        ? static_cast<uint64_t>(-(numerator + 1)) + 1u
+        : static_cast<uint64_t>(numerator);
+    const uint64_t rounded_u = (magnitude_u + half_u) / denom_u;
+
+    if (rounded_u > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return (numerator < 0)
+            ? std::numeric_limits<int64_t>::min()
+            : std::numeric_limits<int64_t>::max();
+    }
+
+    const int64_t rounded = static_cast<int64_t>(rounded_u);
+    return (numerator < 0) ? -rounded : rounded;
+}
+
+int64_t round_long_double_to_int64(long double value) {
+    if (!std::isfinite(value)) {
+        return 0;
+    }
+    const long double max_i64 = static_cast<long double>(std::numeric_limits<int64_t>::max());
+    const long double min_i64 = static_cast<long double>(std::numeric_limits<int64_t>::min());
+    if (value >= max_i64) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    if (value <= min_i64) {
+        return std::numeric_limits<int64_t>::min();
+    }
+    return static_cast<int64_t>(std::llround(value));
+}
+
+int64_t compute_elapsed_samples_from_ticks(
+    const radio::TimeSpec& raw_start_time,
+    const radio::TimeSpec& stream_start_time,
+    double sample_rate,
+    double tick_rate)
+{
+    if (sample_rate <= 0.0 || tick_rate <= 0.0) {
+        return 0;
+    }
+
+    const int64_t raw_ticks = raw_start_time.to_ticks(tick_rate);
+    const int64_t stream_start_ticks = stream_start_time.to_ticks(tick_rate);
+    const int64_t delta_ticks = raw_ticks - stream_start_ticks;
+    const long double elapsed_samples =
+        static_cast<long double>(delta_ticks) * static_cast<long double>(sample_rate) /
+        static_cast<long double>(tick_rate);
+    return round_long_double_to_int64(elapsed_samples);
+}
+
+uint64_t compute_rx_frame_seq_from_time(
+    const radio::TimeSpec& raw_start_time,
+    const radio::TimeSpec& stream_start_time,
+    int32_t discard_samples,
+    int32_t target_alignment_samples,
+    const Config& cfg,
+    double sample_rate,
+    double tick_rate
+) {
+    if (sample_rate <= 0.0 || tick_rate <= 0.0 || cfg.samples_per_frame() == 0) {
+        return 0;
+    }
+
+    const int64_t rounded_samples =
+        compute_elapsed_samples_from_ticks(raw_start_time, stream_start_time, sample_rate, tick_rate) +
+        static_cast<int64_t>(discard_samples);
+    const int64_t frame_samples = static_cast<int64_t>(cfg.samples_per_frame());
+    if (frame_samples <= 0) {
+        return 0;
+    }
+
+    const int64_t pairing_samples =
+        rounded_samples - static_cast<int64_t>(target_alignment_samples);
+    // Only round once when converting UHD time to integer samples; keep frame indexing in integer math.
+    const int64_t rounded_frame_seq =
+        round_divide_nearest_away_from_zero(pairing_samples, frame_samples);
+    return rounded_frame_seq > 0 ? static_cast<uint64_t>(rounded_frame_seq) : 0;
+}
+
+int32_t normalize_alignment_samples(int64_t samples, int64_t frame_samples) {
+    if (frame_samples <= 0) {
+        return 0;
+    }
+    int64_t normalized = samples % frame_samples;
+    if (normalized > frame_samples / 2) {
+        normalized -= frame_samples;
+    } else if (normalized < -(frame_samples / 2)) {
+        normalized += frame_samples;
+    }
+    normalized = std::clamp<int64_t>(
+        normalized,
+        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+    return static_cast<int32_t>(normalized);
+}
+
+int32_t compute_rx_frame_boundary_error_samples(
+    const radio::TimeSpec& raw_start_time,
+    const radio::TimeSpec& stream_start_time,
+    int32_t discard_samples,
+    const Config& cfg,
+    double sample_rate,
+    double tick_rate
+) {
+    if (sample_rate <= 0.0 || tick_rate <= 0.0 || cfg.samples_per_frame() == 0) {
+        return 0;
+    }
+
+    const int64_t rounded_samples =
+        compute_elapsed_samples_from_ticks(raw_start_time, stream_start_time, sample_rate, tick_rate) +
+        static_cast<int64_t>(discard_samples);
+    const int64_t frame_samples = static_cast<int64_t>(cfg.samples_per_frame());
+    if (frame_samples <= 0) {
+        return 0;
+    }
+
+    const int64_t nearest_frame_seq =
+        round_divide_nearest_away_from_zero(rounded_samples, frame_samples);
+    const int64_t residual = rounded_samples - nearest_frame_seq * frame_samples;
+    return normalize_alignment_samples(residual, frame_samples);
+}
+
+constexpr uint64_t kSystemDelayEstimationFrameInterval = 434;
+
+size_t sensing_symbol_capacity(const Config& cfg) {
+    const CompactSensingMaskAnalysis analysis = analyze_compact_sensing_mask(cfg);
+    if (!analysis.local_delay_doppler_supported) {
+        return cfg.ofdm.sensing_symbol_num;
+    }
+    return std::max(cfg.ofdm.sensing_symbol_num, analysis.selected_symbol_count);
+}
+
+void copy_backend_range_view_input(
+    const AlignedVector& src,
+    size_t src_rows,
+    size_t src_stride,
+    size_t fft_rows,
+    size_t view_cols,
+    AlignedVector& dst)
+{
+    if (dst.size() != fft_rows * view_cols) {
+        dst.assign(fft_rows * view_cols, std::complex<float>(0.0f, 0.0f));
+    } else {
+        std::fill(dst.begin(), dst.end(), std::complex<float>(0.0f, 0.0f));
+    }
+
+    const size_t rows_to_copy = std::min(src_rows, fft_rows);
+    for (size_t row = 0; row < rows_to_copy; ++row) {
+        const auto* src_row = src.data() + row * src_stride;
+        auto* dst_row = dst.data() + row * view_cols;
+        std::copy_n(src_row, view_cols, dst_row);
+    }
+}
+
+void crop_doppler_view_output(
+    const std::complex<float>* src,
+    size_t full_rows,
+    size_t cols,
+    size_t output_rows,
+    AlignedVector& dst)
+{
+    if (src == nullptr || full_rows == 0 || cols == 0 || output_rows == 0) {
+        dst.clear();
+        return;
+    }
+
+    if (output_rows >= full_rows) {
+        dst.assign(src, src + full_rows * cols);
+        return;
+    }
+
+    if (dst.size() != output_rows * cols) {
+        dst.assign(output_rows * cols, std::complex<float>(0.0f, 0.0f));
+    }
+
+    const size_t shifted_start = (full_rows / 2) - (output_rows / 2);
+    const size_t ifftshift_offset = output_rows / 2;
+    for (size_t row = 0; row < output_rows; ++row) {
+        const size_t shifted_row = (row + ifftshift_offset) % output_rows;
+        const size_t src_row = (shifted_start + shifted_row + full_rows / 2) % full_rows;
+        const auto* src_row_ptr = src + src_row * cols;
+        auto* dst_row = dst.data() + row * cols;
+        std::copy_n(src_row_ptr, cols, dst_row);
+    }
+}
+
+float hamming_coherent_gain(size_t length)
+{
+    if (length <= 1) {
+        return 1.0f;
+    }
+    return 0.54f - (0.46f / static_cast<float>(length));
+}
+
+float sensing_rd_amplitude_scale(size_t active_rows, size_t active_cols)
+{
+    if (active_rows == 0 || active_cols == 0) {
+        return 1.0f;
+    }
+    const float periodogram_norm =
+        std::sqrt(static_cast<float>(active_rows) * static_cast<float>(active_cols));
+    const float processing_gain_norm =
+        std::sqrt(static_cast<float>(active_rows) * static_cast<float>(active_cols));
+    const float window_coherent_gain =
+        hamming_coherent_gain(active_cols) * hamming_coherent_gain(active_rows);
+    // Divide by sqrt(M*K): standard periodogram normalization so the noise power stays unchanged.
+    // Divide by another sqrt(M*K): remove the coherent processing gain from integrating M symbols and K subcarriers.
+    // Finally divide by G_r * G_d: compensate the coherent gain introduced by the range and Doppler windows.
+    const float total_gain =
+        periodogram_norm * processing_gain_norm * window_coherent_gain;
+    if (!(total_gain > 0.0f) || !std::isfinite(total_gain)) {
+        return 1.0f;
+    }
+    return 1.0f / total_gain;
+}
+
+void scale_complex_buffer_inplace(
+    std::complex<float>* data,
+    size_t complex_count,
+    float scale)
+{
+    if (data == nullptr || complex_count == 0 || scale == 1.0f) {
+        return;
+    }
+
+    auto* scalar = reinterpret_cast<float*>(data);
+    const size_t scalar_count = complex_count * 2;
+    #pragma omp simd simdlen(16)
+    for (size_t i = 0; i < scalar_count; ++i) {
+        scalar[i] *= scale;
+    }
+}
+
+size_t doppler_zoom_head_bin_count(size_t output_rows)
+{
+    return (output_rows + 1) / 2;
+}
+
+size_t doppler_zoom_tail_bin_count(size_t output_rows)
+{
+    return output_rows / 2;
+}
+
+bool backend_range_zoom_active(
+    const SensingChannel::BackendZoomContext& zoom,
+    bool micro_doppler_enabled,
+    size_t micro_doppler_range_bin)
+{
+    if (!zoom.has_range_plan()) {
+        return false;
+    }
+    if (!micro_doppler_enabled) {
+        return true;
+    }
+    return micro_doppler_range_bin < zoom.range_view_bins;
+}
+
+void execute_range_zoom_rows(
+    ZoomFFTProcessor& plan,
+    const std::complex<float>* src,
+    size_t src_rows,
+    size_t src_stride,
+    size_t fft_rows,
+    AlignedVector& dst)
+{
+    const size_t view_cols = plan.params().output_size;
+    if (dst.size() != fft_rows * view_cols) {
+        dst.assign(fft_rows * view_cols, std::complex<float>(0.0f, 0.0f));
+    } else {
+        std::fill(dst.begin(), dst.end(), std::complex<float>(0.0f, 0.0f));
+    }
+
+    const size_t rows_to_process = std::min(src_rows, fft_rows);
+    for (size_t row = 0; row < rows_to_process; ++row) {
+        plan.execute(
+            src + row * src_stride,
+            1,
+            dst.data() + row * view_cols,
+            1);
+    }
+}
+
+void execute_doppler_zoom_columns(
+    SensingChannel::BackendZoomContext& zoom,
+    const std::complex<float>* src,
+    size_t cols,
+    AlignedVector& dst)
+{
+    const size_t output_rows = zoom.doppler_view_bins;
+    if (dst.size() != output_rows * cols) {
+        dst.assign(output_rows * cols, std::complex<float>(0.0f, 0.0f));
+    } else {
+        std::fill(dst.begin(), dst.end(), std::complex<float>(0.0f, 0.0f));
+    }
+
+    for (size_t col = 0; col < cols; ++col) {
+        if (zoom.doppler_head_bins > 0 && zoom.doppler_head_plan) {
+            zoom.doppler_head_plan->execute(
+                src + col,
+                cols,
+                dst.data() + col,
+                cols);
+        }
+        if (zoom.doppler_tail_bins > 0 && zoom.doppler_tail_plan) {
+            zoom.doppler_tail_plan->execute(
+                src + col,
+                cols,
+                dst.data() + zoom.doppler_head_bins * cols + col,
+                cols);
+        }
+    }
+}
+
+}
+
+class SensingChannel::PairedFrameQueue {
+public:
+    PairedFrameQueue(size_t rx_capacity, size_t tx_capacity, uint32_t logical_id, size_t frame_samples)
+      : _rx_q(rx_capacity),
+        _tx_q(tx_capacity),
+        _logical_id(logical_id),
+        _frame_samples(frame_samples) {}
+
+    ~PairedFrameQueue() {
+        close();
+    }
+
+    void set_rx_recycler(std::function<void(AlignedVector&&)> recycler) {
+        _recycle_rx = std::move(recycler);
+    }
+
+    bool push_rx(RxSymbolsFrame&& frame) {
+        if (_closed.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        return _rx_q.try_push(std::move(frame));
+    }
+
+    bool push_tx(TxSymbolsFrame&& frame) {
+        if (_closed.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        return _tx_q.try_push(std::move(frame));
+    }
+
+    bool pop_pair(
+        AlignedVector& rx_out,
+        TxSymbolsFrame& tx_out,
+        const std::atomic<uint64_t>& generation_ref)
+    {
+        RxSymbolsFrame rx_item;
+        TxSymbolsFrame tx_item;
+        bool have_rx = false;
+        bool have_tx = false;
+
+        while (true) {
+            const uint64_t current_generation =
+                generation_ref.load(std::memory_order_acquire);
+            if (!have_rx) {
+                if (!_pop_next_rx(rx_item)) {
+                    return false;
+                }
+                have_rx = true;
+            }
+            if (rx_item.generation != current_generation) {
+                _log_stale_rx(rx_item.frame_seq, rx_item.generation, current_generation);
+                _recycle_one(std::move(rx_item.samples));
+                have_rx = false;
+                continue;
+            }
+
+            if (!have_tx) {
+                if (!_pop_next_tx(tx_item)) {
+                    _recycle_one(std::move(rx_item.samples));
+                    return false;
+                }
+                have_tx = true;
+            }
+            if (tx_item.generation != current_generation) {
+                _log_stale_tx(tx_item.frame_seq, tx_item.generation, current_generation);
+                have_tx = false;
+                continue;
+            }
+
+            if (rx_item.frame_seq == tx_item.frame_seq) {
+                rx_out = std::move(rx_item.samples);
+                tx_out = std::move(tx_item);
+                return true;
+            }
+
+            if (rx_item.frame_seq < tx_item.frame_seq) {
+                _log_drop_rx(rx_item.frame_seq, tx_item.frame_seq);
+                _recycle_one(std::move(rx_item.samples));
+                have_rx = false;
+                continue;
+            }
+
+            _log_drop_tx(rx_item.frame_seq, tx_item.frame_seq);
+            have_tx = false;
+        }
+    }
+
+    void close() {
+        _closed.store(true, std::memory_order_relaxed);
+    }
+
+    PairedFrameQueue(const PairedFrameQueue&) = delete;
+    PairedFrameQueue& operator=(const PairedFrameQueue&) = delete;
+    PairedFrameQueue(PairedFrameQueue&&) = delete;
+    PairedFrameQueue& operator=(PairedFrameQueue&&) = delete;
+
+private:
+    bool _pop_next_rx(RxSymbolsFrame& out) {
+        // Processing side has paired_queue depth as cushion — backoff is fine.
+        // (Hard-RT is sensing _rx_loop sample ingest, not this pairing wait.)
+        SPSCBackoff backoff;
+        while (true) {
+            if (_rx_q.try_pop(out)) {
+                backoff.reset();
+                return true;
+            }
+            if (_closed.load(std::memory_order_relaxed)) {
+                return false;
+            }
+            backoff.pause();
+        }
+    }
+
+    bool _pop_next_tx(TxSymbolsFrame& out) {
+        SPSCBackoff backoff;
+        while (true) {
+            if (_tx_q.try_pop(out)) {
+                backoff.reset();
+                return true;
+            }
+            if (_closed.load(std::memory_order_relaxed)) {
+                return false;
+            }
+            backoff.pause();
+        }
+    }
+
+    void _recycle_one(AlignedVector&& frame) {
+        if (_recycle_rx) {
+            _recycle_rx(std::move(frame));
+        }
+    }
+
+    void _log_drop_rx(uint64_t rx_seq, uint64_t tx_seq) {
+        _rx_drop_count++;
+        const uint64_t gap_frames = tx_seq - rx_seq;
+        const int64_t signed_gap = static_cast<int64_t>(tx_seq) - static_cast<int64_t>(rx_seq);
+        _track_gap(signed_gap);
+        if (_rx_drop_count <= 20 || (_rx_drop_count % 100) == 0 || gap_frames >= 2) {
+            LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _logical_id
+                          << "] drop RX frame due to seq mismatch: rx_seq="
+                          << rx_seq << ", tx_seq=" << tx_seq
+                          << ", gap_frames=" << gap_frames
+                          << ", gap_samples=" << (gap_frames * _frame_samples)
+                          << ", drop_count=" << _rx_drop_count;
+        }
+    }
+
+    void _log_drop_tx(uint64_t rx_seq, uint64_t tx_seq) {
+        _tx_drop_count++;
+        const uint64_t gap_frames = rx_seq - tx_seq;
+        const int64_t signed_gap = static_cast<int64_t>(tx_seq) - static_cast<int64_t>(rx_seq);
+        _track_gap(signed_gap);
+        if (_tx_drop_count <= 20 || (_tx_drop_count % 100) == 0 || gap_frames >= 2) {
+            LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _logical_id
+                          << "] drop TX frame due to seq mismatch: rx_seq="
+                          << rx_seq << ", tx_seq=" << tx_seq
+                          << ", gap_frames=" << gap_frames
+                          << ", gap_samples=" << (gap_frames * _frame_samples)
+                          << ", drop_count=" << _tx_drop_count;
+        }
+    }
+
+    void _log_stale_rx(uint64_t frame_seq, uint64_t frame_generation, uint64_t current_generation) {
+        ++_stale_rx_drop_count;
+        if (_stale_rx_drop_count <= 20 || (_stale_rx_drop_count % 100) == 0) {
+            LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _logical_id
+                          << "] dropping stale RX frame after generation change"
+                          << ": frame_seq=" << frame_seq
+                          << ", frame_generation=" << frame_generation
+                          << ", current_generation=" << current_generation
+                          << ", drop_count=" << _stale_rx_drop_count;
+        }
+    }
+
+    void _log_stale_tx(uint64_t frame_seq, uint64_t frame_generation, uint64_t current_generation) {
+        ++_stale_tx_drop_count;
+        if (_stale_tx_drop_count <= 20 || (_stale_tx_drop_count % 100) == 0) {
+            LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _logical_id
+                          << "] dropping stale TX frame after generation change"
+                          << ": frame_seq=" << frame_seq
+                          << ", frame_generation=" << frame_generation
+                          << ", current_generation=" << current_generation
+                          << ", drop_count=" << _stale_tx_drop_count;
+        }
+    }
+
+    void _track_gap(int64_t signed_gap) {
+        if (signed_gap == _last_signed_gap) {
+            _same_gap_streak++;
+        } else {
+            _last_signed_gap = signed_gap;
+            _same_gap_streak = 1;
+        }
+
+        const uint64_t abs_gap = static_cast<uint64_t>(std::llabs(signed_gap));
+        if (abs_gap == 0) return;
+        if (_same_gap_streak == 8 || (_same_gap_streak % 200) == 0) {
+            LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _logical_id
+                          << "] stable TX/RX seq gap detected: signed_gap_frames="
+                          << signed_gap
+                          << ", abs_gap_samples=" << (abs_gap * _frame_samples)
+                          << ", streak=" << _same_gap_streak
+                          << " (possible fixed integer-frame system latency)";
+        }
+    }
+
+    SPSCRingBuffer<RxSymbolsFrame> _rx_q;
+    SPSCRingBuffer<TxSymbolsFrame> _tx_q;
+    std::atomic<bool> _closed{false};
+    std::function<void(AlignedVector&&)> _recycle_rx;
+    uint32_t _logical_id = 0;
+    size_t _frame_samples = 0;
+    uint64_t _rx_drop_count = 0;
+    uint64_t _tx_drop_count = 0;
+    uint64_t _stale_rx_drop_count = 0;
+    uint64_t _stale_tx_drop_count = 0;
+    int64_t _last_signed_gap = std::numeric_limits<int64_t>::min();
+    uint64_t _same_gap_streak = 0;
+};
+
+SensingChannel::RxIoContext::RxIoContext(const Config& cfg, const SensingRxChannelConfig& c, uint32_t logical_id_)
+  : logical_id(logical_id_),
+    channel_cfg(c),
+    rx_frame_pool(32, [&cfg]() {
+        return AlignedVector(cfg.samples_per_frame());
+    }),
+    paired_queue(std::make_unique<PairedFrameQueue>(
+        cfg.sensing.paired_frame_queue_size,
+        cfg.sensing.paired_frame_queue_size,
+        logical_id_,
+        cfg.samples_per_frame()
+    )),
+    target_alignment(c.alignment),
+    discard_samples(c.alignment) {}
+
+SensingChannel::RxIoContext::~RxIoContext() = default;
+
+SensingChannel::SensingComputeContext::SensingComputeContext(
+    const Config& cfg,
+    const SensingRxChannelConfig& c,
+    uint32_t logical_id,
+    std::shared_ptr<AggregatedSensingDataSender> aggregated_sender,
+    const std::string& output_ip,
+    int output_port)
+  : demod_fft_in(cfg.ofdm.fft_size),
+    demod_fft_out(cfg.ofdm.fft_size),
+    sensing_core({cfg.ofdm.fft_size, std::max(cfg.sensing.range_fft_size, cfg.ofdm.fft_size), cfg.sensing.doppler_fft_size, sensing_symbol_capacity(cfg)}),
+    sensing_sender(
+        output_ip,
+        output_port,
+        c.enable_sensing_output,
+        logical_id,
+        std::move(aggregated_sender),
+        cfg.sensing.on_wire_format),
+    next_hb_time(std::chrono::steady_clock::now()) {
+    accumulated_rx_symbols.reserve(cfg.ofdm.sensing_symbol_num);
+    accumulated_tx_symbols.reserve(cfg.ofdm.sensing_symbol_num);
+    if (sensing_output_mode_is_compact_mask(cfg)) {
+        sensing_mask_layout = build_sensing_mask_layout(cfg);
+        compact_mask_analysis = analyze_compact_sensing_mask(cfg);
+        compact_mask_local_delay_doppler_supported = compact_mask_analysis.local_delay_doppler_supported;
+        compact_channel_output.resize(sensing_mask_layout.total_re_count);
+        compact_selected_tx_symbols.reserve(cfg.ofdm.sensing_symbol_num);
+        compact_shifted_subcarrier_indices.reserve(compact_mask_analysis.common_subcarrier_count);
+        for (size_t sc_idx = 0; sc_idx < compact_mask_analysis.common_subcarrier_count; ++sc_idx) {
+            compact_shifted_subcarrier_indices.push_back(
+                static_cast<int>(raw_fft_bin_to_shifted_index(sc_idx, compact_mask_analysis.common_subcarrier_count)));
+        }
+        if (compact_mask_local_delay_doppler_supported) {
+            compact_sensing_core = std::make_unique<SensingProcessor>(SensingProcessor::Params{
+                compact_mask_analysis.common_subcarrier_count,
+                cfg.sensing.range_fft_size,
+                cfg.sensing.doppler_fft_size,
+                cfg.ofdm.sensing_symbol_num,
+            });
+        }
+    }
+    range_window.resize(cfg.ofdm.fft_size);
+    WindowGenerator::generate_hamming(range_window, cfg.ofdm.fft_size);
+    doppler_window.resize(cfg.ofdm.sensing_symbol_num);
+    WindowGenerator::generate_hamming(doppler_window, cfg.ofdm.sensing_symbol_num);
+    cfar_params.max_points = 256;
+    backend_view_range_bins = resolved_sensing_view_range_bins(cfg);
+    backend_view_doppler_bins = resolved_sensing_view_doppler_bins(cfg);
+    const bool backend_processing = backend_sensing_processing_supported(cfg);
+    backend_range_view_limited =
+        backend_processing &&
+        (backend_view_range_bins != sensing_core.params().range_fft_size);
+    backend_doppler_view_limited =
+        backend_processing &&
+        (backend_view_doppler_bins != sensing_core.params().doppler_fft_size);
+    backend_zoom.range_enabled = backend_range_view_limited;
+    backend_zoom.doppler_enabled = backend_doppler_view_limited;
+    backend_zoom.range_view_bins = backend_view_range_bins;
+    backend_zoom.doppler_view_bins = backend_view_doppler_bins;
+    backend_zoom.doppler_head_bins = doppler_zoom_head_bin_count(backend_view_doppler_bins);
+    backend_zoom.doppler_tail_bins = doppler_zoom_tail_bin_count(backend_view_doppler_bins);
+    if (backend_zoom.range_enabled) {
+        backend_zoom.range_plan = std::make_unique<ZoomFFTProcessor>(ZoomFFTProcessor::Params{
+            sensing_core.params().fft_size,
+            sensing_core.params().range_fft_size,
+            0,
+            backend_view_range_bins,
+            ZoomFFTProcessor::Direction::Backward,
+        });
+    }
+    if (backend_zoom.doppler_enabled) {
+        if (backend_zoom.doppler_head_bins > 0) {
+            backend_zoom.doppler_head_plan = std::make_unique<ZoomFFTProcessor>(ZoomFFTProcessor::Params{
+                sensing_core.params().doppler_fft_size,
+                sensing_core.params().doppler_fft_size,
+                0,
+                backend_zoom.doppler_head_bins,
+                ZoomFFTProcessor::Direction::Forward,
+            });
+        }
+        if (backend_zoom.doppler_tail_bins > 0) {
+            backend_zoom.doppler_tail_plan = std::make_unique<ZoomFFTProcessor>(ZoomFFTProcessor::Params{
+                sensing_core.params().doppler_fft_size,
+                sensing_core.params().doppler_fft_size,
+                sensing_core.params().doppler_fft_size - backend_zoom.doppler_tail_bins,
+                backend_zoom.doppler_tail_bins,
+                ZoomFFTProcessor::Direction::Forward,
+            });
+        }
+    }
+    if (backend_range_view_limited) {
+        backend_view_buffer.assign(
+            backend_view_range_bins * sensing_core.params().doppler_fft_size,
+            std::complex<float>(0.0f, 0.0f));
+        const int backend_view_rows = static_cast<int>(sensing_core.params().doppler_fft_size);
+        const int backend_view_cols = static_cast<int>(backend_view_range_bins);
+        backend_view_doppler_fft_plan = fftwf_plan_many_dft(
+            1,
+            &backend_view_rows,
+            backend_view_cols,
+            reinterpret_cast<fftwf_complex*>(backend_view_buffer.data()),
+            nullptr,
+            backend_view_cols,
+            1,
+            reinterpret_cast<fftwf_complex*>(backend_view_buffer.data()),
+            nullptr,
+            backend_view_cols,
+            1,
+            FFTW_FORWARD,
+            FFTW_MEASURE);
+    }
+    if (backend_doppler_view_limited) {
+        backend_output_buffer.assign(
+            backend_view_range_bins * backend_view_doppler_bins,
+            std::complex<float>(0.0f, 0.0f));
+    }
+    if (compact_mask_local_delay_doppler_supported) {
+        compact_range_window.resize(compact_mask_analysis.common_subcarrier_count);
+        WindowGenerator::generate_hamming(
+            compact_range_window,
+            compact_mask_analysis.common_subcarrier_count);
+        compact_doppler_window.resize(cfg.ofdm.sensing_symbol_num);
+        WindowGenerator::generate_hamming(compact_doppler_window, cfg.ofdm.sensing_symbol_num);
+        compact_backend_zoom.range_enabled = backend_processing &&
+            (backend_view_range_bins != cfg.sensing.range_fft_size);
+        compact_backend_zoom.doppler_enabled = backend_processing &&
+            (backend_view_doppler_bins != cfg.sensing.doppler_fft_size);
+        compact_backend_zoom.range_view_bins = backend_view_range_bins;
+        compact_backend_zoom.doppler_view_bins = backend_view_doppler_bins;
+        compact_backend_zoom.doppler_head_bins = doppler_zoom_head_bin_count(backend_view_doppler_bins);
+        compact_backend_zoom.doppler_tail_bins = doppler_zoom_tail_bin_count(backend_view_doppler_bins);
+        if (compact_backend_zoom.range_enabled) {
+            compact_backend_zoom.range_plan = std::make_unique<ZoomFFTProcessor>(ZoomFFTProcessor::Params{
+                compact_mask_analysis.common_subcarrier_count,
+                cfg.sensing.range_fft_size,
+                0,
+                backend_view_range_bins,
+                ZoomFFTProcessor::Direction::Backward,
+            });
+        }
+        if (compact_backend_zoom.doppler_enabled) {
+            if (compact_backend_zoom.doppler_head_bins > 0) {
+                compact_backend_zoom.doppler_head_plan = std::make_unique<ZoomFFTProcessor>(ZoomFFTProcessor::Params{
+                    cfg.sensing.doppler_fft_size,
+                    cfg.sensing.doppler_fft_size,
+                    0,
+                    compact_backend_zoom.doppler_head_bins,
+                    ZoomFFTProcessor::Direction::Forward,
+                });
+            }
+            if (compact_backend_zoom.doppler_tail_bins > 0) {
+                compact_backend_zoom.doppler_tail_plan = std::make_unique<ZoomFFTProcessor>(ZoomFFTProcessor::Params{
+                    cfg.sensing.doppler_fft_size,
+                    cfg.sensing.doppler_fft_size,
+                    cfg.sensing.doppler_fft_size - compact_backend_zoom.doppler_tail_bins,
+                    compact_backend_zoom.doppler_tail_bins,
+                    ZoomFFTProcessor::Direction::Forward,
+                });
+            }
+        }
+    }
+    actual_subcarrier_indices.resize(cfg.ofdm.fft_size);
+    subcarrier_phases_unit_delay.resize(cfg.ofdm.fft_size);
+    const size_t half_fft = cfg.ofdm.fft_size / 2;
+    #pragma omp simd simdlen(16)
+    for (size_t i = 0; i < cfg.ofdm.fft_size; ++i) {
+        const int k = (i >= half_fft) ? (static_cast<int>(i) - static_cast<int>(cfg.ofdm.fft_size)) : static_cast<int>(i);
+        actual_subcarrier_indices[i] = k;
+        subcarrier_phases_unit_delay[i] = -2.0f * static_cast<float>(M_PI) * static_cast<float>(k) /
+            static_cast<float>(cfg.ofdm.fft_size);
+    }
+
+    demod_fft_plan = fftwf_plan_dft_1d(
+        static_cast<int>(cfg.ofdm.fft_size),
+        reinterpret_cast<fftwf_complex*>(demod_fft_in.data()),
+        reinterpret_cast<fftwf_complex*>(demod_fft_out.data()),
+        FFTW_FORWARD,
+        FFTW_MEASURE
+    );
+
+    delay_estimation_enabled = c.enable_system_delay_estimation;
+    sensing_pipeline_disabled_by_mode = delay_estimation_enabled;
+    if (delay_estimation_enabled) {
+        if (cfg.ofdm.num_symbols == 0 || cfg.ofdm.sync_pos >= cfg.ofdm.num_symbols) {
+            LOG_G_WARN_M(Sensing) << "[Sensing] system delay estimation disabled due to invalid sync config: "
+                      << "num_symbols=" << cfg.ofdm.num_symbols
+                      << ", sync_pos=" << cfg.ofdm.sync_pos;
+            delay_estimation_enabled = false;
+            sensing_pipeline_disabled_by_mode = false;
+        } else {
+            AlignedVector zc_freq(cfg.ofdm.fft_size);
+            ZadoffChuGenerator::generate(zc_freq, cfg.ofdm.fft_size, cfg.ofdm.zc_root);
+            system_delay_sync = std::make_unique<SyncProcessor>(
+                cfg.samples_per_frame(),
+                cfg.ofdm.fft_size,
+                cfg.ofdm.cp_length,
+                zc_freq
+            );
+            system_delay_symbol_len = cfg.ofdm.fft_size + cfg.ofdm.cp_length;
+            system_delay_expected_sync_pos = cfg.ofdm.sync_pos * system_delay_symbol_len;
+        }
+    }
+}
+
+SensingChannel::SensingComputeContext::~SensingComputeContext() {
+    if (backend_view_doppler_fft_plan != nullptr) {
+        fftwf_destroy_plan(backend_view_doppler_fft_plan);
+        backend_view_doppler_fft_plan = nullptr;
+    }
+    if (demod_fft_plan != nullptr) {
+        fftwf_destroy_plan(demod_fft_plan);
+        demod_fft_plan = nullptr;
+    }
+}
+
+SensingChannel::SensingChannel(
+    const Config& cfg,
+    const SensingRxChannelConfig& channel_cfg,
+    SensingRole role,
+    const std::string& output_ip,
+    int output_port,
+    uint32_t logical_id,
+    std::atomic<bool>& running_ref,
+    std::shared_ptr<AggregatedSensingDataSender> aggregated_sender,
+    std::shared_ptr<std::atomic<uint64_t>> batch_reset_symbol,
+    BatchResetRequester batch_reset_requester,
+    HeartbeatCallback heartbeat_sender,
+    CoreResolver core_resolver
+)
+  : _cfg(cfg),
+    _role(role),
+    _running_ref(running_ref),
+    _output_ip(output_ip),
+    _output_port(output_port),
+    _shared_batch_reset_symbol(std::move(batch_reset_symbol)),
+    _batch_reset_requester(std::move(batch_reset_requester)),
+    _heartbeat_sender(std::move(heartbeat_sender)),
+    _core_resolver(std::move(core_resolver)),
+    _rx_io(cfg, channel_cfg, logical_id),
+    _compute(cfg, channel_cfg, logical_id, std::move(aggregated_sender), _output_ip, _output_port) {
+    _rx_io.paired_queue->set_rx_recycler([this](AlignedVector&& frame) {
+        this->_rx_io.rx_frame_pool.release(std::move(frame));
+    });
+
+    if (sensing_output_mode_is_compact_mask(_cfg)) {
+        if (_compute.compact_mask_local_delay_doppler_supported) {
+            LOG_G_INFO_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                         << "] compact_mask regular sampling enables MTI/local Delay-Doppler"
+                         << " (symbols=" << _compute.compact_mask_analysis.selected_symbol_count
+                         << ", stride=" << _compute.compact_mask_analysis.implicit_symbol_stride
+                         << ", subcarriers=" << _compute.compact_mask_analysis.common_subcarrier_count
+                         << ")";
+        } else {
+            const std::string reason = _compute.compact_mask_analysis.effective_reason();
+            LOG_G_INFO_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                         << "] compact_mask stays in raw compact-only mode: "
+                         << (reason.empty() ? "mask is not regular-sampling compatible" : reason);
+        }
+    }
+
+    _load_system_response_calibration();
+
+    if (_compute.delay_estimation_enabled && _compute.sensing_pipeline_disabled_by_mode) {
+        LOG_G_INFO_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                  << "] enable_system_delay_estimation=1, sensing pipeline disabled; "
+                  << "system delay estimation runs every "
+                  << kSystemDelayEstimationFrameInterval << " frames."
+                  ;
+    } else if (_rx_io.channel_cfg.enable_system_delay_estimation && !_compute.delay_estimation_enabled) {
+        LOG_G_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                  << "] enable_system_delay_estimation requested but disabled due to invalid config."
+                  ;
+    }
+}
+
+SensingChannel::~SensingChannel() {
+    stop();
+    join();
+}
+
+void SensingChannel::start(const radio::TimeSpec& start_time) {
+    _stop_requested.store(false, std::memory_order_relaxed);
+    _compute.bistatic_active = false;
+    _compute.next_delay_estimation_frame_seq = 0;
+    _rx_io.stream_start_time = start_time;
+    _rx_io.rx_frame_seq_base = 0;
+    _rx_io.next_rx_frame_seq = 0;
+    _rx_io.restart_requested.store(false, std::memory_order_relaxed);
+    _rx_io.pairing_generation.store(1, std::memory_order_release);
+    _rx_io.compute_reset_requested.store(false, std::memory_order_relaxed);
+    _compute.sensing_sender.start();
+    _rx_io.rx_thread = std::thread(&SensingChannel::_rx_loop, this, start_time);
+    _compute.sensing_thread = std::thread(&SensingChannel::_sensing_loop, this);
+}
+
+void SensingChannel::stop() {
+    const bool already_stopped = _stop_requested.exchange(true, std::memory_order_relaxed);
+    if (already_stopped) return;
+    _compute.bistatic_active = false;
+    if (_rx_io.paired_queue) {
+        _rx_io.paired_queue->close();
+    }
+}
+
+void SensingChannel::join() {
+    if (_rx_io.rx_thread.joinable()) _rx_io.rx_thread.join();
+    if (_compute.sensing_thread.joinable()) _compute.sensing_thread.join();
+    _compute.sensing_sender.stop();
+}
+
+void SensingChannel::start_bistatic() {
+    _compute.bistatic_active = true;
+    _compute.next_hb_time = std::chrono::steady_clock::now();
+    _compute.sensing_sender.start();
+}
+
+void SensingChannel::stop_bistatic() {
+    _compute.bistatic_active = false;
+    _compute.sensing_sender.stop();
+}
+
+void SensingChannel::request_reacquire(const radio::TimeSpec& start_time, uint64_t frame_seq) {
+    const uint64_t generation =
+        _rx_io.pairing_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    _rx_io.compute_reset_requested.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(_rx_io.restart_mutex);
+        _rx_io.pending_restart_time = start_time;
+        _rx_io.pending_restart_frame_seq = frame_seq;
+    }
+    _rx_io.restart_requested.store(true, std::memory_order_release);
+    LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                  << "] requested RX restart at " << start_time.get_real_secs()
+                  << " s, frame_seq_base=" << frame_seq
+                  << ", generation=" << generation;
+}
+
+bool SensingChannel::enqueue_tx_symbols(
+    const std::shared_ptr<const SymbolVector>& symbols,
+    uint64_t frame_start_symbol_index,
+    uint64_t frame_seq
+) {
+    TxSymbolsFrame tx_frame;
+    tx_frame.symbols = symbols;
+    tx_frame.frame_start_symbol_index = frame_start_symbol_index;
+    tx_frame.frame_seq = frame_seq;
+    tx_frame.generation = _rx_io.pairing_generation.load(std::memory_order_acquire);
+    const bool pushed = _rx_io.paired_queue->push_tx(std::move(tx_frame));
+    if (!pushed && !_stop_requested.load(std::memory_order_relaxed)) {
+        LOG_RT_WARN_HZ_M(Sensing, 5) << "[Sensing CH " << _rx_io.logical_id
+                          << "] paired TX queue full, dropping newest TX sensing frame";
+    }
+    return pushed;
+}
+
+void SensingChannel::process_bistatic_frame(const SensingFrame& frame, uint64_t frame_start_symbol_index) {
+    if (!_compute.bistatic_active) {
+        return;
+    }
+    _apply_batch_reset_if_due(frame_start_symbol_index);
+    const auto now = std::chrono::steady_clock::now();
+    _send_heartbeat_if_due(now);
+    if (_compute.sensing_pipeline_disabled_by_mode) {
+        return;
+    }
+
+    if (frame.rx_symbols.size() != frame.tx_symbols.size()) {
+        LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                      << "] bistatic RX/TX symbol counts differ; dropping unmatched symbols"
+                      << ": rx_symbols=" << frame.rx_symbols.size()
+                      << ", tx_symbols=" << frame.tx_symbols.size();
+    }
+    const size_t symbols_in_frame = std::min(frame.rx_symbols.size(), frame.tx_symbols.size());
+    if (symbols_in_frame == 0) {
+        return;
+    }
+    if (sensing_output_mode_is_compact_mask(_cfg)) {
+        _apply_shared_sensing_if_due(frame_start_symbol_index);
+        if (_compute.compact_mask_local_delay_doppler_supported) {
+            _process_regular_compact_bistatic_frame(frame, frame_start_symbol_index);
+        } else {
+            _process_compact_bistatic_frame(frame, frame_start_symbol_index);
+        }
+        return;
+    }
+
+    const uint64_t frame_start = frame_start_symbol_index;
+    const uint64_t frame_end = frame_start + static_cast<uint64_t>(symbols_in_frame);
+    if (_compute.next_symbol_to_sample < frame_start) {
+        _compute.next_symbol_to_sample = frame_start;
+    }
+
+    while (_compute.next_symbol_to_sample < frame_end) {
+        _apply_shared_sensing_if_due(_compute.next_symbol_to_sample);
+        if (_compute.next_symbol_to_sample < frame_start) {
+            _compute.next_symbol_to_sample = frame_start;
+        }
+        if (_compute.next_symbol_to_sample >= frame_end) break;
+
+        const auto gather_start = std::chrono::steady_clock::now();
+        const size_t symbol_idx = static_cast<size_t>(_compute.next_symbol_to_sample - frame_start);
+        if (symbol_idx >= symbols_in_frame) {
+            break;
+        }
+
+        AlignedVector rx_symbol = frame.rx_symbols[symbol_idx];
+        const int relative_symbol_index = static_cast<int>(symbol_idx) - static_cast<int>(_cfg.ofdm.sync_pos);
+        const size_t phase_bins = std::min(rx_symbol.size(), _compute.actual_subcarrier_indices.size());
+        apply_sensing_phase_compensation(
+            rx_symbol.data(), phase_bins,
+            _compute.actual_subcarrier_indices.data(),
+            _compute.subcarrier_phases_unit_delay.data(),
+            frame.CFO, frame.SFO, frame.delay_offset, relative_symbol_index);
+
+        if (!_compute.batch_has_first_symbol) {
+            _compute.current_batch_first_symbol = _compute.next_symbol_to_sample;
+            _compute.batch_has_first_symbol = true;
+        }
+
+        _compute.accumulated_rx_symbols.push_back(std::move(rx_symbol));
+        _compute.accumulated_tx_symbols.push_back(frame.tx_symbols[symbol_idx]);
+        _compute.next_symbol_to_sample += _compute.active_stride;
+        _compute.pending_batch_gather_us += std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - gather_start).count();
+
+        if (_compute.accumulated_tx_symbols.size() >= _cfg.ofdm.sensing_symbol_num) {
+            SensingFrame sensing_frame;
+            sensing_frame.rx_symbols = std::move(_compute.accumulated_rx_symbols);
+            sensing_frame.tx_symbols = std::move(_compute.accumulated_tx_symbols);
+            _compute.accumulated_rx_symbols.clear();
+            _compute.accumulated_tx_symbols.clear();
+
+            const uint64_t first_symbol = _compute.current_batch_first_symbol;
+            _compute.batch_has_first_symbol = false;
+            const double gather_us = _compute.pending_batch_gather_us;
+            _compute.pending_batch_gather_us = 0.0;
+            _sensing_process_freq(sensing_frame, first_symbol, gather_us);
+        }
+    }
+}
+
+void SensingChannel::set_target_alignment(int32_t samples) {
+    const int64_t frame_samples = static_cast<int64_t>(_cfg.samples_per_frame());
+    if (frame_samples > 0 && samples != 0 && (samples % frame_samples) == 0) {
+        LOG_G_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                  << "] target ALGN equals an integer number of frames: samples="
+                  << samples << ", frame_samples=" << frame_samples
+                  << ", frame_shift=" << (samples / frame_samples);
+    }
+    _rx_io.target_alignment.store(samples);
+    LOG_G_INFO_M(Sensing) << "Set target ALGN for channel " << _rx_io.logical_id
+              << ": " << samples << " samples";
+}
+
+void SensingChannel::set_alignment(int32_t samples) {
+    const int64_t frame_samples = static_cast<int64_t>(_cfg.samples_per_frame());
+    if (frame_samples > 0 && samples != 0 && (samples % frame_samples) == 0) {
+        LOG_G_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                  << "] ALGN equals an integer number of frames: samples="
+                  << samples << ", frame_samples=" << frame_samples
+                  << ", frame_shift=" << (samples / frame_samples);
+    }
+    _rx_io.discard_samples.store(samples);
+    _rx_io.rx_state.store(RxState::ALIGNMENT);
+    _request_shared_batch_reset();
+    LOG_G_INFO_M(Sensing) << "Set ALGN for channel " << _rx_io.logical_id
+              << ": " << samples << " samples";
+}
+
+bool SensingChannel::set_rx_gain(double requested_gain_db, double* applied_gain_db) {
+    if (!_rx_io.rx_device || !_rx_io.rx_device->supports(radio::Capability::HardwareGain)) {
+        LOG_G_WARN_M(Sensing) << "RXGN ignored for channel " << _rx_io.logical_id
+                     << ": hardware gain not supported on this backend";
+        return false;
+    }
+
+    const radio::GainRange gain_range = _rx_io.rx_device->get_rx_gain_range(_rx_io.channel_cfg.usrp_channel);
+    const double clamped_gain = std::clamp(requested_gain_db, gain_range.start, gain_range.stop);
+    _rx_io.channel_cfg.rx_gain = clamped_gain;
+    _rx_io.rx_device->set_rx_gain(clamped_gain, _rx_io.channel_cfg.usrp_channel);
+
+    if (applied_gain_db != nullptr) {
+        *applied_gain_db = clamped_gain;
+    }
+    LOG_G_INFO_M(Sensing) << "Set RXGN for channel " << _rx_io.logical_id
+              << " (USRP ch " << _rx_io.channel_cfg.usrp_channel
+              << "): " << clamped_gain << " dB";
+    return true;
+}
+
+void SensingChannel::apply_shared_cfg(const SharedSensingRuntime& snapshot) {
+    std::lock_guard<std::mutex> lock(_shared_cfg_mutex);
+    _pending_shared_cfg = snapshot;
+    _has_pending_shared_cfg = true;
+}
+
+void SensingChannel::request_system_response_calibration(size_t target_symbols) {
+    const size_t resolved_target =
+        (target_symbols == 0) ? kDefaultSystemResponseCalibrationSymbols : target_symbols;
+    if (resolved_target == 0) {
+        return;
+    }
+
+    if (_compute.sensing_pipeline_disabled_by_mode) {
+        LOG_G_WARN_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                     << " CH " << _rx_io.logical_id
+                     << "] CALB ignored: sensing pipeline is disabled for this channel";
+        return;
+    }
+    if (!_can_capture_full_band_system_response()) {
+        LOG_G_WARN_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                     << " CH " << _rx_io.logical_id
+                     << "] CALB ignored: full-band system-response capture requires dense mode "
+                     << "or a full-band regular compact mask";
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(_system_response_mutex);
+        auto& cal = _system_response_calibration;
+        cal.file_path = _system_response_calibration_file_path();
+        if (cal.accumulator.size() != _cfg.ofdm.fft_size) {
+            cal.accumulator.assign(_cfg.ofdm.fft_size, std::complex<float>(0.0f, 0.0f));
+        } else {
+            std::fill(cal.accumulator.begin(), cal.accumulator.end(), std::complex<float>(0.0f, 0.0f));
+        }
+        cal.target_symbols = resolved_target;
+        cal.captured_symbols = 0;
+        cal.capture_active = true;
+    }
+
+    LOG_G_INFO_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                 << " CH " << _rx_io.logical_id
+                 << "] started system response calibration: target_symbols="
+                 << resolved_target
+                 << ", output_file=" << _system_response_calibration_file_path()
+                 << ". Keep RF TX/RX directly connected until completion.";
+}
+
+std::string SensingChannel::_system_response_calibration_file_path() const {
+    return make_system_response_calibration_filename(_role, _rx_io.logical_id);
+}
+
+bool SensingChannel::_can_capture_full_band_system_response() const {
+    if (!sensing_output_mode_is_compact_mask(_cfg)) {
+        return true;
+    }
+    return _compute.compact_mask_local_delay_doppler_supported &&
+           _compute.compact_mask_analysis.common_subcarrier_count == _cfg.ofdm.fft_size;
+}
+
+void SensingChannel::_load_system_response_calibration() {
+    const std::string file_path = _system_response_calibration_file_path();
+    {
+        std::lock_guard<std::mutex> lock(_system_response_mutex);
+        _system_response_calibration.file_path = file_path;
+        _system_response_calibration.loaded = false;
+        _system_response_calibration.response.clear();
+        _system_response_calibration.inverse_response.clear();
+        _system_response_calibration.min_valid_power = 0.0f;
+    }
+
+    std::ifstream in(file_path, std::ios::binary);
+    if (!in) {
+        LOG_G_INFO_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                     << " CH " << _rx_io.logical_id
+                     << "] calibration file not found: " << file_path
+                     << "; system-response correction skipped";
+        return;
+    }
+
+    SystemResponseCalibrationFileHeader header{};
+    in.read(reinterpret_cast<char*>(&header), static_cast<std::streamsize>(sizeof(header)));
+    if (!in ||
+        std::memcmp(header.magic, kSystemResponseMagic, sizeof(header.magic)) != 0 ||
+        header.version != kSystemResponseCalibrationVersion) {
+        LOG_G_WARN_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                     << " CH " << _rx_io.logical_id
+                     << "] invalid calibration header in " << file_path
+                     << "; system-response correction skipped";
+        return;
+    }
+
+    const std::string expected_mode = sensing_role_label(_role);
+    const std::string file_mode = header_mode_string(header);
+    if (header.role != sensing_role_id(_role) ||
+        file_mode != expected_mode ||
+        header.logical_id != _rx_io.logical_id ||
+        header.fft_size != _cfg.ofdm.fft_size ||
+        !nearly_equal_config_value(header.sample_rate, _cfg.rf_sampling.sample_rate) ||
+        !nearly_equal_config_value(header.center_freq, _cfg.downlink.center_freq) ||
+        !nearly_equal_config_value(header.bandwidth, _cfg.rf_sampling.bandwidth)) {
+        LOG_G_WARN_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                     << " CH " << _rx_io.logical_id
+                     << "] calibration file does not match current runtime config: "
+                     << file_path
+                     << " (file_mode=" << file_mode
+                     << ", file_ch=" << header.logical_id
+                     << ", file_fft=" << header.fft_size
+                     << "); system-response correction skipped";
+        return;
+    }
+
+    AlignedVector response(header.fft_size);
+    in.read(
+        reinterpret_cast<char*>(response.data()),
+        static_cast<std::streamsize>(response.size() * sizeof(std::complex<float>)));
+    if (!in) {
+        LOG_G_WARN_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                     << " CH " << _rx_io.logical_id
+                     << "] calibration file is truncated: " << file_path
+                     << "; system-response correction skipped";
+        return;
+    }
+
+    if (!normalize_system_response(response)) {
+        LOG_G_WARN_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                     << " CH " << _rx_io.logical_id
+                     << "] calibration response has no usable normalization power: "
+                     << file_path
+                     << "; system-response correction skipped";
+        return;
+    }
+
+    const float min_valid_power = compute_system_response_min_power(response);
+    if (!std::isfinite(min_valid_power)) {
+        LOG_G_WARN_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                     << " CH " << _rx_io.logical_id
+                     << "] calibration response has no usable bins: " << file_path
+                     << "; system-response correction skipped";
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(_system_response_mutex);
+        auto& cal = _system_response_calibration;
+        cal.inverse_response = compute_system_response_inverse(response, min_valid_power);
+        cal.response = std::move(response);
+        cal.min_valid_power = min_valid_power;
+        cal.loaded = cal.inverse_response.size() == _cfg.ofdm.fft_size;
+    }
+
+    LOG_G_INFO_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                 << " CH " << _rx_io.logical_id
+                 << "] loaded system response calibration: "
+                 << file_path
+                 << " (" << header.captured_symbols << " symbols)";
+}
+
+void SensingChannel::_accumulate_system_response_calibration(
+    const AlignedVector& channel_buf,
+    size_t range_stride,
+    size_t symbol_count,
+    size_t fft_size)
+{
+    if (fft_size != _cfg.ofdm.fft_size || range_stride < _cfg.ofdm.fft_size || symbol_count == 0) {
+        return;
+    }
+
+    AlignedVector averaged_response;
+    size_t completed_symbols = 0;
+    bool completed = false;
+    bool failed_response = false;
+    {
+        std::lock_guard<std::mutex> lock(_system_response_mutex);
+        auto& cal = _system_response_calibration;
+        if (!cal.capture_active || cal.target_symbols == 0) {
+            return;
+        }
+        if (cal.accumulator.size() != _cfg.ofdm.fft_size) {
+            cal.accumulator.assign(_cfg.ofdm.fft_size, std::complex<float>(0.0f, 0.0f));
+        }
+
+        const size_t remaining = cal.target_symbols - cal.captured_symbols;
+        const size_t rows_to_use = std::min(symbol_count, remaining);
+        for (size_t row = 0; row < rows_to_use; ++row) {
+            const auto* src = channel_buf.data() + row * range_stride;
+            for (size_t bin = 0; bin < _cfg.ofdm.fft_size; ++bin) {
+                cal.accumulator[bin] += src[bin];
+            }
+        }
+
+        cal.captured_symbols += rows_to_use;
+        if (cal.captured_symbols >= cal.target_symbols) {
+            averaged_response = cal.accumulator;
+            const float scale = 1.0f / static_cast<float>(cal.captured_symbols);
+            for (auto& value : averaged_response) {
+                value *= scale;
+            }
+            if (!normalize_system_response(averaged_response)) {
+                cal.response.clear();
+                cal.inverse_response.clear();
+                cal.min_valid_power = 0.0f;
+                cal.loaded = false;
+                cal.capture_active = false;
+                completed_symbols = cal.captured_symbols;
+                failed_response = true;
+                std::fill(cal.accumulator.begin(), cal.accumulator.end(), std::complex<float>(0.0f, 0.0f));
+            } else {
+                cal.response = averaged_response;
+                cal.min_valid_power = compute_system_response_min_power(cal.response);
+                cal.inverse_response = std::isfinite(cal.min_valid_power)
+                    ? compute_system_response_inverse(cal.response, cal.min_valid_power)
+                    : AlignedVector{};
+                cal.loaded = cal.inverse_response.size() == _cfg.ofdm.fft_size;
+                cal.capture_active = false;
+                completed_symbols = cal.captured_symbols;
+                completed = cal.loaded;
+                std::fill(cal.accumulator.begin(), cal.accumulator.end(), std::complex<float>(0.0f, 0.0f));
+            }
+        }
+    }
+
+    if (failed_response) {
+        LOG_RT_WARN_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                      << " CH " << _rx_io.logical_id
+                      << "] completed calibration but response has no usable normalization power; "
+                      << "system-response correction skipped";
+        return;
+    }
+    if (!completed) {
+        return;
+    }
+
+    const auto header = make_system_response_header(
+        _cfg,
+        _role,
+        _rx_io.logical_id,
+        completed_symbols);
+    LOG_RT_INFO_M(Sensing) << "[Sensing Hsys " << sensing_role_label(_role)
+                  << " CH " << _rx_io.logical_id
+                  << "] completed system response calibration from "
+                  << completed_symbols << " symbols; saving "
+                  << _system_response_calibration_file_path();
+    save_system_response_calibration_async(
+        _system_response_calibration_file_path(),
+        header,
+        std::move(averaged_response));
+}
+
+void SensingChannel::_apply_system_response_calibration(
+    AlignedVector& channel_buf,
+    size_t range_stride,
+    size_t symbol_count,
+    size_t fft_size)
+{
+    if (fft_size != _cfg.ofdm.fft_size || range_stride < _cfg.ofdm.fft_size || symbol_count == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(_system_response_mutex);
+    const auto& cal = _system_response_calibration;
+    if (!cal.loaded || cal.inverse_response.size() != _cfg.ofdm.fft_size) {
+        return;
+    }
+
+    const auto* inverse_response = cal.inverse_response.data();
+    for (size_t row = 0; row < symbol_count; ++row) {
+        auto* dst = channel_buf.data() + row * range_stride;
+        #pragma omp simd simdlen(16)
+        for (size_t bin = 0; bin < _cfg.ofdm.fft_size; ++bin) {
+            const float in_real = dst[bin].real();
+            const float in_imag = dst[bin].imag();
+            const float corr_real = inverse_response[bin].real();
+            const float corr_imag = inverse_response[bin].imag();
+            dst[bin] = std::complex<float>(
+                in_real * corr_real - in_imag * corr_imag,
+                in_real * corr_imag + in_imag * corr_real);
+        }
+    }
+}
+
+void SensingChannel::_apply_regular_compact_system_response_calibration(
+    AlignedVector& channel_buf,
+    size_t range_stride,
+    size_t symbol_count,
+    const std::vector<int>& raw_subcarrier_indices)
+{
+    if (raw_subcarrier_indices.empty() || symbol_count == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(_system_response_mutex);
+    const auto& cal = _system_response_calibration;
+    if (!cal.loaded || cal.inverse_response.size() != _cfg.ofdm.fft_size) {
+        return;
+    }
+
+    const size_t compact_fft_size = raw_subcarrier_indices.size();
+    if (range_stride < compact_fft_size) {
+        return;
+    }
+
+    const auto* inverse_response = cal.inverse_response.data();
+    const size_t full_fft_size = _cfg.ofdm.fft_size;
+    for (size_t row = 0; row < symbol_count; ++row) {
+        auto* dst = channel_buf.data() + row * range_stride;
+        // No omp simd: indirect gather + branch + index remap inside the loop; scalar ties.
+        for (size_t sub_idx = 0; sub_idx < compact_fft_size; ++sub_idx) {
+            const int raw_sc = raw_subcarrier_indices[sub_idx];
+            if (raw_sc >= 0 && static_cast<size_t>(raw_sc) < full_fft_size) {
+                const size_t compact_shifted = raw_fft_bin_to_shifted_index(sub_idx, compact_fft_size);
+                const size_t full_shifted = raw_fft_bin_to_shifted_index(static_cast<size_t>(raw_sc), full_fft_size);
+                const float in_real = dst[compact_shifted].real();
+                const float in_imag = dst[compact_shifted].imag();
+                const float corr_real = inverse_response[full_shifted].real();
+                const float corr_imag = inverse_response[full_shifted].imag();
+                dst[compact_shifted] = std::complex<float>(
+                    in_real * corr_real - in_imag * corr_imag,
+                    in_real * corr_imag + in_imag * corr_real);
+            }
+        }
+    }
+}
+
+void SensingChannel::_apply_sparse_compact_system_response_calibration(
+    AlignedVector& compact_output,
+    const std::vector<int>& raw_subcarrier_indices)
+{
+    if (compact_output.empty() || raw_subcarrier_indices.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(_system_response_mutex);
+    const auto& cal = _system_response_calibration;
+    if (!cal.loaded || cal.inverse_response.size() != _cfg.ofdm.fft_size) {
+        return;
+    }
+
+    const size_t count = std::min(compact_output.size(), raw_subcarrier_indices.size());
+    const auto* inverse_response = cal.inverse_response.data();
+    const size_t full_fft_size = _cfg.ofdm.fft_size;
+    // No omp simd: indirect gather + branch + index remap inside the loop; scalar ties.
+    for (size_t idx = 0; idx < count; ++idx) {
+        const int raw_sc = raw_subcarrier_indices[idx];
+        if (raw_sc >= 0 && static_cast<size_t>(raw_sc) < full_fft_size) {
+            const size_t shifted = raw_fft_bin_to_shifted_index(static_cast<size_t>(raw_sc), full_fft_size);
+            const float in_real = compact_output[idx].real();
+            const float in_imag = compact_output[idx].imag();
+            const float corr_real = inverse_response[shifted].real();
+            const float corr_imag = inverse_response[shifted].imag();
+            compact_output[idx] = std::complex<float>(
+                in_real * corr_real - in_imag * corr_imag,
+                in_real * corr_imag + in_imag * corr_real);
+        }
+    }
+}
+
+void SensingChannel::_request_shared_batch_reset() {
+    if (_batch_reset_requester) {
+        _batch_reset_requester();
+    }
+}
+
+void SensingChannel::_apply_batch_reset_if_due(uint64_t frame_start_symbol_index) {
+    if (!_shared_batch_reset_symbol) {
+        return;
+    }
+    const uint64_t reset_symbol = _shared_batch_reset_symbol->load(std::memory_order_relaxed);
+    if (reset_symbol == 0 || reset_symbol == _applied_batch_reset_symbol) {
+        return;
+    }
+    if (frame_start_symbol_index < reset_symbol) {
+        return;
+    }
+
+    _compute.accumulated_rx_symbols.clear();
+    _compute.accumulated_tx_symbols.clear();
+    _compute.compact_selected_tx_symbols.clear();
+    _compute.pending_batch_gather_us = 0.0;
+    _compute.batch_has_first_symbol = false;
+    _compute.current_batch_first_symbol = frame_start_symbol_index;
+    _compute.next_symbol_to_sample = frame_start_symbol_index;
+    if (backend_sensing_processing_supported(_cfg)) {
+        _compute.micro_doppler_state.clear();
+    }
+    _compute.sensing_core.clear_channel_buffer();
+    if (_compute.compact_sensing_core) {
+        _compute.compact_sensing_core->clear_channel_buffer();
+    }
+
+    _applied_batch_reset_symbol = reset_symbol;
+    LOG_G_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                 << "] applied shared batch reset at frame_start_symbol="
+                 << frame_start_symbol_index;
+}
+
+uint32_t SensingChannel::logical_id() const {
+    return _rx_io.logical_id;
+}
+
+int32_t SensingChannel::target_alignment() const {
+    return _rx_io.target_alignment.load(std::memory_order_relaxed);
+}
+
+const SensingRxChannelConfig& SensingChannel::channel_cfg() const {
+    return _rx_io.channel_cfg;
+}
+
+void SensingChannel::initialize_rx_and_sync(
+    const Config& cfg,
+    const radio::TuneRequest& tune_req,
+    radio::IDevicePtr tx_device,
+    const std::string& tx_device_args,
+    std::vector<std::unique_ptr<SensingChannel>>& channels
+) {
+    // Simulation backend: each sensing channel consumes its own hub ring
+    // ("rx.sens<id>"); there is no tuning, gain, or PPS time-sync to apply.
+    if (radio_is_sim(cfg)) {
+        for (auto& ch : channels) {
+            auto& io = ch->_rx_io;
+            radio::StreamArgs args("fc32", cfg.sensing.rx_wire_format);
+            args.args["sim_suffix"] = "rx.sens" + std::to_string(io.logical_id);
+            args.channels = {io.channel_cfg.usrp_channel};
+            io.rx_device = tx_device;
+            io.rx_stream = tx_device->get_rx_stream(args);
+            io.rx_sample_rate = cfg.rf_sampling.sample_rate;
+            io.rx_tick_rate = cfg.rf_sampling.sample_rate;
+        }
+        return;
+    }
+
+    auto resolve_rx_device_args = [&cfg](const SensingRxChannelConfig& ch_cfg) -> std::string {
+        if (!ch_cfg.device_args.empty()) return ch_cfg.device_args;
+        if (!cfg.sensing.rx_device_args.empty()) return cfg.sensing.rx_device_args;
+        return cfg.usrp_device.device_args;
+    };
+
+    auto resolve_rx_clock_source = [&cfg](const SensingRxChannelConfig& ch_cfg) -> std::string {
+        if (!ch_cfg.clock_source.empty()) return ch_cfg.clock_source;
+        if (!cfg.sensing.rx_clock_source.empty()) return cfg.sensing.rx_clock_source;
+        return cfg.clock_time.clock_source;
+    };
+
+    auto resolve_rx_time_source = [&cfg](const SensingRxChannelConfig& ch_cfg, const std::string& resolved_clock_source) -> std::string {
+        if (!ch_cfg.time_source.empty()) return ch_cfg.time_source;
+        if (!cfg.sensing.rx_time_source.empty()) return cfg.sensing.rx_time_source;
+        if (!cfg.clock_time.time_source.empty()) return cfg.clock_time.time_source;
+        return resolved_clock_source;
+    };
+
+    auto resolve_rx_wire_format = [&cfg](const SensingRxChannelConfig& ch_cfg) -> std::string {
+        if (!ch_cfg.wire_format.empty()) return ch_cfg.wire_format;
+        return cfg.sensing.rx_wire_format;
+    };
+
+    // The per-process device registry inside make_device() dedups by device_args
+    // and enforces the clock/time-source conflict check, so a sensing RX that
+    // shares the BS TX device args transparently gets the same IDevice instance.
+    auto get_or_create_rx_device = [&](const std::string& rx_args,
+                                       const std::string& rx_clock_source,
+                                       const std::string& rx_time_source) -> radio::IDevicePtr {
+        radio::DeviceConfig dcfg;
+        dcfg.backend = "uhd";
+        dcfg.device_args = rx_args;
+        dcfg.clock_source = rx_clock_source;
+        dcfg.time_source = rx_time_source;
+        return radio::make_device(dcfg);
+    };
+
+    for (auto& ch : channels) {
+        auto& io = ch->_rx_io;
+        const std::string rx_device_args = resolve_rx_device_args(io.channel_cfg);
+        const std::string rx_clock_source = resolve_rx_clock_source(io.channel_cfg);
+        const std::string rx_time_source = resolve_rx_time_source(io.channel_cfg, rx_clock_source);
+        const std::string rx_wire_format = resolve_rx_wire_format(io.channel_cfg);
+        io.rx_device = get_or_create_rx_device(rx_device_args, rx_clock_source, rx_time_source);
+
+        if (!io.rx_device) {
+            throw std::runtime_error("Failed to initialize RX device for sensing channel " + std::to_string(io.logical_id));
+        }
+
+        const size_t usrp_rx_channels = io.rx_device->get_rx_num_channels();
+        if (io.channel_cfg.usrp_channel >= usrp_rx_channels) {
+            throw std::runtime_error(
+                "Configured sensing RX channel out of range: " +
+                std::to_string(io.channel_cfg.usrp_channel) +
+                " (USRP supports " + std::to_string(usrp_rx_channels) + " RX channels)");
+        }
+
+        io.rx_device->set_rx_rate(cfg.rf_sampling.sample_rate);
+        io.rx_device->set_rx_freq(tune_req, io.channel_cfg.usrp_channel);
+        io.rx_device->set_rx_gain(io.channel_cfg.rx_gain, io.channel_cfg.usrp_channel);
+        io.rx_device->set_rx_bandwidth(cfg.rf_sampling.bandwidth, io.channel_cfg.usrp_channel);
+        const double actual_rx_rate = io.rx_device->get_rx_rate(io.channel_cfg.usrp_channel);
+        io.rx_sample_rate = (actual_rx_rate > 0.0) ? actual_rx_rate : cfg.rf_sampling.sample_rate;
+        const double actual_tick_rate = io.rx_device->master_clock_rate();
+        io.rx_tick_rate = (actual_tick_rate > 0.0) ? actual_tick_rate : io.rx_sample_rate;
+        if (!io.channel_cfg.rx_antenna.empty()) {
+            io.rx_device->set_rx_antenna(io.channel_cfg.rx_antenna, io.channel_cfg.usrp_channel);
+        }
+
+        radio::StreamArgs rx_stream_args("fc32", rx_wire_format);
+        rx_stream_args.args["block_id"] = "radio";
+        rx_stream_args.channels = {io.channel_cfg.usrp_channel};
+        io.rx_stream = io.rx_device->get_rx_stream(rx_stream_args);
+    }
+
+    // PPS time sync across the distinct devices in use (including the shared TX
+    // device). Gated on the backend reporting PpsTimeSync support.
+    struct SyncEntry {
+        std::string args;
+        radio::IDevicePtr device;
+    };
+    struct SyncSnapshot {
+        double now_s = 0.0;
+        double last_pps_s = 0.0;
+    };
+    std::vector<SyncEntry> sync_devices;
+    auto add_sync_device = [&](const std::string& args, const radio::IDevicePtr& dev) {
+        if (!dev) return;
+        for (const auto& e : sync_devices) {
+            if (e.device.get() == dev.get()) return;
+        }
+        sync_devices.push_back(SyncEntry{args, dev});
+    };
+    add_sync_device(tx_device_args, tx_device);
+    for (auto& ch : channels) {
+        add_sync_device(resolve_rx_device_args(ch->_rx_io.channel_cfg), ch->_rx_io.rx_device);
+    }
+
+    auto collect_sync_snapshot = [&]() {
+        std::vector<SyncSnapshot> snapshots;
+        snapshots.reserve(sync_devices.size());
+        for (const auto& entry : sync_devices) {
+            SyncSnapshot s;
+            s.now_s = entry.device->time_now().get_real_secs();
+            s.last_pps_s = entry.device->time_last_pps().get_real_secs();
+            snapshots.push_back(s);
+        }
+        return snapshots;
+    };
+
+    auto print_last_pps_status = [&](const std::string& title, const std::vector<SyncSnapshot>& snapshots) {
+        if (sync_devices.empty()) return;
+        LOG_G_INFO_M(Sensing) << title;
+        for (size_t i = 0; i < sync_devices.size(); ++i) {
+            const auto& entry = sync_devices[i];
+            const double pps_s = snapshots[i].last_pps_s;
+            LOG_G_INFO_M(Radio) << std::fixed << std::setprecision(9)
+                      << "  [USRP " << i << "] args='" << entry.args
+                      << "', time_last_pps=" << pps_s << " s"
+                      << std::defaultfloat;
+        }
+    };
+
+    const bool pps_capable = tx_device && tx_device->supports(radio::Capability::PpsTimeSync);
+    auto latest_sync_snapshot = collect_sync_snapshot();
+    if (pps_capable && sync_devices.size() > 1) {
+        try {
+            for (const auto& entry : sync_devices) {
+                entry.device->set_time_next_pps(radio::TimeSpec(0.0));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            latest_sync_snapshot = collect_sync_snapshot();
+            LOG_G_INFO_M(Radio) << "Time synchronized across " << sync_devices.size()
+                         << " USRPs using next PPS.";
+            print_last_pps_status("Post-sync USRP PPS status:", latest_sync_snapshot);
+
+            bool all_zero_last_pps = true;
+            for (const auto& s : latest_sync_snapshot) {
+                if (std::abs(s.last_pps_s) > 1e-9) {
+                    all_zero_last_pps = false;
+                    break;
+                }
+            }
+            if (all_zero_last_pps) {
+                LOG_G_INFO_M(Radio) << "PPS verification success: all USRPs report time_last_pps == 0.";
+            } else {
+                LOG_G_WARN_M(Radio) << "Warning: PPS verification failed: not all USRPs report time_last_pps == 0."
+                             ;
+            }
+        } catch (const std::exception& e) {
+            LOG_G_WARN_M(Sensing) << "PPS time sync failed (" << e.what()
+                         << "), fallback to set_time_now per device.";
+            for (const auto& entry : sync_devices) {
+                entry.device->set_time_now(radio::TimeSpec(0.0));
+            }
+            latest_sync_snapshot = collect_sync_snapshot();
+            print_last_pps_status("Fallback set_time_now USRP PPS status:", latest_sync_snapshot);
+        }
+    } else if (!sync_devices.empty()) {
+        sync_devices.front().device->set_time_now(radio::TimeSpec(0.0));
+        latest_sync_snapshot = collect_sync_snapshot();
+        print_last_pps_status("Single-USRP PPS status:", latest_sync_snapshot);
+    }
+}
+
+std::optional<size_t> SensingChannel::_resolve_core(size_t hint) const {
+    if (_core_resolver) return _core_resolver(hint);
+    return std::nullopt;
+}
+
+void SensingChannel::_rx_loop(const radio::TimeSpec& start_time) {
+    async_logger::LoggerThreadModeGuard log_mode_guard(async_logger::LoggerThreadMode::Realtime);
+    radio::set_thread_priority(1.0f, true);
+    bind_current_thread_to_core(configured_core_to_optional(_rx_io.channel_cfg.rx_cpu_core));
+    prefault_thread_stack();
+
+    auto issue_start = [&](const radio::TimeSpec& stream_start_time) {
+        radio::StreamCmd stream_cmd(radio::StreamMode::StartContinuous);
+        const bool timed_start = stream_start_time.get_real_secs() > 0.0;
+        stream_cmd.stream_now = !timed_start;
+        if (timed_start) {
+            stream_cmd.time_spec = stream_start_time;
+        }
+        _rx_io.stream_start_time = stream_start_time;
+        _rx_io.rx_stream->issue_stream_cmd(stream_cmd);
+    };
+    auto issue_stop = [&]() {
+        try {
+            _rx_io.rx_stream->issue_stream_cmd(radio::StreamCmd(radio::StreamMode::StopContinuous));
+        } catch (const std::exception& e) {
+            LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                          << "] failed to stop RX stream before restart: " << e.what();
+        }
+    };
+    auto apply_pending_restart = [&]() {
+        if (!_rx_io.restart_requested.exchange(false, std::memory_order_acq_rel)) {
+            return false;
+        }
+        radio::TimeSpec restart_time(0.0);
+        uint64_t restart_frame_seq = 0;
+        {
+            std::lock_guard<std::mutex> lock(_rx_io.restart_mutex);
+            restart_time = _rx_io.pending_restart_time;
+            restart_frame_seq = _rx_io.pending_restart_frame_seq;
+            _rx_io.pending_restart_time = radio::TimeSpec(0.0);
+        }
+        issue_stop();
+        _rx_io.rx_frame_seq_base = restart_frame_seq;
+        _rx_io.next_rx_frame_seq = restart_frame_seq;
+        _rx_io.rx_state.store(RxState::ALIGNMENT, std::memory_order_release);
+        const uint64_t generation =
+            _rx_io.pairing_generation.load(std::memory_order_acquire);
+        issue_start(restart_time);
+        LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                      << "] RX stream generation " << generation
+                      << " restarted at " << restart_time.get_real_secs()
+                      << " s, frame_seq_base=" << restart_frame_seq;
+        return true;
+    };
+
+    issue_start(start_time);
+
+    while (_running_ref.load(std::memory_order_relaxed)) {
+        if (apply_pending_restart()) {
+            continue;
+        }
+        switch (_rx_io.rx_state.load()) {
+        case RxState::ALIGNMENT:
+            _handle_alignment();
+            break;
+        case RxState::NORMAL:
+            _handle_normal_rx();
+            break;
+        }
+    }
+
+    issue_stop();
+}
+
+void SensingChannel::_handle_alignment() {
+    const int32_t discard = _rx_io.discard_samples.load();
+    const int64_t frame_samples = static_cast<int64_t>(_cfg.samples_per_frame());
+    if (discard > 0) {
+        LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                      << "] alignment will drop " << discard
+                      << " leading RX samples to advance the sensing frame boundary";
+    } else if (discard < 0) {
+        LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                      << "] alignment will pad " << -static_cast<int64_t>(discard)
+                      << " leading samples because the aligned sensing frame has no data for them";
+    }
+    if (frame_samples > 0 && discard != 0 && (discard % frame_samples) == 0) {
+        LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                      << "] applying ALGN with integer-frame shift: discard="
+                      << discard << ", frame_samples=" << frame_samples
+                      << ", frame_shift=" << (discard / frame_samples);
+    }
+    const int64_t total_read_signed =
+        static_cast<int64_t>(_cfg.samples_per_frame()) + static_cast<int64_t>(discard);
+    if (total_read_signed <= 0) {
+        LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                      << "] alignment total_read <= 0 (discard=" << discard
+                      << ", frame_samples=" << _cfg.samples_per_frame()
+                      << "). This can manifest as integer-frame TX/RX offset.";
+    }
+    const size_t total_read = static_cast<size_t>(total_read_signed);
+    AlignedVector temp_buf(total_read);
+    radio::RxMetadata md;
+    size_t received = 0;
+    bool have_first_time = false;
+    radio::TimeSpec first_time_spec(0.0);
+
+    while (received < total_read && _running_ref.load(std::memory_order_relaxed)) {
+        size_t num_rx = _rx_io.rx_stream->recv(
+            temp_buf.data() + received,
+            total_read - received,
+            md,
+            1.0,
+            false
+        );
+
+        if (md.error_code != radio::RxError::None) {
+            if (md.error_code != radio::RxError::Timeout) {
+                LOG_RT_WARN_M(Sensing) << "RX alignment error: " << md.strerror();
+                received = 0;
+                have_first_time = false;
+            }
+            continue;
+        }
+
+        if (!have_first_time && num_rx > 0 && md.has_time_spec) {
+            first_time_spec = md.time_spec;
+            have_first_time = true;
+        }
+        received += num_rx;
+        if (_rx_io.restart_requested.load(std::memory_order_acquire)) {
+            return;
+        }
+    }
+
+    if (!_running_ref.load(std::memory_order_relaxed) ||
+        _rx_io.restart_requested.load(std::memory_order_acquire)) return;
+
+    AlignedVector aligned_frame = _rx_io.rx_frame_pool.acquire();
+    if (discard >= 0) {
+        const size_t positive_discard = static_cast<size_t>(discard);
+        std::copy(
+            temp_buf.begin() + positive_discard,
+            temp_buf.begin() + positive_discard + _cfg.samples_per_frame(),
+            aligned_frame.begin()
+        );
+    } else {
+        const size_t shift = static_cast<size_t>(-discard);
+        std::fill(aligned_frame.begin(), aligned_frame.end(), std::complex<float>(0.0f, 0.0f));
+        std::copy(
+            temp_buf.begin(),
+            temp_buf.begin() + total_read,
+            aligned_frame.begin() + shift
+        );
+    }
+
+    const uint64_t frame_seq = have_first_time
+        ? (_rx_io.rx_frame_seq_base + compute_rx_frame_seq_from_time(
+            first_time_spec,
+            _rx_io.stream_start_time,
+            discard,
+            _rx_io.target_alignment.load(std::memory_order_relaxed),
+            _cfg,
+            _rx_io.rx_sample_rate > 0.0 ? _rx_io.rx_sample_rate : _cfg.rf_sampling.sample_rate,
+            _rx_io.rx_tick_rate > 0.0 ? _rx_io.rx_tick_rate :
+                (_rx_io.rx_sample_rate > 0.0 ? _rx_io.rx_sample_rate : _cfg.rf_sampling.sample_rate)))
+        : _rx_io.next_rx_frame_seq;
+    RxSymbolsFrame rx_item;
+    rx_item.samples = std::move(aligned_frame);
+    rx_item.frame_seq = frame_seq;
+    rx_item.generation = _rx_io.pairing_generation.load(std::memory_order_acquire);
+    if (!_rx_io.paired_queue->push_rx(std::move(rx_item))) {
+        if (!_stop_requested.load(std::memory_order_relaxed)) {
+            LOG_RT_WARN_HZ_M(Sensing, 5) << "[Sensing CH " << _rx_io.logical_id
+                              << "] paired RX queue full during alignment, dropping newest RX frame";
+        }
+        _rx_io.next_rx_frame_seq = frame_seq + 1;
+        _rx_io.rx_frame_pool.release(std::move(rx_item.samples));
+        return;
+    }
+    _rx_io.next_rx_frame_seq = frame_seq + 1;
+
+    _rx_io.rx_state.store(RxState::NORMAL);
+    LOG_RT_INFO_M(Sensing) << "[Sensing CH " << _rx_io.logical_id << "] aligned. ALGN="
+                  << discard << " samples.";
+}
+
+void SensingChannel::_handle_normal_rx() {
+    AlignedVector rx_frame = _rx_io.rx_frame_pool.acquire();
+    radio::RxMetadata md;
+    size_t received = 0;
+    bool have_first_time = false;
+    radio::TimeSpec first_time_spec(0.0);
+
+    while (received < _cfg.samples_per_frame() && _running_ref.load(std::memory_order_relaxed)) {
+        size_t num_rx = _rx_io.rx_stream->recv(
+            rx_frame.data() + received,
+            _cfg.samples_per_frame() - received,
+            md,
+            2.0,
+            false
+        );
+
+        if (md.error_code != radio::RxError::None) {
+            if (md.error_code != radio::RxError::Timeout) {
+                LOG_RT_WARN_M(Sensing) << "RX error: " << md.strerror();
+                received = 0;
+                have_first_time = false;
+            }
+            continue;
+        }
+
+        if (!have_first_time && num_rx > 0 && md.has_time_spec) {
+            first_time_spec = md.time_spec;
+            have_first_time = true;
+        }
+        received += num_rx;
+        if (_rx_io.restart_requested.load(std::memory_order_acquire)) {
+            _rx_io.rx_frame_pool.release(std::move(rx_frame));
+            return;
+        }
+    }
+
+    if (!_running_ref.load(std::memory_order_relaxed) ||
+        _rx_io.restart_requested.load(std::memory_order_acquire)) {
+        _rx_io.rx_frame_pool.release(std::move(rx_frame));
+        return;
+    }
+
+    if (have_first_time) {
+        const int64_t frame_samples = static_cast<int64_t>(_cfg.samples_per_frame());
+        const int32_t desired_alignment = _rx_io.target_alignment.load(std::memory_order_relaxed);
+        const int32_t current_alignment = _rx_io.discard_samples.load(std::memory_order_relaxed);
+        const int32_t frame_offset = compute_rx_frame_boundary_error_samples(
+            first_time_spec,
+            _rx_io.stream_start_time,
+            0,
+            _cfg,
+            _rx_io.rx_sample_rate > 0.0 ? _rx_io.rx_sample_rate : _cfg.rf_sampling.sample_rate,
+            _rx_io.rx_tick_rate > 0.0 ? _rx_io.rx_tick_rate :
+                (_rx_io.rx_sample_rate > 0.0 ? _rx_io.rx_sample_rate : _cfg.rf_sampling.sample_rate));
+        const int32_t correction = normalize_alignment_samples(
+            static_cast<int64_t>(desired_alignment) - static_cast<int64_t>(frame_offset),
+            frame_samples);
+        if (correction != 0) {
+            LOG_RT_WARN_HZ_M(Sensing, 5) << "[Sensing CH " << _rx_io.logical_id
+                              << "] RX frame boundary mismatch: offset=" << frame_offset
+                              << ", target_ALGN=" << desired_alignment
+                              << ", last_ALGN=" << current_alignment
+                              << ", correction=" << correction;
+            // Keep the current frame paired; apply the corrected ALGN starting from the next frame.
+            set_alignment(correction);
+        }
+    }
+
+    const uint64_t frame_seq = have_first_time
+        ? (_rx_io.rx_frame_seq_base + compute_rx_frame_seq_from_time(
+            first_time_spec,
+            _rx_io.stream_start_time,
+            0,
+            _rx_io.target_alignment.load(std::memory_order_relaxed),
+            _cfg,
+            _rx_io.rx_sample_rate > 0.0 ? _rx_io.rx_sample_rate : _cfg.rf_sampling.sample_rate,
+            _rx_io.rx_tick_rate > 0.0 ? _rx_io.rx_tick_rate :
+                (_rx_io.rx_sample_rate > 0.0 ? _rx_io.rx_sample_rate : _cfg.rf_sampling.sample_rate)))
+        : _rx_io.next_rx_frame_seq;
+    RxSymbolsFrame rx_item;
+    rx_item.samples = std::move(rx_frame);
+    rx_item.frame_seq = frame_seq;
+    rx_item.generation = _rx_io.pairing_generation.load(std::memory_order_acquire);
+    if (!_rx_io.paired_queue->push_rx(std::move(rx_item))) {
+        if (!_stop_requested.load(std::memory_order_relaxed)) {
+            LOG_RT_WARN_HZ_M(Sensing, 5) << "[Sensing CH " << _rx_io.logical_id
+                              << "] paired RX queue full, dropping newest RX frame";
+        }
+        _rx_io.next_rx_frame_seq = frame_seq + 1;
+        _rx_io.rx_frame_pool.release(std::move(rx_item.samples));
+        return;
+    }
+    _rx_io.next_rx_frame_seq = frame_seq + 1;
+}
+
+void SensingChannel::_reset_monostatic_accumulators() {
+    _compute.accumulated_rx_symbols.clear();
+    _compute.accumulated_tx_symbols.clear();
+    _compute.next_symbol_to_sample = 0;
+    _compute.current_batch_first_symbol = 0;
+    _compute.batch_has_first_symbol = false;
+    _compute.pending_batch_gather_us = 0.0;
+}
+
+void SensingChannel::_sensing_loop() {
+    async_logger::LoggerThreadModeGuard log_mode_guard(async_logger::LoggerThreadMode::Realtime);
+    radio::set_thread_priority(0.6f, true);
+    bind_current_thread_to_core(configured_core_to_optional(_rx_io.channel_cfg.processing_cpu_core));
+    prefault_thread_stack();
+
+    while (_running_ref.load(std::memory_order_relaxed)) {
+        AlignedVector rx_frame_data;
+        TxSymbolsFrame tx_frame;
+        if (!_rx_io.paired_queue->pop_pair(
+                rx_frame_data, tx_frame, _rx_io.pairing_generation)) {
+            break;
+        }
+        if (_rx_io.compute_reset_requested.exchange(false, std::memory_order_acq_rel)) {
+            _reset_monostatic_accumulators();
+        }
+
+        _apply_batch_reset_if_due(tx_frame.frame_start_symbol_index);
+
+        const auto now = std::chrono::steady_clock::now();
+        _send_heartbeat_if_due(now);
+        if (_compute.delay_estimation_enabled &&
+            tx_frame.frame_seq >= _compute.next_delay_estimation_frame_seq) {
+            _estimate_system_delay(rx_frame_data, tx_frame.frame_seq);
+        }
+        if (_compute.sensing_pipeline_disabled_by_mode) {
+            _rx_io.rx_frame_pool.release(std::move(rx_frame_data));
+            continue;
+        }
+        if (sensing_output_mode_is_compact_mask(_cfg)) {
+            _apply_shared_sensing_if_due(tx_frame.frame_start_symbol_index);
+            if (_compute.compact_mask_local_delay_doppler_supported) {
+                _process_regular_compact_monostatic_frame(rx_frame_data, tx_frame);
+            } else {
+                _process_compact_monostatic_frame(rx_frame_data, tx_frame);
+            }
+            _rx_io.rx_frame_pool.release(std::move(rx_frame_data));
+            continue;
+        }
+
+        const auto& tx_symbols = *tx_frame.symbols;
+        const uint64_t frame_start = tx_frame.frame_start_symbol_index;
+        const uint64_t frame_end = frame_start + static_cast<uint64_t>(tx_symbols.size());
+        if (_compute.next_symbol_to_sample < frame_start) {
+            _compute.next_symbol_to_sample = frame_start;
+        }
+
+        while (_compute.next_symbol_to_sample < frame_end) {
+            _apply_shared_sensing_if_due(_compute.next_symbol_to_sample);
+            if (_compute.next_symbol_to_sample < frame_start) {
+                _compute.next_symbol_to_sample = frame_start;
+            }
+            if (_compute.next_symbol_to_sample >= frame_end) break;
+
+            const auto gather_start = std::chrono::steady_clock::now();
+            const size_t symbol_idx = static_cast<size_t>(_compute.next_symbol_to_sample - frame_start);
+            AlignedVector rx_symbol(_cfg.ofdm.fft_size);
+            const size_t symbol_start = symbol_idx * (_cfg.ofdm.fft_size + _cfg.ofdm.cp_length) + _cfg.ofdm.cp_length;
+            std::copy(
+                rx_frame_data.begin() + symbol_start,
+                rx_frame_data.begin() + symbol_start + _cfg.ofdm.fft_size,
+                rx_symbol.begin()
+            );
+
+            if (!_compute.batch_has_first_symbol) {
+                _compute.current_batch_first_symbol = _compute.next_symbol_to_sample;
+                _compute.batch_has_first_symbol = true;
+            }
+
+            _compute.accumulated_rx_symbols.push_back(std::move(rx_symbol));
+            _compute.accumulated_tx_symbols.push_back(tx_symbols[symbol_idx]);
+            _compute.next_symbol_to_sample += _compute.active_stride;
+            _compute.pending_batch_gather_us += std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - gather_start).count();
+
+            if (_compute.accumulated_tx_symbols.size() >= _cfg.ofdm.sensing_symbol_num) {
+                SensingFrame sensing_frame;
+                sensing_frame.rx_symbols = std::move(_compute.accumulated_rx_symbols);
+                sensing_frame.tx_symbols = std::move(_compute.accumulated_tx_symbols);
+                _compute.accumulated_rx_symbols.clear();
+                _compute.accumulated_tx_symbols.clear();
+
+                const uint64_t first_symbol = _compute.current_batch_first_symbol;
+                _compute.batch_has_first_symbol = false;
+                const double gather_us = _compute.pending_batch_gather_us;
+                _compute.pending_batch_gather_us = 0.0;
+                _sensing_process(sensing_frame, first_symbol, gather_us);
+            }
+        }
+
+        _rx_io.rx_frame_pool.release(std::move(rx_frame_data));
+    }
+}
+
+void SensingChannel::_send_heartbeat_if_due(const std::chrono::steady_clock::time_point& now) {
+    if (!_rx_io.channel_cfg.enable_sensing_output) {
+        return;
+    }
+    if (now < _compute.next_hb_time) {
+        return;
+    }
+    if (_heartbeat_sender) {
+        _heartbeat_sender(_output_ip, _output_port);
+    }
+    _compute.next_hb_time = now + std::chrono::seconds(1);
+}
+
+void SensingChannel::_estimate_system_delay(const AlignedVector& rx_frame_data, uint64_t frame_seq) {
+    if (!_compute.delay_estimation_enabled || !_compute.system_delay_sync) {
+        return;
+    }
+
+    int max_pos = 0;
+    float max_corr = 0.0f;
+    float avg_corr = 0.0f;
+    _compute.system_delay_sync->find_sync_position(rx_frame_data, max_pos, max_corr, avg_corr);
+
+    const int64_t frame_samples = static_cast<int64_t>(_cfg.samples_per_frame());
+    if (frame_samples <= 0) {
+        return;
+    }
+    const int64_t raw_delay = static_cast<int64_t>(max_pos) -
+        static_cast<int64_t>(_compute.system_delay_expected_sync_pos);
+    int64_t delay_samples = raw_delay % frame_samples;
+    if (delay_samples < 0) {
+        delay_samples += frame_samples;
+    }
+    if (frame_samples > 1) {
+        const int64_t half_frame = frame_samples / 2;
+        if (delay_samples >= half_frame) {
+            delay_samples -= frame_samples;
+        }
+    }
+
+    const double rx_sample_rate =
+        (_rx_io.rx_sample_rate > 0.0) ? _rx_io.rx_sample_rate : _cfg.rf_sampling.sample_rate;
+    const double delay_us = (rx_sample_rate > 0.0)
+        ? (static_cast<double>(delay_samples) * 1e6 / rx_sample_rate)
+        : 0.0;
+    const float corr_ratio = (avg_corr > 0.0f) ? (max_corr / avg_corr) : 0.0f;
+    const int32_t target_alignment = _rx_io.target_alignment.load(std::memory_order_relaxed);
+    const int64_t suggested_alignment_raw =
+        static_cast<int64_t>(target_alignment) + delay_samples;
+
+    _compute.next_delay_estimation_frame_seq = frame_seq + kSystemDelayEstimationFrameInterval;
+
+    LOG_RT_INFO_M(Sensing) << "[SYSDLY CH " << _rx_io.logical_id
+                  << "] frame_seq=" << frame_seq
+                  << ", delay=" << delay_samples << " samp (" << delay_us << " us)"
+                  << ", peak=" << max_pos
+                  << ", expected=" << _compute.system_delay_expected_sync_pos
+                  << ", corr_ratio=" << corr_ratio
+                  << ", target_alignment=" << target_alignment
+                  << ", alignment_suggest=" << suggested_alignment_raw
+                  << ", next_frame_seq=" << _compute.next_delay_estimation_frame_seq
+                  << ", interval=" << kSystemDelayEstimationFrameInterval;
+}
+
+void SensingChannel::_process_compact_monostatic_frame(
+    const AlignedVector& rx_frame_data,
+    const TxSymbolsFrame& tx_frame)
+{
+    const auto& layout = _compute.sensing_mask_layout;
+    if (layout.empty() || tx_frame.symbols == nullptr) {
+        return;
+    }
+
+    const auto& tx_symbols = *tx_frame.symbols;
+    auto& compact_output = _compute.compact_channel_output;
+    for (size_t row = 0; row < layout.selected_symbols.size(); ++row) {
+        const size_t symbol_idx = static_cast<size_t>(layout.selected_symbols[row]);
+        if (symbol_idx >= tx_symbols.size()) {
+            continue;
+        }
+        const size_t symbol_start = symbol_idx * (_cfg.ofdm.fft_size + _cfg.ofdm.cp_length) + _cfg.ofdm.cp_length;
+        std::copy(
+            rx_frame_data.begin() + symbol_start,
+            rx_frame_data.begin() + symbol_start + _cfg.ofdm.fft_size,
+            _compute.demod_fft_in.begin());
+        fftwf_execute(_compute.demod_fft_plan);
+
+        const auto& tx_symbol = tx_symbols[symbol_idx];
+        const size_t begin = layout.selected_symbol_offsets[row];
+        const size_t end = layout.selected_symbol_offsets[row + 1];
+        for (size_t idx = begin; idx < end; ++idx) {
+            const size_t sc = static_cast<size_t>(layout.flat_subcarrier_indices[idx]);
+            compact_output[idx] = _compute.demod_fft_out[sc] * std::conj(tx_symbol[sc]);
+        }
+    }
+
+    _apply_sparse_compact_system_response_calibration(
+        compact_output,
+        layout.flat_subcarrier_indices);
+    _compute.sensing_sender.push_compact_data(
+        compact_output,
+        layout.mask_hash,
+        tx_frame.frame_start_symbol_index);
+}
+
+void SensingChannel::_process_compact_bistatic_frame(
+    const SensingFrame& frame,
+    uint64_t frame_start_symbol_index)
+{
+    const auto& layout = _compute.sensing_mask_layout;
+    if (layout.empty()) {
+        return;
+    }
+
+    auto& compact_output = _compute.compact_channel_output;
+    const size_t symbols_in_frame = std::min(frame.rx_symbols.size(), frame.tx_symbols.size());
+    for (size_t row = 0; row < layout.selected_symbols.size(); ++row) {
+        const size_t symbol_idx = static_cast<size_t>(layout.selected_symbols[row]);
+        if (symbol_idx >= symbols_in_frame) {
+            continue;
+        }
+
+        AlignedVector rx_symbol = frame.rx_symbols[symbol_idx];
+        const int relative_symbol_index = static_cast<int>(symbol_idx) - static_cast<int>(_cfg.ofdm.sync_pos);
+        const size_t phase_bins = std::min(rx_symbol.size(), _compute.actual_subcarrier_indices.size());
+        apply_sensing_phase_compensation(
+            rx_symbol.data(), phase_bins,
+            _compute.actual_subcarrier_indices.data(),
+            _compute.subcarrier_phases_unit_delay.data(),
+            frame.CFO, frame.SFO, frame.delay_offset, relative_symbol_index);
+
+        const auto& tx_symbol = frame.tx_symbols[symbol_idx];
+        const size_t begin = layout.selected_symbol_offsets[row];
+        const size_t end = layout.selected_symbol_offsets[row + 1];
+        for (size_t idx = begin; idx < end; ++idx) {
+            const size_t sc = static_cast<size_t>(layout.flat_subcarrier_indices[idx]);
+            compact_output[idx] = rx_symbol[sc] * std::conj(tx_symbol[sc]);
+        }
+    }
+
+    _apply_sparse_compact_system_response_calibration(
+        compact_output,
+        layout.flat_subcarrier_indices);
+    _compute.sensing_sender.push_compact_data(
+        compact_output,
+        layout.mask_hash,
+        frame_start_symbol_index);
+}
+
+void SensingChannel::_process_regular_compact_monostatic_frame(
+    const AlignedVector& rx_frame_data,
+    const TxSymbolsFrame& tx_frame)
+{
+    const auto& analysis = _compute.compact_mask_analysis;
+    if (!analysis.local_delay_doppler_supported || tx_frame.symbols == nullptr) {
+        _process_compact_monostatic_frame(rx_frame_data, tx_frame);
+        return;
+    }
+
+    const auto& tx_symbols = *tx_frame.symbols;
+    if (analysis.selected_symbols.empty()) {
+        return;
+    }
+
+    if (!_compute.compact_sensing_core) {
+        return;
+    }
+
+    auto& compact_core = *_compute.compact_sensing_core;
+    auto& channel_buf = compact_core.channel_buffer();
+    const size_t range_stride = compact_core.params().range_fft_size;
+
+    if (_compute.compact_selected_tx_symbols.empty()) {
+        compact_core.clear_channel_buffer();
+    }
+
+    for (size_t selected_row = 0; selected_row < analysis.selected_symbols.size(); ++selected_row) {
+        const size_t symbol_idx = static_cast<size_t>(analysis.selected_symbols[selected_row]);
+        if (symbol_idx >= tx_symbols.size()) {
+            return;
+        }
+        if (_compute.compact_selected_tx_symbols.size() >= _cfg.ofdm.sensing_symbol_num) {
+            _process_regular_compact_buffer(
+                _compute.compact_selected_tx_symbols,
+                _compute.current_batch_first_symbol);
+            _compute.compact_selected_tx_symbols.clear();
+            _compute.batch_has_first_symbol = false;
+            compact_core.clear_channel_buffer();
+        }
+
+        const size_t batch_row = _compute.compact_selected_tx_symbols.size();
+        if (!_compute.batch_has_first_symbol) {
+            _compute.current_batch_first_symbol =
+                tx_frame.frame_start_symbol_index + static_cast<uint64_t>(symbol_idx);
+            _compute.batch_has_first_symbol = true;
+        }
+
+        const size_t symbol_start = symbol_idx * (_cfg.ofdm.fft_size + _cfg.ofdm.cp_length) + _cfg.ofdm.cp_length;
+        if (symbol_start + _cfg.ofdm.fft_size > rx_frame_data.size()) {
+            return;
+        }
+        std::copy(
+            rx_frame_data.begin() + static_cast<std::ptrdiff_t>(symbol_start),
+            rx_frame_data.begin() + static_cast<std::ptrdiff_t>(symbol_start + _cfg.ofdm.fft_size),
+            _compute.demod_fft_in.begin());
+        fftwf_execute(_compute.demod_fft_plan);
+
+        auto* row_out = channel_buf.data() + batch_row * range_stride;
+        AlignedVector compact_tx_symbol(analysis.common_subcarrier_count);
+        for (size_t sub_idx = 0; sub_idx < analysis.common_subcarrier_count; ++sub_idx) {
+            const size_t sc_idx = static_cast<size_t>(analysis.common_subcarrier_indices[sub_idx]);
+            row_out[sub_idx] = _compute.demod_fft_out[sc_idx];
+            compact_tx_symbol[sub_idx] = tx_symbols[symbol_idx][sc_idx];
+        }
+        _compute.compact_selected_tx_symbols.push_back(std::move(compact_tx_symbol));
+        if (_compute.compact_selected_tx_symbols.size() >= _cfg.ofdm.sensing_symbol_num) {
+            _process_regular_compact_buffer(
+                _compute.compact_selected_tx_symbols,
+                _compute.current_batch_first_symbol);
+            _compute.compact_selected_tx_symbols.clear();
+            _compute.batch_has_first_symbol = false;
+            compact_core.clear_channel_buffer();
+        }
+    }
+}
+
+void SensingChannel::_process_regular_compact_bistatic_frame(
+    const SensingFrame& frame,
+    uint64_t frame_start_symbol_index)
+{
+    const auto& analysis = _compute.compact_mask_analysis;
+    if (!analysis.local_delay_doppler_supported || analysis.selected_symbols.empty()) {
+        _process_compact_bistatic_frame(frame, frame_start_symbol_index);
+        return;
+    }
+
+    const size_t symbols_in_frame = std::min(frame.rx_symbols.size(), frame.tx_symbols.size());
+    if (symbols_in_frame == 0) {
+        return;
+    }
+
+    if (!_compute.compact_sensing_core) {
+        return;
+    }
+
+    auto& compact_core = *_compute.compact_sensing_core;
+    auto& channel_buf = compact_core.channel_buffer();
+    const size_t range_stride = compact_core.params().range_fft_size;
+
+    if (_compute.compact_selected_tx_symbols.empty()) {
+        compact_core.clear_channel_buffer();
+    }
+
+    for (size_t selected_row = 0; selected_row < analysis.selected_symbols.size(); ++selected_row) {
+        const size_t symbol_idx = static_cast<size_t>(analysis.selected_symbols[selected_row]);
+        if (symbol_idx >= symbols_in_frame) {
+            return;
+        }
+        if (_compute.compact_selected_tx_symbols.size() >= _cfg.ofdm.sensing_symbol_num) {
+            _process_regular_compact_buffer(
+                _compute.compact_selected_tx_symbols,
+                _compute.current_batch_first_symbol);
+            _compute.compact_selected_tx_symbols.clear();
+            _compute.batch_has_first_symbol = false;
+            compact_core.clear_channel_buffer();
+        }
+
+        const size_t batch_row = _compute.compact_selected_tx_symbols.size();
+        if (!_compute.batch_has_first_symbol) {
+            _compute.current_batch_first_symbol =
+                frame_start_symbol_index + static_cast<uint64_t>(symbol_idx);
+            _compute.batch_has_first_symbol = true;
+        }
+
+        const int relative_symbol_index = static_cast<int>(symbol_idx) - static_cast<int>(_cfg.ofdm.sync_pos);
+        const float phase_diff_cfo = frame.CFO * static_cast<float>(relative_symbol_index);
+        auto* row_out = channel_buf.data() + batch_row * range_stride;
+        AlignedVector compact_tx_symbol(analysis.common_subcarrier_count);
+        for (size_t sub_idx = 0; sub_idx < analysis.common_subcarrier_count; ++sub_idx) {
+            const size_t sc_idx = static_cast<size_t>(analysis.common_subcarrier_indices[sub_idx]);
+            const float phase_diff_sfo =
+                frame.SFO * static_cast<float>(_compute.actual_subcarrier_indices[sc_idx]) *
+                static_cast<float>(relative_symbol_index);
+            const float phase_diff_delay =
+                _compute.subcarrier_phases_unit_delay[sc_idx] * frame.delay_offset;
+            const float phase_diff_total = phase_diff_delay + phase_diff_sfo + phase_diff_cfo;
+            const std::complex<float> phase = std::polar(1.0f, -phase_diff_total);
+            row_out[sub_idx] = frame.rx_symbols[symbol_idx][sc_idx] * phase;
+            compact_tx_symbol[sub_idx] = frame.tx_symbols[symbol_idx][sc_idx];
+        }
+        _compute.compact_selected_tx_symbols.push_back(std::move(compact_tx_symbol));
+        if (_compute.compact_selected_tx_symbols.size() >= _cfg.ofdm.sensing_symbol_num) {
+            _process_regular_compact_buffer(
+                _compute.compact_selected_tx_symbols,
+                _compute.current_batch_first_symbol);
+            _compute.compact_selected_tx_symbols.clear();
+            _compute.batch_has_first_symbol = false;
+            compact_core.clear_channel_buffer();
+        }
+    }
+}
+
+void SensingChannel::_process_regular_compact_buffer(
+    const std::vector<AlignedVector>& tx_symbols,
+    uint64_t frame_start_symbol_index)
+{
+    const auto& analysis = _compute.compact_mask_analysis;
+    if (!analysis.local_delay_doppler_supported || tx_symbols.empty()) {
+        return;
+    }
+
+    if (!_compute.compact_sensing_core) {
+        return;
+    }
+
+    auto& compact_core = *_compute.compact_sensing_core;
+    auto& channel_buf = compact_core.channel_buffer();
+    const size_t symbol_count = tx_symbols.size();
+    const size_t range_stride = compact_core.params().range_fft_size;
+    const bool backend_processing = backend_sensing_processing_supported(_cfg);
+
+    compact_core.channel_estimate_with_shift(tx_symbols, symbol_count);
+    _accumulate_system_response_calibration(
+        channel_buf,
+        range_stride,
+        symbol_count,
+        compact_core.params().fft_size);
+    _apply_regular_compact_system_response_calibration(
+        channel_buf,
+        range_stride,
+        symbol_count,
+        analysis.common_subcarrier_indices);
+    compact_core.apply_mti(_compute.active_enable_mti, symbol_count);
+
+    if (_compute.active_skip_sensing_fft) {
+        AlignedVector compact_output(symbol_count * analysis.common_subcarrier_count);
+        for (size_t row = 0; row < symbol_count; ++row) {
+            for (size_t sub_idx = 0; sub_idx < analysis.common_subcarrier_count; ++sub_idx) {
+                const size_t compact_idx = row * analysis.common_subcarrier_count + sub_idx;
+                compact_output[compact_idx] = channel_buf[row * range_stride + sub_idx];
+            }
+        }
+        _compute.sensing_sender.push_compact_data(
+            compact_output,
+            _compute.sensing_mask_layout.mask_hash,
+            frame_start_symbol_index);
+        return;
+    }
+
+    compact_core.apply_windows(
+        channel_buf,
+        _compute.compact_range_window,
+        _compute.compact_doppler_window,
+        symbol_count);
+    const bool range_zoom_enabled = backend_processing &&
+        backend_range_zoom_active(
+            _compute.compact_backend_zoom,
+            _compute.micro_doppler_enabled,
+            _compute.micro_doppler_range_bin);
+    const bool doppler_zoom_enabled = backend_processing &&
+        _compute.compact_backend_zoom.has_doppler_plan();
+    const size_t fft_rows = compact_core.params().doppler_fft_size;
+    const std::complex<float>* doppler_input = nullptr;
+    size_t doppler_input_cols = range_stride;
+    AlignedVector* post_doppler_buf = &channel_buf;
+
+    if (range_zoom_enabled) {
+        execute_range_zoom_rows(
+            *_compute.compact_backend_zoom.range_plan,
+            channel_buf.data(),
+            symbol_count,
+            range_stride,
+            fft_rows,
+            _compute.compact_backend_zoom.range_output_buffer);
+        doppler_input = _compute.compact_backend_zoom.range_output_buffer.data();
+        doppler_input_cols = _compute.compact_backend_zoom.range_view_bins;
+    } else {
+        compact_core.execute_range_ifft();
+        doppler_input = channel_buf.data();
+        if (backend_processing && _compute.backend_range_view_limited) {
+            copy_backend_range_view_input(
+                channel_buf,
+                symbol_count,
+                range_stride,
+                fft_rows,
+                _compute.backend_view_range_bins,
+                _compute.backend_view_buffer);
+            doppler_input = _compute.backend_view_buffer.data();
+            doppler_input_cols = _compute.backend_view_range_bins;
+        }
+    }
+
+    if (backend_processing &&
+        _compute.micro_doppler_enabled &&
+        doppler_input_cols > 0) {
+        const size_t selected_range_bin = std::min(
+            _compute.micro_doppler_range_bin,
+            doppler_input_cols - 1);
+        extract_range_bin_trace(
+            doppler_input,
+            symbol_count,
+            doppler_input_cols,
+            selected_range_bin,
+            _compute.micro_doppler_trace);
+        _compute.micro_doppler_state.append_samples(
+            _compute.micro_doppler_trace.data(),
+            _compute.micro_doppler_trace.size());
+    }
+
+    if (doppler_zoom_enabled) {
+        execute_doppler_zoom_columns(
+            _compute.compact_backend_zoom,
+            doppler_input,
+            doppler_input_cols,
+            _compute.backend_output_buffer);
+        post_doppler_buf = &_compute.backend_output_buffer;
+    } else if (backend_processing && _compute.backend_range_view_limited) {
+        if (doppler_input == _compute.backend_view_buffer.data()) {
+            fftwf_execute(_compute.backend_view_doppler_fft_plan);
+            post_doppler_buf = &_compute.backend_view_buffer;
+        } else {
+            fftwf_execute_dft(
+                _compute.backend_view_doppler_fft_plan,
+                reinterpret_cast<fftwf_complex*>(const_cast<std::complex<float>*>(doppler_input)),
+                reinterpret_cast<fftwf_complex*>(const_cast<std::complex<float>*>(doppler_input)));
+            post_doppler_buf = &_compute.compact_backend_zoom.range_output_buffer;
+        }
+    } else {
+        compact_core.execute_doppler_fft();
+        post_doppler_buf = &channel_buf;
+    }
+
+    if (backend_processing) {
+        AlignedVector* output_buf = nullptr;
+        const size_t output_cols = doppler_input_cols;
+        if (doppler_zoom_enabled) {
+            output_buf = &_compute.backend_output_buffer;
+        } else if (_compute.backend_doppler_view_limited) {
+            const auto* fft_output = post_doppler_buf->data();
+            crop_doppler_view_output(
+                fft_output,
+                fft_rows,
+                output_cols,
+                _compute.backend_view_doppler_bins,
+                _compute.backend_output_buffer);
+            output_buf = &_compute.backend_output_buffer;
+        } else {
+            output_buf = post_doppler_buf;
+        }
+        const size_t output_rows = (doppler_zoom_enabled || _compute.backend_doppler_view_limited)
+            ? _compute.backend_view_doppler_bins
+            : fft_rows;
+        const float amplitude_scale = sensing_rd_amplitude_scale(
+            symbol_count,
+            compact_core.params().fft_size);
+        scale_complex_buffer_inplace(output_buf->data(), output_buf->size(), amplitude_scale);
+        _compute.metadata_bytes = _build_backend_metadata(
+            output_buf->data(),
+            output_rows,
+            output_cols,
+            frame_start_symbol_index);
+        _compute.sensing_sender.push_data(
+            *output_buf,
+            frame_start_symbol_index,
+            std::move(_compute.metadata_bytes));
+    } else {
+        _compute.sensing_sender.push_data(channel_buf, frame_start_symbol_index);
+    }
+    compact_core.clear_channel_buffer();
+}
+
+void SensingChannel::_sensing_process(const SensingFrame& frame, uint64_t first_symbol_index, double gather_us) {
+    using ProfileClock = std::chrono::steady_clock;
+    auto& channel_buf = _compute.sensing_core.channel_buffer();
+    const auto& sensing_params = _compute.sensing_core.params();
+    const size_t range_stride = sensing_params.range_fft_size;
+    const size_t doppler_slots = sensing_params.doppler_fft_size;
+
+    const size_t symbol_count = std::min(frame.rx_symbols.size(), _cfg.ofdm.sensing_symbol_num);
+    if (symbol_count < sensing_params.sensing_symbol_num) {
+        LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                      << "] sensing frame has too few time-domain symbols; dropping missing rows"
+                      << ": received=" << symbol_count
+                      << ", expected=" << sensing_params.sensing_symbol_num;
+        _compute.sensing_core.clear_channel_buffer();
+    }
+    const int plan_input_alignment = fftwf_alignment_of(
+        reinterpret_cast<float*>(_compute.demod_fft_in.data())
+    );
+    const int plan_output_alignment = fftwf_alignment_of(
+        reinterpret_cast<float*>(_compute.demod_fft_out.data())
+    );
+    const auto prep_start = ProfileClock::now();
+    for (size_t i = 0; i < symbol_count; ++i) {
+        if (i >= doppler_slots) {
+            continue;
+        }
+
+        auto* fft_in = reinterpret_cast<fftwf_complex*>(
+            const_cast<std::complex<float>*>(frame.rx_symbols[i].data())
+        );
+        auto* slot_out = reinterpret_cast<fftwf_complex*>(
+            channel_buf.data() + i * range_stride
+        );
+
+        const int current_input_alignment = fftwf_alignment_of(
+            reinterpret_cast<float*>(fft_in)
+        );
+        const int current_output_alignment = fftwf_alignment_of(
+            reinterpret_cast<float*>(slot_out)
+        );
+
+        if (current_input_alignment == plan_input_alignment &&
+            current_output_alignment == plan_output_alignment) {
+            fftwf_execute_dft(_compute.demod_fft_plan, fft_in, slot_out);
+        } else {
+            std::copy(frame.rx_symbols[i].begin(), frame.rx_symbols[i].end(), _compute.demod_fft_in.begin());
+            fftwf_execute(_compute.demod_fft_plan);
+            _compute.sensing_core.copy_fft_result_to_buffer(i, _compute.demod_fft_out);
+        }
+    }
+
+    const double prep_us = std::chrono::duration<double, std::micro>(
+        ProfileClock::now() - prep_start).count();
+    _sensing_process_finalize(frame.tx_symbols, first_symbol_index, gather_us, prep_us, symbol_count);
+}
+
+void SensingChannel::_sensing_process_freq(const SensingFrame& frame, uint64_t first_symbol_index, double gather_us) {
+    using ProfileClock = std::chrono::steady_clock;
+    const size_t symbol_count = std::min(frame.rx_symbols.size(), _cfg.ofdm.sensing_symbol_num);
+    if (symbol_count < _compute.sensing_core.params().sensing_symbol_num) {
+        LOG_RT_WARN_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                      << "] sensing frame has too few frequency-domain symbols; dropping missing rows"
+                      << ": received=" << symbol_count
+                      << ", expected=" << _compute.sensing_core.params().sensing_symbol_num;
+        _compute.sensing_core.clear_channel_buffer();
+    }
+    const auto prep_start = ProfileClock::now();
+    _compute.sensing_core.copy_symbols_to_buffer(frame.rx_symbols, symbol_count);
+    const double prep_us = std::chrono::duration<double, std::micro>(
+        ProfileClock::now() - prep_start).count();
+    _sensing_process_finalize(frame.tx_symbols, first_symbol_index, gather_us, prep_us, symbol_count);
+}
+
+void SensingChannel::_sensing_process_finalize(
+    const std::vector<AlignedVector>& tx_symbols,
+    uint64_t first_symbol_index,
+    double gather_us,
+    double prep_us,
+    size_t symbol_count
+) {
+    using ProfileClock = std::chrono::steady_clock;
+    const bool do_prof = should_profile_sensing(_cfg);
+    const bool backend_processing = backend_sensing_processing_supported(_cfg);
+    auto& channel_buf = _compute.sensing_core.channel_buffer();
+    const auto chest_start = ProfileClock::now();
+    _compute.sensing_core.channel_estimate_with_shift(tx_symbols, symbol_count);
+    _accumulate_system_response_calibration(
+        channel_buf,
+        _compute.sensing_core.params().range_fft_size,
+        symbol_count,
+        _compute.sensing_core.params().fft_size);
+    _apply_system_response_calibration(
+        channel_buf,
+        _compute.sensing_core.params().range_fft_size,
+        symbol_count,
+        _compute.sensing_core.params().fft_size);
+    const double chest_shift_us = std::chrono::duration<double, std::micro>(
+        ProfileClock::now() - chest_start).count();
+    const auto mti_start = ProfileClock::now();
+    _compute.sensing_core.apply_mti(_compute.active_enable_mti, symbol_count);
+    const double mti_us = std::chrono::duration<double, std::micro>(
+        ProfileClock::now() - mti_start).count();
+
+    double windows_fft_us = 0.0;
+    const size_t fft_rows = _compute.sensing_core.params().doppler_fft_size;
+    const bool range_zoom_enabled = backend_processing &&
+        backend_range_zoom_active(
+            _compute.backend_zoom,
+            _compute.micro_doppler_enabled,
+            _compute.micro_doppler_range_bin);
+    const bool doppler_zoom_enabled = backend_processing &&
+        _compute.backend_zoom.has_doppler_plan();
+    const std::complex<float>* doppler_input = channel_buf.data();
+    size_t doppler_input_cols = _compute.sensing_core.params().range_fft_size;
+    AlignedVector* post_doppler_buf = &channel_buf;
+    if (!_compute.active_skip_sensing_fft) {
+        const auto fft_start = ProfileClock::now();
+        _compute.sensing_core.apply_windows(
+            channel_buf,
+            _compute.range_window,
+            _compute.doppler_window,
+            symbol_count);
+        if (range_zoom_enabled) {
+            execute_range_zoom_rows(
+                *_compute.backend_zoom.range_plan,
+                channel_buf.data(),
+                symbol_count,
+                _compute.sensing_core.params().range_fft_size,
+                fft_rows,
+                _compute.backend_zoom.range_output_buffer);
+            doppler_input = _compute.backend_zoom.range_output_buffer.data();
+            doppler_input_cols = _compute.backend_zoom.range_view_bins;
+        } else {
+            _compute.sensing_core.execute_range_ifft();
+            doppler_input = channel_buf.data();
+            doppler_input_cols = _compute.sensing_core.params().range_fft_size;
+            if (backend_processing && _compute.backend_range_view_limited) {
+                copy_backend_range_view_input(
+                    channel_buf,
+                    symbol_count,
+                    _compute.sensing_core.params().range_fft_size,
+                    fft_rows,
+                    _compute.backend_view_range_bins,
+                    _compute.backend_view_buffer);
+                doppler_input = _compute.backend_view_buffer.data();
+                doppler_input_cols = _compute.backend_view_range_bins;
+            }
+        }
+
+        if (backend_processing &&
+            _compute.micro_doppler_enabled &&
+            doppler_input_cols > 0) {
+            const size_t selected_range_bin = std::min(
+                _compute.micro_doppler_range_bin,
+                doppler_input_cols - 1);
+            extract_range_bin_trace(
+                doppler_input,
+                symbol_count,
+                doppler_input_cols,
+                selected_range_bin,
+                _compute.micro_doppler_trace);
+            _compute.micro_doppler_state.append_samples(
+                _compute.micro_doppler_trace.data(),
+                _compute.micro_doppler_trace.size());
+        }
+
+        if (doppler_zoom_enabled) {
+            execute_doppler_zoom_columns(
+                _compute.backend_zoom,
+                doppler_input,
+                doppler_input_cols,
+                _compute.backend_output_buffer);
+            post_doppler_buf = &_compute.backend_output_buffer;
+        } else if (backend_processing && _compute.backend_range_view_limited) {
+            if (doppler_input == _compute.backend_view_buffer.data()) {
+                fftwf_execute(_compute.backend_view_doppler_fft_plan);
+                post_doppler_buf = &_compute.backend_view_buffer;
+            } else {
+                fftwf_execute_dft(
+                    _compute.backend_view_doppler_fft_plan,
+                    reinterpret_cast<fftwf_complex*>(const_cast<std::complex<float>*>(doppler_input)),
+                    reinterpret_cast<fftwf_complex*>(const_cast<std::complex<float>*>(doppler_input)));
+                post_doppler_buf = &_compute.backend_zoom.range_output_buffer;
+            }
+        } else {
+            _compute.sensing_core.execute_doppler_fft();
+            post_doppler_buf = &channel_buf;
+        }
+        windows_fft_us = std::chrono::duration<double, std::micro>(
+            ProfileClock::now() - fft_start).count();
+    }
+
+    const auto send_start = ProfileClock::now();
+    if (backend_processing) {
+        AlignedVector* output_buf = nullptr;
+        const size_t output_cols = doppler_input_cols;
+        if (doppler_zoom_enabled) {
+            output_buf = &_compute.backend_output_buffer;
+        } else if (_compute.backend_doppler_view_limited) {
+            const auto* fft_output = post_doppler_buf->data();
+            crop_doppler_view_output(
+                fft_output,
+                fft_rows,
+                output_cols,
+                _compute.backend_view_doppler_bins,
+                _compute.backend_output_buffer);
+            output_buf = &_compute.backend_output_buffer;
+        } else {
+            output_buf = post_doppler_buf;
+        }
+        const size_t output_rows = (doppler_zoom_enabled || _compute.backend_doppler_view_limited)
+            ? _compute.backend_view_doppler_bins
+            : fft_rows;
+        const float amplitude_scale = sensing_rd_amplitude_scale(
+            symbol_count,
+            _compute.sensing_core.params().fft_size);
+        scale_complex_buffer_inplace(output_buf->data(), output_buf->size(), amplitude_scale);
+        _compute.metadata_bytes = _build_backend_metadata(
+            output_buf->data(),
+            output_rows,
+            output_cols,
+            first_symbol_index);
+        _compute.sensing_sender.push_data(
+            *output_buf,
+            first_symbol_index,
+            std::move(_compute.metadata_bytes));
+    } else {
+        _compute.sensing_sender.push_data(channel_buf, first_symbol_index);
+    }
+    const double send_us = std::chrono::duration<double, std::micro>(
+        ProfileClock::now() - send_start).count();
+    if (_cfg.sensing.range_fft_size != _cfg.ofdm.fft_size || _cfg.sensing.doppler_fft_size != _cfg.ofdm.fft_size) {
+        _compute.sensing_core.clear_channel_buffer();
+    }
+
+    if (do_prof) {
+        _compute.prof_gather_total_us += gather_us;
+        _compute.prof_prep_total_us += prep_us;
+        _compute.prof_chest_shift_total_us += chest_shift_us;
+        _compute.prof_mti_total_us += mti_us;
+        _compute.prof_windows_fft_total_us += windows_fft_us;
+        _compute.prof_send_total_us += send_us;
+        _compute.prof_batch_count++;
+
+        constexpr uint64_t PROF_REPORT_INTERVAL = 64;
+        if (_compute.prof_batch_count >= PROF_REPORT_INTERVAL) {
+            const double n = static_cast<double>(_compute.prof_batch_count);
+            const double total_latency_us =
+                _compute.prof_prep_total_us +
+                _compute.prof_chest_shift_total_us +
+                _compute.prof_mti_total_us +
+                _compute.prof_windows_fft_total_us;
+            std::ostringstream oss;
+            oss << "\n========== Sensing CH " << _rx_io.logical_id
+                << " Profiling (avg per batch, us) ==========\n"
+                << "Batch gather:            " << _compute.prof_gather_total_us / n << " us\n"
+                << "RX symbol prep:          " << _compute.prof_prep_total_us / n << " us\n"
+                << "ChEst + Shift:           " << _compute.prof_chest_shift_total_us / n << " us\n"
+                << "MTI:                     " << _compute.prof_mti_total_us / n << " us\n"
+                << "Windows+IFFT+DopFFT:     " << _compute.prof_windows_fft_total_us / n << " us\n"
+                << "Send queue push:         " << _compute.prof_send_total_us / n << " us\n"
+                << "TOTAL LATENCY (excl. gather/send): " << total_latency_us / n << " us\n"
+                << "Profile batch count:     " << _compute.prof_batch_count << "\n"
+                << "========================================================\n";
+            LOG_RT_INFO_M(SensingProfiling) << oss.str();
+            _compute.prof_gather_total_us = 0.0;
+            _compute.prof_prep_total_us = 0.0;
+            _compute.prof_chest_shift_total_us = 0.0;
+            _compute.prof_mti_total_us = 0.0;
+            _compute.prof_windows_fft_total_us = 0.0;
+            _compute.prof_send_total_us = 0.0;
+            _compute.prof_batch_count = 0;
+        }
+    }
+}
+
+void SensingChannel::_prepare_backend_processing_state(
+    SharedSensingRuntime& snapshot,
+    bool& clear_micro_doppler)
+{
+    clear_micro_doppler = false;
+    _compute.cfar_params.enabled = snapshot.cfar_enabled;
+    _compute.cfar_params.train_doppler = snapshot.cfar_train_doppler;
+    _compute.cfar_params.train_range = snapshot.cfar_train_range;
+    _compute.cfar_params.guard_doppler = snapshot.cfar_guard_doppler;
+    _compute.cfar_params.guard_range = snapshot.cfar_guard_range;
+    _compute.cfar_params.alpha_db = snapshot.cfar_alpha_db;
+    _compute.cfar_params.min_range_bin = snapshot.cfar_min_range_bin;
+    _compute.cfar_params.dc_exclusion_bins = snapshot.cfar_dc_exclusion_bins;
+    _compute.cfar_params.min_power_db = snapshot.cfar_min_power_db;
+    _compute.cfar_params.os_rank_percent = snapshot.cfar_os_rank_percent;
+    _compute.cfar_params.os_suppress_doppler = snapshot.cfar_os_suppress_doppler;
+    _compute.cfar_params.os_suppress_range = snapshot.cfar_os_suppress_range;
+
+    if (_compute.micro_doppler_enabled != snapshot.micro_doppler_enabled) {
+        _compute.micro_doppler_enabled = snapshot.micro_doppler_enabled;
+        clear_micro_doppler = true;
+    }
+    const size_t next_range_bin = static_cast<size_t>(std::max(0, snapshot.micro_doppler_range_bin));
+    if (_compute.micro_doppler_range_bin != next_range_bin) {
+        _compute.micro_doppler_range_bin = next_range_bin;
+        clear_micro_doppler = true;
+    }
+}
+
+std::vector<uint8_t> SensingChannel::_build_backend_metadata(
+    const std::complex<float>* rd_data,
+    size_t rows,
+    size_t cols,
+    uint64_t frame_start_symbol_index)
+{
+    if (!backend_sensing_processing_supported(_cfg) ||
+        rd_data == nullptr ||
+        rows == 0 ||
+        cols == 0) {
+        return {};
+    }
+
+    SensingMetadata metadata{};
+    metadata.cfar_enabled = _compute.cfar_params.enabled;
+    metadata.micro_doppler_enabled = _compute.micro_doppler_enabled;
+    compute_shifted_magnitude_db(rd_data, rows, cols, _compute.rd_magnitude_db);
+    run_os_cfar_2d_full(
+        _compute.rd_magnitude_db,
+        rows,
+        cols,
+        _compute.cfar_params,
+        metadata.cfar_points,
+        metadata.cfar_hits,
+        metadata.cfar_shown_hits,
+        metadata.cfar_stats);
+    if (!metadata.cfar_points.empty()) {
+        metadata.target_clusters = cluster_detected_targets(
+            metadata.cfar_points,
+            _compute.rd_magnitude_db,
+            rows,
+            cols,
+            std::max(0, _compute.cfar_params.os_suppress_doppler) + 1,
+            std::max(0, _compute.cfar_params.os_suppress_range) + 1);
+    }
+
+    if (_compute.micro_doppler_enabled) {
+        _compute.micro_doppler_state.compute_spectrum(
+            metadata.micro_doppler_spectrum,
+            metadata.micro_doppler_rows,
+            metadata.micro_doppler_cols,
+            metadata.micro_doppler_extent);
+    }
+    return serialize_sensing_metadata(metadata, frame_start_symbol_index);
+}
+
+void SensingChannel::_apply_shared_sensing_if_due(uint64_t symbol_index) {
+    SharedSensingRuntime snapshot;
+    bool should_apply = false;
+    {
+        std::lock_guard<std::mutex> lock(_shared_cfg_mutex);
+        if (_has_pending_shared_cfg && _pending_shared_cfg.generation > _compute.applied_generation) {
+            snapshot = _pending_shared_cfg;
+            if (symbol_index >= _pending_shared_cfg.apply_symbol_index) {
+                should_apply = true;
+            }
+        }
+    }
+    if (!should_apply) {
+        return;
+    }
+
+    const size_t previous_stride = _compute.active_stride;
+    _compute.active_stride = std::max<size_t>(1, snapshot.sensing_symbol_stride);
+    _compute.active_enable_mti = snapshot.enable_mti;
+    _compute.active_skip_sensing_fft = backend_sensing_processing_supported(_cfg)
+        ? false
+        : snapshot.skip_sensing_fft;
+    bool clear_micro_doppler = false;
+    _prepare_backend_processing_state(snapshot, clear_micro_doppler);
+    if (clear_micro_doppler) {
+        _compute.micro_doppler_state.clear();
+    }
+    _compute.applied_generation = snapshot.generation;
+
+    if (_compute.next_symbol_to_sample < snapshot.apply_symbol_index ||
+        _compute.active_stride != previous_stride) {
+        _compute.next_symbol_to_sample = snapshot.apply_symbol_index;
+    }
+
+    LOG_RT_INFO_M(Sensing) << "[Sensing CH " << _rx_io.logical_id
+                  << "] applied shared params at OFDM symbol "
+                  << snapshot.apply_symbol_index
+                  << " (stride=" << _compute.active_stride
+                  << ", MTI=" << (_compute.active_enable_mti ? 1 : 0)
+                  << ", SKIP=" << (_compute.active_skip_sensing_fft ? 1 : 0)
+                  << ", CFAR=" << (_compute.cfar_params.enabled ? 1 : 0)
+                  << ", OS%=" << _compute.cfar_params.os_rank_percent
+                  << ", OSS=" << _compute.cfar_params.os_suppress_doppler
+                  << "/" << _compute.cfar_params.os_suppress_range
+                  << ", MD=" << (_compute.micro_doppler_enabled ? 1 : 0)
+                  << ")";
+}
