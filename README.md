@@ -31,6 +31,12 @@ sudo apt install -y build-essential cmake pkg-config \
 
 Install AFF3CT 3.0.2 or newer separately and remember its installation prefix. No UHD package is required.
 
+## Algorithm simulation
+
+- Windows C++ PHY: [overview](cpp_phy/README.md), [formal frame](Windows_C++_PHY正式帧结构与使用说明.md), and [VLC video test](Windows_VLC视频信道仿真使用说明.md)
+- Python golden model: [model and validation guide](python_phy/README.md)
+- Design route: [Python MIMO to C++](Python_MIMO到C++实施路线.md) and [4x4/DM-RS validation](4x4_MIMO设计与第一阶段验证.md)
+
 ## Build
 
 ```bash
@@ -41,6 +47,18 @@ cmake --build build -j"$(nproc)"
 ```
 
 If AFF3CT is installed in a standard prefix, omit `-DAFF3CT_ROOT`. The primary outputs are `build/ChannelSimulator`, `build/BS`, and `build/UE`.
+
+## Repository layout
+
+| Path | Description |
+| :--- | :--- |
+| `src/`, `include/` | Core C++ PHY, sensing, threading, and runtime logic |
+| `config/` | Simulation presets for BS/UE roles |
+| `scripts/` | Python frontends, web config console, and Linux performance helpers |
+| `python_phy/` | Cross-platform Python PHY models, configurations, experiments, and tests |
+| `cpp_phy/` | UHD-independent C++17 PHY core, VS2019 scripts, benchmarks, video bridge, and live monitor |
+| `capture/` | Offline plotting helpers for saved sensing results |
+| `docs/` | Static project site and architecture/signal-processing pages |
 
 Python tools use:
 

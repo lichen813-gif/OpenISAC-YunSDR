@@ -1,5 +1,7 @@
 #pragma once
 
+#include "openisac/mimo_nxn.hpp"
+
 #include <complex>
 #include <cstddef>
 #include <cstdint>
@@ -32,10 +34,32 @@ PhaseSlopeEstimate estimate_sfo_phase_slope(
     std::size_t receive_antennas,
     std::size_t samples_per_symbol);
 
+// Fit the residual common phase and frequency-linear phase between a known
+// sparse reference grid and a previously estimated NxN channel.  This is used
+// to track the age of front-loaded DM-RS without repeating a full CSI solve.
+PhaseSlopeEstimate estimate_reference_residual_phase_slope_nxn(
+    const std::vector<std::complex<float>>& receive_grid,
+    const std::vector<std::complex<float>>& reference_grid,
+    const std::vector<std::uint16_t>& pilot_fft_indices,
+    const std::vector<ChannelNxN>& channels,
+    std::size_t symbol_index,
+    std::size_t fft_size,
+    std::size_t ports);
+
 void correct_second_symbol_phase_inplace(
     std::vector<std::complex<float>>& receive_grid,
     const PhaseSlopeEstimate& estimate,
     std::size_t fft_size,
     std::size_t receive_antennas);
+
+// Align one OFDM symbol to an earlier reference. symbol_intervals is the
+// number of OFDM-symbol spacings between the target and reference symbols.
+void correct_symbol_phase_inplace(
+    std::vector<std::complex<float>>& receive_grid,
+    const PhaseSlopeEstimate& one_symbol_estimate,
+    std::size_t fft_size,
+    std::size_t receive_antennas,
+    std::size_t symbol_index,
+    float symbol_intervals);
 
 }  // namespace openisac

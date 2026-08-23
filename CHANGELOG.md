@@ -8,6 +8,21 @@
 - Date: `2026-04-02 22:59:43 +08:00`
 - Subject: `Improve overflow/underflow recovery, add macOS support, benchmark scripts, and configurable data resource blocks`
 
+## 2026-08-23 - 跨平台算法模型、Windows C++ PHY与统一DM-RS
+
+### Summary
+
+新增不依赖SDR硬件的Python算法模型和Windows C++17 PHY，覆盖高阶QAM、SISO、STBC/SFBC、Rank-1/2/4空间复用、TDL/AWGN/CFO/SFO、同步、信道估计、MMSE、LDPC/CRC、通信感知及VLC视频字节闭环。保留原FDM帧作为兼容基线，并增加SISO/2×2/4×4统一的双符号前置DM-RS实验模式。
+
+### Changes
+
+- `python_phy/`增加可配置的OFDM/MIMO/信道/同步/FEC模型、显式实验脚本和单元测试，为后续C++移植提供黄金参考。
+- `cpp_phy/`增加VS2019构建、1024/128 OFDM、QPSK至256-QAM、2×2和通用NxN MMSE、Rank-4时域链、LDPC固定线程池、连续同步、感知处理、基准与Python实时绘图。
+- Windows视频桥把VLC MPEG-TS数据报经过PHY分片、空间相关TDL、同步、MIMO检测、LDPC/CRC和重组后送回VLC，支持Rank-1/2/4和手动信道参数。
+- `pilot-mode=fdm|nr-dmrs`保持旧3符号/225 us帧默认不变，并提供ZC、两个前置DM-RS、两个数据符号的5符号/375 us帧。Rank-4使用两个频域梳齿组和组内双符号时域OCC；Rank-1/2共享同一帧结构。
+- Rank-1/2/4 DM-RS视频闭环各30包逐字节恢复且FER为0；Rank-4固定种子100帧下FDM与DM-RS均100/100 CRC通过，详细EVM、BER、CSI和处理时间记录在正式帧与视频测试说明中。
+- 根目录新增Python到C++路线、正式帧结构、4×4设计、感知/libyunsdr路线及Windows VLC操作文档。
+
 ## 2026-07-13 - ARQ 协议窗口上限与安全默认值分离
 
 ### Summary

@@ -26,4 +26,3 @@ Detection2x2 detect_2x2(
     LinearDetector detector);
 
 }  // namespace openisac
-

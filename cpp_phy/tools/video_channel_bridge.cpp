@@ -3,6 +3,8 @@
 #include "openisac/dynamic_link_pipeline.hpp"
 #include "openisac/frame.hpp"
 #include "openisac/ldpc.hpp"
+#include "openisac/rank4_time_link.hpp"
+#include "openisac/rank4_time_pipeline.hpp"
 #include "openisac/sensing.hpp"
 
 #ifdef _WIN32
@@ -95,12 +97,14 @@ struct Options {
     std::size_t maximum_datagram_bytes = maximum_udp_payload;
     unsigned transmit_rank = 2u;
     openisac::Modulation modulation = openisac::Modulation::qam64;
+    openisac::PilotMode pilot_mode = openisac::PilotMode::fdm;
     std::size_t fft_size = 1024u;
     std::size_t cp_length = 128u;
     float subcarrier_spacing_hz = 15000.0f;
     float center_frequency_hz = 5.8e9f;
     float transmit_spatial_correlation = 0.2f;
     float receive_spatial_correlation = 0.2f;
+    float rank4_mmse_regularization_scale = 0.5f;
     std::uint32_t spatial_channel_seed = 0xC057u;
     std::string telemetry_directory;
     float telemetry_interval_seconds = 2.0f;
@@ -159,6 +163,17 @@ openisac::Modulation parse_modulation(const std::string& text) {
     throw std::invalid_argument("modulation must be QPSK, 16QAM, 64QAM or 256QAM");
 }
 
+openisac::PilotMode parse_pilot_mode(const std::string& text) {
+    if (text == "fdm" || text == "FDM") {
+        return openisac::PilotMode::fdm;
+    }
+    if (text == "nr-dmrs" || text == "NR-DMRS" ||
+        text == "dmrs" || text == "DMRS") {
+        return openisac::PilotMode::nr_dmrs;
+    }
+    throw std::invalid_argument("pilot mode must be fdm or nr-dmrs");
+}
+
 std::vector<openisac::TdlTap> parse_tdl(const std::string& text) {
     std::vector<openisac::TdlTap> taps;
     std::stringstream paths(text);
@@ -208,14 +223,16 @@ void print_usage() {
         << "  --sfo PPM               sample-rate offset (20)\n"
         << "  --timing SAMPLES        frame timing offset (20)\n"
         << "  --tdl SPEC              delay:power_db:phase_deg[:doppler_hz]+...\n"
-        << "  --rank N                spatial rank: 1 or 2 (2)\n"
+        << "  --rank N                spatial rank: 1, 2 or 4 (2)\n"
         << "  --modulation NAME       QPSK, 16QAM, 64QAM or 256QAM (64QAM)\n"
+        << "  --pilot-mode NAME       fdm or nr-dmrs (fdm)\n"
         << "  --fft N                 formal FFT size; currently 1024\n"
         << "  --cp N                  formal CP length; currently 128\n"
         << "  --subcarrier-spacing HZ formal spacing; currently 15000\n"
         << "  --center-frequency HZ   sensing display center frequency (5.8e9)\n"
         << "  --tx-correlation RHO    transmit spatial correlation, |rho|<1 (0.2)\n"
         << "  --rx-correlation RHO    receive spatial correlation, |rho|<1 (0.2)\n"
+        << "  --mmse-scale VALUE      Rank-4 MMSE loading scale (0.5)\n"
         << "  --spatial-seed N        repeatable MIMO spatial channel seed\n"
         << "  --workers N             LDPC worker threads (8)\n"
         << "  --queue-packets N       UDP ingress queue capacity (8192)\n"
@@ -264,6 +281,8 @@ Options parse_options(int argc, char** argv) {
             result.transmit_rank = parse_unsigned(value("--rank"), "rank");
         } else if (option == "--modulation") {
             result.modulation = parse_modulation(value("--modulation"));
+        } else if (option == "--pilot-mode") {
+            result.pilot_mode = parse_pilot_mode(value("--pilot-mode"));
         } else if (option == "--fft") {
             result.fft_size = parse_size(value("--fft"), "FFT size");
         } else if (option == "--cp") {
@@ -280,6 +299,9 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--rx-correlation") {
             result.receive_spatial_correlation =
                 parse_float(value("--rx-correlation"), "Rx correlation");
+        } else if (option == "--mmse-scale") {
+            result.rank4_mmse_regularization_scale =
+                parse_float(value("--mmse-scale"), "MMSE scale");
         } else if (option == "--spatial-seed") {
             result.spatial_channel_seed =
                 parse_unsigned(value("--spatial-seed"), "spatial seed");
@@ -323,10 +345,14 @@ Options parse_options(int argc, char** argv) {
         result.ldpc_workers == 0u || result.ldpc_workers > 19u ||
         result.ingress_queue_packets == 0u || result.ingress_queue_packets > 65536u ||
         result.timing_offset > 128u || result.self_test_packets == 0u ||
-        (result.transmit_rank != 1u && result.transmit_rank != 2u) ||
+        (result.transmit_rank != 1u && result.transmit_rank != 2u &&
+         result.transmit_rank != 4u) ||
         result.center_frequency_hz <= 0.0f ||
         std::abs(result.transmit_spatial_correlation) >= 1.0f ||
         std::abs(result.receive_spatial_correlation) >= 1.0f ||
+        !std::isfinite(result.rank4_mmse_regularization_scale) ||
+        result.rank4_mmse_regularization_scale <= 0.0f ||
+        result.rank4_mmse_regularization_scale > 16.0f ||
         result.telemetry_interval_seconds < 0.2f ||
         result.telemetry_waveform_points == 0u ||
         result.sensing_coherent_frames > 512u ||
@@ -383,18 +409,32 @@ struct BridgeCounters {
 openisac::DynamicSensingConfig make_sensing_config(const Options& options) {
     openisac::DynamicSensingConfig config;
     config.fft_size = options.fft_size;
+    config.transmit_ports = options.transmit_rank == 4u ? 4u : 2u;
+    config.receive_ports = options.transmit_rank == 4u ? 4u : 2u;
     config.coherent_frames = options.sensing_coherent_frames;
     config.range_fft_size = options.fft_size;
     config.doppler_fft_size = options.sensing_coherent_frames;
     config.subcarrier_spacing_hz = options.subcarrier_spacing_hz;
     config.center_frequency_hz = options.center_frequency_hz;
-    config.frame_period_seconds = 225.0e-6f;
+    config.frame_period_seconds = static_cast<float>(
+        openisac::formal_frame_period_seconds(options.pilot_mode));
     config.maximum_range_bin = options.sensing_export_range_bins;
     config.enable_static_clutter_suppression = true;
     config.doppler_dc_exclusion_bins = 1u;
     config.enable_cfar_detection = true;
     config.cfar_false_alarm_probability = 1.0e-7f;
     return config;
+}
+
+double frame_period_seconds(const Options& options) {
+    return openisac::formal_frame_period_seconds(options.pilot_mode);
+}
+
+std::uint64_t frame_timestamp_ns(
+    std::uint64_t frame_id,
+    const Options& options) {
+    return static_cast<std::uint64_t>(std::llround(
+        static_cast<double>(frame_id) * frame_period_seconds(options) * 1.0e9));
 }
 
 float condition_number_2x2(const openisac::Channel2x2& channel) {
@@ -418,11 +458,18 @@ class VideoPhyChannel {
 public:
     VideoPhyChannel(const Options& options, const openisac::Ldpc5041008& codec)
         : options_(options), codec_(codec),
-          mode_{options.transmit_rank, options.modulation},
-          pipeline_(codec, options.ldpc_workers) {
+          mode_{options.transmit_rank, options.modulation} {
         openisac::FormalFrameProfile profile;
         profile.transmit_rank = mode_.rank;
         profile.bits_per_symbol = openisac::modulation_bits(mode_.modulation);
+        if (mode_.rank == 4u) {
+            profile.pilot_spacing = 2u;
+            rank4_pipeline_ = std::make_unique<openisac::Rank4TimePipeline>(
+                codec_, options_.ldpc_workers);
+        } else {
+            dynamic_pipeline_ = std::make_unique<openisac::DynamicLinkPipeline>(
+                codec_, options_.ldpc_workers);
+        }
         const auto layout = openisac::build_formal_frame_layout(profile);
         phy_payload_capacity_ = layout.user_payload_bytes;
         data_fft_indices_ = layout.data_fft_indices;
@@ -455,12 +502,48 @@ public:
             return std::nullopt;
         }
 
+        struct CompletedPhyFrame {
+            bool crc_ok = false;
+            std::vector<std::uint8_t> payload;
+            double latency_us = 0.0;
+        };
+        auto receive_frame = [&]() {
+            CompletedPhyFrame completed;
+            if (mode_.rank == 4u) {
+                auto result = rank4_pipeline_->receive();
+                if (!result.link.sensing_channel_frequency_response.empty()) {
+                    try {
+                        process_rank4_telemetry(result);
+                    } catch (const std::exception& error) {
+                        std::cerr << "WARNING: Rank-4 live telemetry snapshot failed: "
+                                  << error.what() << '\n';
+                        if (sensing_ != nullptr) {
+                            sensing_->reset();
+                        }
+                        rank4_sensing_batch_in_flight_ = false;
+                        last_telemetry_ = std::chrono::steady_clock::now();
+                    }
+                }
+                completed.crc_ok = result.link.crc_ok;
+                completed.payload = std::move(result.link.user_payload);
+                completed.latency_us = result.timing.latency_us;
+            } else {
+                auto result = dynamic_pipeline_->receive();
+                completed.crc_ok = result.link.crc_ok;
+                completed.payload = std::move(result.link.user_payload);
+                completed.latency_us = result.timing.latency_us;
+            }
+            return completed;
+        };
+        const std::size_t pipeline_slots = mode_.rank == 4u
+            ? rank4_pipeline_->slot_count()
+            : dynamic_pipeline_->slot_count();
         std::size_t in_flight = 0u;
-        std::vector<openisac::DynamicLinkPipelineResult> results;
+        std::vector<CompletedPhyFrame> results;
         results.reserve(fragment_count);
         for (std::size_t fragment = 0u; fragment < fragment_count; ++fragment) {
-            if (in_flight >= pipeline_.slot_count()) {
-                results.push_back(pipeline_.receive());
+            if (in_flight >= pipeline_slots) {
+                results.push_back(receive_frame());
                 --in_flight;
             }
             const std::size_t offset = fragment * fragment_payload_capacity_;
@@ -481,71 +564,121 @@ public:
                 datagram.begin() + static_cast<std::ptrdiff_t>(offset + count),
                 phy_payload.begin() + static_cast<std::ptrdiff_t>(fragment_header_bytes));
 
-            openisac::DynamicLinkSimulationConfig config;
-            config.snr_db = options_.snr_db;
-            config.timing_offset_samples = options_.timing_offset;
-            config.cfo_hz = options_.cfo_hz;
-            config.sfo_ppm = options_.sfo_ppm;
-            config.random_seed = options_.random_seed +
-                static_cast<unsigned>(frame_id_ * 2654435761u);
-            config.pilot_seed = 0xC057u;
-            config.enable_correlated_spatial_tdl = true;
-            config.transmit_spatial_correlation =
-                options_.transmit_spatial_correlation;
-            config.receive_spatial_correlation =
-                options_.receive_spatial_correlation;
-            config.spatial_channel_seed = options_.spatial_channel_seed;
             const bool time_varying_channel = std::any_of(
                 options_.taps.begin(), options_.taps.end(),
                 [](const openisac::TdlTap& tap) {
                     return std::abs(tap.doppler_hz) > 1.0e-6f;
                 });
-            // A moving path invalidates stale CSI; current-frame CSI is both
-            // cheaper and more robust than temporal smoothing in this case.
-            config.csi_smoothing_alpha = time_varying_channel ? 1.0f : 0.35f;
-            config.channel_time_seconds =
-                static_cast<double>(frame_id_) * 225.0e-6;
-            const bool telemetry_requested = telemetry_due();
-            const bool sensing_batch_active = sensing_ != nullptr &&
-                sensing_->frames_accumulated() > 0u;
-            const bool telemetry_capture =
-                telemetry_requested || sensing_batch_active;
-            if (telemetry_requested && sensing_ != nullptr &&
-                !sensing_batch_active) {
-                sensing_->reset();
-                telemetry_receiver_state_.reset();
-            }
-            const bool final_sensing_frame = sensing_ != nullptr &&
-                telemetry_capture &&
-                sensing_->frames_accumulated() + 1u >=
-                    options_.sensing_coherent_frames;
-            config.enable_truth_diagnostics =
-                telemetry_capture && (sensing_ == nullptr || final_sensing_frame);
-            config.taps = options_.taps;
-
-            openisac::DynamicLinkIqFrame iq;
-            openisac::generate_dynamic_tdl_iq_frame(
-                phy_payload, mode_, static_cast<std::uint16_t>(frame_id_), codec_,
-                config, iq, generation_workspace_);
-            if (telemetry_capture) {
-                try {
-                    process_telemetry(iq);
-                } catch (const std::exception& error) {
-                    std::cerr << "WARNING: live telemetry snapshot failed: "
-                              << error.what() << '\n';
-                    if (sensing_ != nullptr) {
-                        sensing_->reset();
-                    }
-                    last_telemetry_ = std::chrono::steady_clock::now();
+            if (mode_.rank == 4u) {
+                openisac::Rank4TimeSimulationConfig config;
+                config.pilot_mode = options_.pilot_mode;
+                config.modulation = mode_.modulation;
+                config.snr_db = options_.snr_db;
+                config.timing_offset_samples = options_.timing_offset;
+                config.cfo_hz = options_.cfo_hz;
+                config.sfo_ppm = options_.sfo_ppm;
+                config.transmit_correlation =
+                    options_.transmit_spatial_correlation;
+                config.receive_correlation =
+                    options_.receive_spatial_correlation;
+                config.csi_smoothing_alpha =
+                    time_varying_channel ? 1.0f : 0.35f;
+                config.mmse_regularization_scale =
+                    options_.rank4_mmse_regularization_scale;
+                config.channel_time_seconds =
+                    static_cast<double>(frame_id_) * frame_period_seconds(options_);
+                config.channel_seed = options_.spatial_channel_seed;
+                config.random_seed = options_.random_seed +
+                    static_cast<unsigned>(frame_id_ * 2654435761u);
+                config.pilot_seed = 0xC057u;
+                config.taps = options_.taps;
+                const bool telemetry_requested = telemetry_due();
+                if (telemetry_requested && sensing_ != nullptr &&
+                    !rank4_sensing_batch_in_flight_) {
+                    sensing_->reset();
+                    rank4_sensing_batch_in_flight_ = true;
+                    rank4_sensing_capture_remaining_ =
+                        options_.sensing_coherent_frames;
+                    std::cout << "Rank-4 sensing capture started: "
+                              << rank4_sensing_capture_remaining_
+                              << " coherent frames\n";
                 }
+                const bool telemetry_capture = sensing_ != nullptr
+                    ? rank4_sensing_capture_remaining_ > 0u
+                    : telemetry_requested;
+                if (telemetry_capture && sensing_ != nullptr) {
+                    --rank4_sensing_capture_remaining_;
+                }
+                config.enable_sensing_snapshot = telemetry_capture;
+                config.diagnostic_waveform_points =
+                    options_.telemetry_waveform_points;
+                rank4_pipeline_->submit_payload(
+                    frame_id_, phy_payload,
+                    static_cast<std::uint16_t>(frame_id_), config);
+            } else {
+                openisac::DynamicLinkSimulationConfig config;
+                config.pilot_mode = options_.pilot_mode;
+                config.snr_db = options_.snr_db;
+                config.timing_offset_samples = options_.timing_offset;
+                config.cfo_hz = options_.cfo_hz;
+                config.sfo_ppm = options_.sfo_ppm;
+                config.random_seed = options_.random_seed +
+                    static_cast<unsigned>(frame_id_ * 2654435761u);
+                config.pilot_seed = 0xC057u;
+                config.enable_correlated_spatial_tdl = true;
+                config.transmit_spatial_correlation =
+                    options_.transmit_spatial_correlation;
+                config.receive_spatial_correlation =
+                    options_.receive_spatial_correlation;
+                config.spatial_channel_seed = options_.spatial_channel_seed;
+                // A moving path invalidates stale CSI; current-frame CSI is
+                // both cheaper and more robust than temporal smoothing.
+                config.csi_smoothing_alpha =
+                    time_varying_channel ? 1.0f : 0.35f;
+                config.channel_time_seconds =
+                    static_cast<double>(frame_id_) * frame_period_seconds(options_);
+                const bool telemetry_requested = telemetry_due();
+                const bool sensing_batch_active = sensing_ != nullptr &&
+                    sensing_->frames_accumulated() > 0u;
+                const bool telemetry_capture =
+                    telemetry_requested || sensing_batch_active;
+                if (telemetry_requested && sensing_ != nullptr &&
+                    !sensing_batch_active) {
+                    sensing_->reset();
+                    telemetry_receiver_state_.reset();
+                }
+                const bool final_sensing_frame = sensing_ != nullptr &&
+                    telemetry_capture &&
+                    sensing_->frames_accumulated() + 1u >=
+                        options_.sensing_coherent_frames;
+                config.enable_truth_diagnostics = telemetry_capture &&
+                    (sensing_ == nullptr || final_sensing_frame);
+                config.taps = options_.taps;
+
+                openisac::DynamicLinkIqFrame iq;
+                openisac::generate_dynamic_tdl_iq_frame(
+                    phy_payload, mode_, static_cast<std::uint16_t>(frame_id_),
+                    codec_, config, iq, generation_workspace_);
+                if (telemetry_capture) {
+                    try {
+                        process_telemetry(iq);
+                    } catch (const std::exception& error) {
+                        std::cerr << "WARNING: live telemetry snapshot failed: "
+                                  << error.what() << '\n';
+                        if (sensing_ != nullptr) {
+                            sensing_->reset();
+                        }
+                        last_telemetry_ = std::chrono::steady_clock::now();
+                    }
+                }
+                dynamic_pipeline_->submit_iq(frame_id_, iq);
             }
-            pipeline_.submit_iq(frame_id_, iq);
             ++frame_id_;
             ++in_flight;
             ++counters_.phy_frames;
         }
         while (in_flight > 0u) {
-            results.push_back(pipeline_.receive());
+            results.push_back(receive_frame());
             --in_flight;
         }
 
@@ -553,13 +686,13 @@ public:
         std::vector<bool> received(fragment_count, false);
         bool valid = true;
         for (const auto& result : results) {
-            counters_.phy_latency_us += result.timing.latency_us;
-            if (!result.link.crc_ok) {
+            counters_.phy_latency_us += result.latency_us;
+            if (!result.crc_ok) {
                 ++counters_.phy_crc_failures;
                 valid = false;
                 continue;
             }
-            const auto& payload = result.link.user_payload;
+            const auto& payload = result.payload;
             if (payload.size() < fragment_header_bytes ||
                 get_u32(payload, 0u) != fragment_magic ||
                 payload[4u] != fragment_version ||
@@ -623,6 +756,291 @@ private:
                  options_.telemetry_interval_seconds);
     }
 
+    void process_rank4_telemetry(
+        const openisac::Rank4TimePipelineResult& pipeline_result) {
+        const openisac::DynamicSensingResult* sensing_result = nullptr;
+        if (sensing_ != nullptr) {
+            const bool ready = sensing_->push_channel_frame(
+                pipeline_result.frame_id,
+                frame_timestamp_ns(pipeline_result.frame_id, options_),
+                pipeline_result.link.sensing_channel_frequency_response,
+                pipeline_result.link.sensing_active_subcarrier_mask);
+            if (!ready) {
+                return;
+            }
+            std::cout << "Rank-4 sensing capture complete: frame "
+                      << pipeline_result.frame_id << '\n';
+            rank4_sensing_batch_in_flight_ = false;
+            sensing_result = &sensing_->last_result();
+        }
+        write_rank4_telemetry(
+            pipeline_result.frame_id, pipeline_result.link, sensing_result);
+    }
+
+    void write_rank4_telemetry(
+        std::uint64_t capture_frame_id,
+        const openisac::Rank4TimeSimulationResult& diagnostic,
+        const openisac::DynamicSensingResult* sensing_result) {
+        const std::filesystem::path directory(options_.telemetry_directory);
+        std::filesystem::create_directories(directory);
+
+        std::ofstream waveform(directory / "waveform.csv");
+        waveform << "sample,tx0_i,tx0_q,rx0_i,rx0_q\n"
+                 << std::setprecision(9);
+        for (std::size_t sample = 0u;
+             sample < diagnostic.receive_waveform_rx0.size(); ++sample) {
+            const auto value = diagnostic.receive_waveform_rx0[sample];
+            waveform << sample << ",0,0," << value.real() << ','
+                     << value.imag() << '\n';
+        }
+
+        std::ofstream constellation(directory / "constellation.csv");
+        constellation << "index,layer,ideal_i,ideal_q,equalized_i,equalized_q\n"
+                      << std::setprecision(9);
+        const std::size_t information_bytes = diagnostic.payload_bytes + 2u;
+        const std::size_t payload_blocks = (information_bytes + 62u) / 63u;
+        const std::size_t coded_symbols = payload_blocks * 1008u /
+            openisac::modulation_bits(mode_.modulation);
+        const std::size_t available_symbols = std::min(
+            diagnostic.transmitted_symbols.size(),
+            diagnostic.equalized_symbols.size());
+        const std::size_t symbols = std::min(available_symbols, coded_symbols);
+        const std::size_t padding_symbols = available_symbols - symbols;
+        for (std::size_t index = 0u; index < symbols; ++index) {
+            const auto ideal = diagnostic.transmitted_symbols[index];
+            const auto equalized = diagnostic.equalized_symbols[index];
+            constellation << index << ',' << index % 4u << ','
+                          << ideal.real() << ',' << ideal.imag() << ','
+                          << equalized.real() << ',' << equalized.imag() << '\n';
+        }
+
+        std::ofstream channel(directory / "channel.csv");
+        channel << "fft";
+        for (std::size_t rx = 0u; rx < 4u; ++rx) {
+            for (std::size_t tx = 0u; tx < 4u; ++tx) {
+                channel << ",h" << rx << tx << "_i,h" << rx << tx << "_q";
+            }
+        }
+        channel << '\n' << std::setprecision(9);
+        for (std::size_t fft = 0u; fft < options_.fft_size; ++fft) {
+            channel << fft;
+            for (std::size_t link = 0u; link < 16u; ++link) {
+                const auto value = diagnostic.sensing_channel_frequency_response[
+                    link * options_.fft_size + fft];
+                channel << ',' << value.real() << ',' << value.imag();
+            }
+            channel << '\n';
+        }
+        waveform.close();
+        constellation.close();
+        channel.close();
+        if (!waveform || !constellation || !channel) {
+            throw std::runtime_error(
+                "cannot write Rank-4 telemetry waveform/channel data");
+        }
+
+        std::size_t reported_sensing_detections = 0u;
+        constexpr float sensing_display_floor_db = -30.0f;
+        if (sensing_result != nullptr) {
+            const auto& sensing_config = sensing_->config();
+            const std::size_t range_bins = std::min(
+                options_.sensing_export_range_bins,
+                sensing_config.range_fft_size / 2u);
+            float maximum_power = 0.0f;
+            for (std::size_t doppler = 0u;
+                 doppler < sensing_config.doppler_fft_size; ++doppler) {
+                for (std::size_t range = 0u; range < range_bins; ++range) {
+                    maximum_power = std::max(
+                        maximum_power,
+                        std::norm(sensing_result->range_doppler_map[
+                            doppler * sensing_config.range_fft_size + range]));
+                }
+            }
+            std::ofstream range_doppler(directory / "sensing_range_doppler.csv");
+            range_doppler
+                << "doppler_bin,range_bin,range_m,velocity_mps,relative_power_db\n"
+                << std::setprecision(9);
+            const std::size_t dc = sensing_config.doppler_fft_size / 2u;
+            for (std::size_t doppler = 0u;
+                 doppler < sensing_config.doppler_fft_size; ++doppler) {
+                const int centered = static_cast<int>(doppler) -
+                    static_cast<int>(dc);
+                for (std::size_t range = 0u; range < range_bins; ++range) {
+                    const float power = std::norm(
+                        sensing_result->range_doppler_map[
+                            doppler * sensing_config.range_fft_size + range]);
+                    const float relative_db = 10.0f * std::log10(
+                        std::max(power, 1.0e-30f) /
+                        std::max(maximum_power, 1.0e-30f));
+                    range_doppler << doppler << ',' << range << ','
+                                  << range * sensing_result->range_bin_spacing_m
+                                  << ','
+                                  << centered *
+                                      sensing_result->velocity_bin_spacing_mps
+                                  << ',' << relative_db << '\n';
+                }
+            }
+            std::ofstream detections(directory / "sensing_detections.csv");
+            detections
+                << "range_bin,doppler_bin,range_m,doppler_hz,velocity_mps,"
+                   "relative_power_db,power_over_threshold_db\n"
+                << std::setprecision(9);
+            for (const auto& detection : sensing_result->detections) {
+                const float relative_db = 10.0f * std::log10(
+                    std::max(detection.peak.power, 1.0e-30f) /
+                    std::max(maximum_power, 1.0e-30f));
+                if (relative_db < sensing_display_floor_db) {
+                    continue;
+                }
+                detections << detection.peak.range_bin << ','
+                           << detection.peak.doppler_bin << ','
+                           << detection.peak.range_m << ','
+                           << detection.peak.doppler_hz << ','
+                           << detection.peak.velocity_mps << ','
+                           << relative_db << ','
+                           << detection.power_over_threshold_db << '\n';
+                ++reported_sensing_detections;
+            }
+            range_doppler.close();
+            detections.close();
+            if (!range_doppler || !detections) {
+                throw std::runtime_error(
+                    "cannot write Rank-4 sensing telemetry data");
+            }
+        }
+
+        std::vector<float> condition_numbers;
+        condition_numbers.reserve(options_.fft_size);
+        if (diagnostic.sensing_active_subcarrier_mask.size() ==
+                options_.fft_size &&
+            diagnostic.sensing_channel_frequency_response.size() ==
+                16u * options_.fft_size) {
+            for (std::size_t fft = 0u; fft < options_.fft_size; ++fft) {
+                if (diagnostic.sensing_active_subcarrier_mask[fft] == 0u) {
+                    continue;
+                }
+                openisac::ChannelNxN channel;
+                channel.streams = 4u;
+                for (std::size_t rx = 0u; rx < 4u; ++rx) {
+                    for (std::size_t tx = 0u; tx < 4u; ++tx) {
+                        const std::size_t link = rx * 4u + tx;
+                        channel.values[
+                            rx * openisac::maximum_spatial_streams + tx] =
+                            diagnostic.sensing_channel_frequency_response[
+                                link * options_.fft_size + fft];
+                    }
+                }
+                condition_numbers.push_back(
+                    openisac::condition_number_nxn(channel));
+            }
+        }
+        std::sort(condition_numbers.begin(), condition_numbers.end());
+        const float condition_median = condition_numbers.empty()
+            ? 0.0f : condition_numbers[condition_numbers.size() / 2u];
+        const float condition_p90 = condition_numbers.empty()
+            ? 0.0f : condition_numbers[std::min(
+                condition_numbers.size() - 1u,
+                condition_numbers.size() * 9u / 10u)];
+        const std::size_t ill_conditioned_subcarriers =
+            static_cast<std::size_t>(std::count_if(
+                condition_numbers.begin(), condition_numbers.end(),
+                [](float value) { return value > 10.0f; }));
+        const double ill_conditioned_percent = condition_numbers.empty()
+            ? 0.0 : 100.0 * static_cast<double>(ill_conditioned_subcarriers) /
+                static_cast<double>(condition_numbers.size());
+
+        const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const double fer_percent = counters_.phy_frames > 0u
+            ? 100.0 * static_cast<double>(counters_.phy_crc_failures) /
+                  static_cast<double>(counters_.phy_frames)
+            : 0.0;
+        std::ofstream status(directory / "status.csv");
+        status << "metric,value\n" << std::setprecision(12)
+               << "snapshot_epoch_ms," << epoch_ms << '\n'
+               << "frame_id," << capture_frame_id << '\n'
+               << "rank,4\n"
+               << "modulation," << openisac::modulation_name(mode_.modulation) << '\n'
+               << "pilot_mode," << openisac::pilot_mode_name(options_.pilot_mode) << '\n'
+               << "frame_symbols," << openisac::formal_frame_symbols(options_.pilot_mode) << '\n'
+               << "frame_period_us,"
+               << frame_period_seconds(options_) * 1.0e6 << '\n'
+               << "fft_size," << options_.fft_size << '\n'
+               << "cp_length," << options_.cp_length << '\n'
+               << "subcarrier_spacing_hz," << options_.subcarrier_spacing_hz << '\n'
+               << "sample_rate_hz,"
+               << options_.fft_size * options_.subcarrier_spacing_hz << '\n'
+               << "center_frequency_hz," << options_.center_frequency_hz << '\n'
+               << "tx_spatial_correlation,"
+               << options_.transmit_spatial_correlation << '\n'
+               << "rx_spatial_correlation,"
+               << options_.receive_spatial_correlation << '\n'
+               << "spatial_channel_seed," << options_.spatial_channel_seed << '\n'
+               << "channel_condition_median," << condition_median << '\n'
+               << "channel_condition_p90," << condition_p90 << '\n'
+               << "ill_conditioned_subcarriers,"
+               << ill_conditioned_subcarriers << '\n'
+               << "ill_conditioned_subcarrier_percent,"
+               << ill_conditioned_percent << '\n'
+               << "sensing_link_count,16\n"
+               << "snr_db," << options_.snr_db << '\n'
+               << "constellation_valid_symbols," << symbols << '\n'
+               << "constellation_padding_symbols_excluded,"
+               << padding_symbols << '\n'
+               << "evm_percent," << diagnostic.evm_percent << '\n'
+               << "channel_nmse_db," << diagnostic.channel_nmse_db << '\n'
+               << "cfo_true_hz," << options_.cfo_hz << '\n'
+               << "cfo_estimated_hz," << diagnostic.estimated_cfo_hz << '\n'
+               << "cfo_error_hz," << diagnostic.cfo_error_hz << '\n'
+               << "sfo_true_ppm," << options_.sfo_ppm << '\n'
+               << "sfo_residual_ppm," << diagnostic.residual_sfo_ppm << '\n'
+               << "timing_true_samples," << options_.timing_offset << '\n'
+               << "timing_estimated_samples," << diagnostic.timing_offset << '\n'
+               << "timing_metric," << diagnostic.timing_metric << '\n'
+               << "noise_variance," << diagnostic.noise_variance << '\n'
+               << "mmse_regularization_scale,"
+               << options_.rank4_mmse_regularization_scale << '\n'
+               << "ingress_socket_packets," << counters_.ingress_socket_packets << '\n'
+               << "ingress_queue_drops," << counters_.ingress_queue_drops << '\n'
+               << "ingress_queue_depth," << counters_.ingress_queue_depth << '\n'
+               << "ingress_queue_high_watermark,"
+               << counters_.ingress_queue_high_watermark << '\n'
+               << "udp_packets_in," << counters_.udp_packets_in << '\n'
+               << "udp_packets_out," << counters_.udp_packets_out << '\n'
+               << "udp_dropped," << counters_.dropped_packets << '\n'
+               << "phy_frames," << counters_.phy_frames << '\n'
+               << "fer_percent," << fer_percent << '\n';
+        if (sensing_result != nullptr) {
+            status << "sensing_ready,1\n"
+                   << "sensing_coherent_frames," << sensing_result->coherent_frames << '\n'
+                   << "sensing_range_spacing_m,"
+                   << sensing_result->range_bin_spacing_m << '\n'
+                   << "sensing_doppler_spacing_hz,"
+                   << sensing_result->doppler_bin_spacing_hz << '\n'
+                   << "sensing_velocity_spacing_mps,"
+                   << sensing_result->velocity_bin_spacing_mps << '\n'
+                   << "sensing_peak_range_m,"
+                   << sensing_result->strongest_peak.range_m << '\n'
+                   << "sensing_peak_doppler_hz,"
+                   << sensing_result->strongest_peak.doppler_hz << '\n'
+                   << "sensing_peak_velocity_mps,"
+                   << sensing_result->strongest_peak.velocity_mps << '\n'
+                   << "sensing_detection_count,"
+                   << reported_sensing_detections << '\n'
+                   << "sensing_raw_cfar_detection_count,"
+                   << sensing_result->detections.size() << '\n'
+                   << "sensing_display_floor_db," << sensing_display_floor_db << '\n'
+                   << "sensing_cfar_cells," << sensing_result->cfar_cells_tested << '\n';
+        } else {
+            status << "sensing_ready,0\n";
+        }
+        status.close();
+        if (!status) {
+            throw std::runtime_error("cannot write Rank-4 telemetry status data");
+        }
+        last_telemetry_ = std::chrono::steady_clock::now();
+    }
+
     void process_telemetry(const openisac::DynamicLinkIqFrame& iq) {
         openisac::PreparedDynamicLinkFrame prepared;
         openisac::prepare_dynamic_iq_frame(
@@ -630,7 +1048,7 @@ private:
         const openisac::DynamicSensingResult* sensing_result = nullptr;
         if (sensing_ != nullptr) {
             const bool ready = sensing_->push_frame(
-                frame_id_, frame_id_ * 225000u,
+                frame_id_, frame_timestamp_ns(frame_id_, options_),
                 iq.transmit_reference_grid, telemetry_workspace_.rx_grid);
             if (!ready) {
                 return;
@@ -817,6 +1235,10 @@ private:
                << "frame_id," << frame_id_ << '\n'
                << "rank," << mode_.rank << '\n'
                << "modulation," << openisac::modulation_name(mode_.modulation) << '\n'
+               << "pilot_mode," << openisac::pilot_mode_name(options_.pilot_mode) << '\n'
+               << "frame_symbols," << openisac::formal_frame_symbols(options_.pilot_mode) << '\n'
+               << "frame_period_us,"
+               << frame_period_seconds(options_) * 1.0e6 << '\n'
                << "fft_size," << options_.fft_size << '\n'
                << "cp_length," << options_.cp_length << '\n'
                << "subcarrier_spacing_hz," << options_.subcarrier_spacing_hz << '\n'
@@ -899,11 +1321,14 @@ private:
     openisac::DynamicLinkWorkspace telemetry_workspace_;
     openisac::DynamicLinkReceiverState telemetry_receiver_state_;
     std::unique_ptr<openisac::DynamicSensingProcessor> sensing_;
-    openisac::DynamicLinkPipeline pipeline_;
+    std::unique_ptr<openisac::DynamicLinkPipeline> dynamic_pipeline_;
+    std::unique_ptr<openisac::Rank4TimePipeline> rank4_pipeline_;
     std::size_t phy_payload_capacity_ = 0u;
     std::size_t fragment_payload_capacity_ = 0u;
     std::vector<std::uint16_t> data_fft_indices_;
     std::uint64_t frame_id_ = 0u;
+    std::size_t rank4_sensing_capture_remaining_ = 0u;
+    bool rank4_sensing_batch_in_flight_ = false;
     BridgeCounters counters_;
     std::chrono::steady_clock::time_point last_telemetry_{};
 };
@@ -999,8 +1424,13 @@ int run_live(const Options& options, VideoPhyChannel& channel) {
     std::cout << "Listening for VLC MPEG-TS/UDP on " << options.listen_address << ':'
               << options.listen_port << "; forwarding decoded packets to "
               << options.output_address << ':' << options.output_port << "\n"
-              << "PHY: 2x2 Rank-" << options.transmit_rank << '/'
-              << openisac::modulation_name(options.modulation) << ", FFT/CP "
+              << "PHY: " << (options.transmit_rank == 4u ? "4x4" : "2x2")
+              << " Rank-" << options.transmit_rank << '/'
+              << openisac::modulation_name(options.modulation) << ", pilots "
+              << openisac::pilot_mode_name(options.pilot_mode)
+              << ", frame "
+              << openisac::formal_frame_symbols(options.pilot_mode)
+              << " symbols, FFT/CP "
               << options.fft_size << '/' << options.cp_length << ", payload "
               << channel.phy_payload_capacity() << " bytes, fragment data "
               << channel.fragment_payload_capacity() << " bytes, SNR "

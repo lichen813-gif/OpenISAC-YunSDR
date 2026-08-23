@@ -8,9 +8,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(OPENISAC_ENABLE_AVX2 "Enable AVX2 for optimized targets" OFF)
 set(
     OPENISAC_GOLDEN_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/../measurement/cpp_frame_vectors"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors"
     CACHE PATH
-    "Directory containing Python-generated formal-frame golden vectors"
+    "Directory containing the committed Python-generated formal-frame vectors"
 )
 
 add_library(openisac_phy STATIC
@@ -28,8 +28,12 @@ add_library(openisac_phy STATIC
     src/link_adaptation.cpp
     src/mimo2x2.cpp
     src/mimo_nxn.cpp
+    src/mimo_nxn_link.cpp
     src/ofdm.cpp
     src/preamble_sync.cpp
+    src/rank4_formal_link.cpp
+    src/rank4_time_link.cpp
+    src/rank4_time_pipeline.cpp
     src/sampling_offset.cpp
     src/sensing.cpp
     src/tdl_channel.cpp
@@ -126,6 +130,20 @@ if(MSVC)
 endif()
 
 add_executable(
+    openisac_phy_4x4_time_pipeline_benchmark
+    benchmarks/bench_rank4_time_pipeline.cpp)
+target_link_libraries(
+    openisac_phy_4x4_time_pipeline_benchmark PRIVATE openisac_phy)
+target_compile_definitions(
+    openisac_phy_4x4_time_pipeline_benchmark PRIVATE
+    OPENISAC_MATRIX_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+if(MSVC)
+    target_compile_options(
+        openisac_phy_4x4_time_pipeline_benchmark PRIVATE
+        /W4 /permissive- /EHsc /fp:precise /Zc:__cplusplus /utf-8)
+endif()
+
+add_executable(
     openisac_phy_capture_io_benchmark
     benchmarks/bench_capture_io.cpp)
 target_link_libraries(openisac_phy_capture_io_benchmark PRIVATE openisac_phy)
@@ -161,6 +179,37 @@ if(MSVC)
     )
 endif()
 
+add_executable(
+    openisac_phy_4x4_diagnostics
+    tools/mimo4x4_diagnostics.cpp)
+target_link_libraries(openisac_phy_4x4_diagnostics PRIVATE openisac_phy)
+if(MSVC)
+    target_compile_options(openisac_phy_4x4_diagnostics PRIVATE
+        /W4 /permissive- /EHsc /fp:precise /Zc:__cplusplus /utf-8)
+endif()
+
+add_executable(
+    openisac_phy_4x4_formal_diagnostics
+    tools/rank4_formal_diagnostics.cpp)
+target_link_libraries(openisac_phy_4x4_formal_diagnostics PRIVATE openisac_phy)
+target_compile_definitions(openisac_phy_4x4_formal_diagnostics PRIVATE
+    OPENISAC_MATRIX_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+if(MSVC)
+    target_compile_options(openisac_phy_4x4_formal_diagnostics PRIVATE
+        /W4 /permissive- /EHsc /fp:precise /Zc:__cplusplus /utf-8)
+endif()
+
+add_executable(
+    openisac_phy_4x4_time_diagnostics
+    tools/rank4_time_diagnostics.cpp)
+target_link_libraries(openisac_phy_4x4_time_diagnostics PRIVATE openisac_phy)
+target_compile_definitions(openisac_phy_4x4_time_diagnostics PRIVATE
+    OPENISAC_MATRIX_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+if(MSVC)
+    target_compile_options(openisac_phy_4x4_time_diagnostics PRIVATE
+        /W4 /permissive- /EHsc /fp:precise /Zc:__cplusplus /utf-8)
+endif()
+
 add_executable(openisac_phy_adaptive_regression tools/adaptive_tdl_regression.cpp)
 target_link_libraries(openisac_phy_adaptive_regression PRIVATE openisac_phy)
 target_compile_definitions(openisac_phy_adaptive_regression PRIVATE
@@ -192,4 +241,17 @@ if(WIN32)
         target_compile_options(openisac_phy_video_bridge PRIVATE
             /W4 /permissive- /EHsc /fp:precise /Zc:__cplusplus /utf-8)
     endif()
+    add_test(
+        NAME openisac_video_rank1_compatibility
+        COMMAND openisac_phy_video_bridge --self-test 5 --rank 1
+                --modulation 64QAM --snr 45 --sensing-coherent 0)
+    add_test(
+        NAME openisac_video_rank2_compatibility
+        COMMAND openisac_phy_video_bridge --self-test 5 --rank 2
+                --modulation 64QAM --snr 45 --sensing-coherent 0)
+    add_test(
+        NAME openisac_video_rank4_compatibility
+        COMMAND openisac_phy_video_bridge --self-test 10 --rank 4
+                --modulation 64QAM --workers 12 --snr 45
+                --sensing-coherent 0)
 endif()

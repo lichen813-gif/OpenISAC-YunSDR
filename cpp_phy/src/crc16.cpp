@@ -31,4 +31,3 @@ bool check_crc16_ccitt_false(const std::vector<std::uint8_t>& frame) {
 }
 
 }  // namespace openisac
-

@@ -8,8 +8,8 @@
 | 子载波间隔 | 15 kHz |
 | 采样率 | 15.36 Msps |
 | OFDM 符号时长 | 75 us（有效 66.667 us + CP 8.333 us） |
-| 帧长度 | 3 个 OFDM 符号，3456 samples，225 us |
-| MIMO | 两个物理端口，载荷可动态切换 Rank 1/2；4×4/8×8 检测内核已具备 |
+| 帧长度 | `fdm`：3个符号/3456 samples/225 us；`nr-dmrs`：5个符号/5760 samples/375 us |
+| MIMO | Windows时域及视频链支持两个物理端口Rank 1/2和四个物理端口Rank 4；8×8检测内核已具备，8×8完整时域帧尚未接入 |
 | 数据调制 | 控制头动态选择 QPSK、16-QAM、64-QAM、256-QAM |
 | 检测 | 2×2 专用 ZF/MMSE；通用 1×1 到 8×8 Cholesky ZF/MMSE |
 | FEC | LDPC(1008,504)，归一化 Min-Sum，默认最多 6 次迭代、系数 0.8 |
@@ -22,10 +22,18 @@
 | 1024+128    | 1024+128    | 1024+128    |
 ```
 
+可选的统一前置DM-RS模式为：
+
+```text
+| ZC preamble | DM-RS 0 | DM-RS 1 | data OFDM 0 | data OFDM 1 |
+| 1024+128    | 1024+128 | 1024+128 | 1024+128    | 1024+128    |
+```
+
 - 前导为根 29 的 1024 点 Zadoff-Chu 频域序列，经 IFFT 后添加 128 点 CP；只由 Tx0 发送，Tx1 静默。
 - 接收机用双接收分支归一化 ZC 相关完成启动/失锁捕获。
 - 捕获后用 CP 相关估计 CFO；估计无歧义范围为归一化 `[-0.5,0.5)`，在 15 kHz 子载波间隔下约为 ±7.5 kHz。
 - CP 校正窗口跳过最大多径时延，因此要求 `maximum_path_delay < 128 samples`。
+- `PilotMode::fdm`是默认值，确保旧脚本、旧IQ语料和225 us性能基准不变；`PilotMode::nr_dmrs`显式选择五符号帧。
 
 ## 3. 频域资源结构
 
@@ -47,6 +55,14 @@
 
 Rank 2、64-QAM 下，14 个 LDPC 码字占用 `14×1008/6 = 2352` 个 QAM 符号，剩余 80 个为容量 padding。控制区前 64 个 QPSK 标签是 Marker，后 64 个标签承载补零的 BCH(127,64) 码字；接收端先由 QPSK max-log LLR 计算归一化软 Marker 相关，再对 LLR 硬切片后的 BCH 码字进行最多 10 位纠错，最后检查 mini-header CRC16。旧硬标签解码接口仅作为无噪声/黄金向量兼容路径保留。
 
+### 3.1 统一前置DM-RS端口映射
+
+- Rank-1/SISO仍运行在两个物理射频端口框架中：有效载荷只用Tx0，但两个Tx端口都发送正交DM-RS，以便接收机保留完整2×2 CSI和后续Rank自适应能力。
+- Rank-2的两个端口在每个活动子载波上同时发送，使用两个DM-RS符号的`[+,+]`与`[+,-]`时域OCC分离。
+- Rank-4采用两个交织频域梳齿：梳齿0承载端口0/1，梳齿1承载端口2/3；每个梳齿内同样使用双符号时域OCC。每个端口在隔一个活动子载波处得到LS点，再做周期线性插值。
+- 每个DM-RS RE的四端口总发射功率归一化为1。映射和估计均为固定次数复乘加及线性插值，不使用迭代算法或大矩阵求逆。
+- 两个数据符号暂时保留原FDM/相位参考：用于导频差分噪声估计，并用已估DM-RS信道拟合公共相位和频率线性相位，跟踪前置CSI老化。这是类似NR的工程结构，不是逐字段兼容3GPP标准。
+
 ## 4. 数据处理顺序
 
 Rank 2、64-QAM 基准发送链为：
@@ -63,7 +79,8 @@ Rank 2、64-QAM 基准发送链为：
 接收执行严格逆序。LLR 约定为正数表示 bit 0、负数表示 bit 1。14 块信息共 7056 bit，即 882 字节；CRC 通过才计为有效帧。净用户数据率（不含更高层间隔）为：
 
 ```text
-880 × 8 / 225 us = 31.29 Mbit/s
+fdm:      880 × 8 / 225 us = 31.29 Mbit/s
+nr-dmrs:  880 × 8 / 375 us = 18.77 Mbit/s
 ```
 
 动态满载容量如下；表中已经扣除每帧 2 字节 CRC：
@@ -75,11 +92,13 @@ Rank 2、64-QAM 基准发送链为：
 
 不足一个满载帧时允许发送较短用户数据，未使用的层符号位置作为 padding。mini-header 携带版本、Rank/MCS flags、实际信息长度、LDPC 块数和 16 位序号，接收端以控制头字段决定软解调阶数、层数和 LDPC 码块数量。
 
+当前`nr-dmrs`不减少有效载荷RE，所以每帧字节容量与`fdm`相同；代价是帧周期增加到5/3，理论净空口吞吐降为`fdm`的60%。后续只有在验证数据符号中低密度跟踪参考可以安全稀疏化后，才会回收这部分开销。
+
 ## 5. CFO、SFO 与工程实现选择
 
 - CFO 默认诊断值为 300 Hz，使用 CP 重复区的合并相关相位估计并对整帧旋转校正。
 - SFO 定义为 `(Frx-Ftx)/Ftx × 1e6`，默认 20 ppm。
-- 当前 3 符号短帧在 20 ppm 下累计漂移仅 `3456×20e-6=0.0691 sample`。默认采用 8 个相位参考拟合跨数据符号的相位斜率并校正第二个符号，避免时域重复插值带来的额外 EVM。
+- 3符号FDM帧在20 ppm下累计漂移为`3456×20e-6=0.0691 sample`，5符号DM-RS帧为`5760×20e-6=0.1152 sample`。两种模式都用8个数据相位参考拟合跨数据符号相位斜率；DM-RS模式还把两个数据符号分别对齐到前置DM-RS信道。
 - C++ 同时提供四点 Lagrange 三次重采样器，供未来长帧或连续流使用；不建议在当前短帧中多次级联重采样。
 - `sfo_ppm_estimated` 是由两个数据符号的有效相位斜率换算出的跟踪量；当前 3 符号帧和 CP-CFO 联合估计下不把它作为晶振 ppm 校准读数。验收量是相位校正后的 `sfo_ppm_residual`、BER/EVM 和 CRC。
 
@@ -113,6 +132,14 @@ cpp_phy\run_cpp_python_plot.cmd 40 20 0:0:0+3:-4:45+9:-8:-80 300 20 49239
 
 六个参数依次为 SNR dB、整数定时偏移、TDL、CFO Hz、SFO ppm、随机种子。脚本不依赖 `py` 命令，优先使用 `python_phy\.venv\Scripts\python.exe`。
 
+带视频和全部物理层参数的Windows入口支持在最后选择导频：
+
+```bat
+cpp_phy\manual_video_phy_test.cmd "E:\openisac\视频源\1920x1080_2Mbps_2.mp4" 4 64QAM 45 300 20 20 "0:0:0:0+3:-14:45:0+9:-8:-80:69.444444" 2 128 0.02 0.02 1000 nr-dmrs
+```
+
+不写最后的`nr-dmrs`时保持默认`fdm`。实时窗口会直接显示导频模式、帧符号数和帧周期。
+
 批量 FER 回归：
 
 ```bat
@@ -120,6 +147,15 @@ python_phy\.venv\Scripts\python.exe cpp_phy\run_cpp_regression.py
 ```
 
 ## 8. 当前显式测试结果
+
+统一DM-RS回归在Rank-1/2/4、64-QAM、45 dB、300 Hz CFO、20 ppm SFO和Tx/Rx相关系数0.02下各发送30个UDP数据报，全部逐字节恢复且FER为0；三种模式分别处理126、72和60个PHY帧。Rank-4固定种子100帧结果如下：
+
+| 导频 | 帧周期 | EVM | 预FEC BER | CSI NMSE | CRC | 接收均值 |
+|---|---:|---:|---:|---:|---:|---:|
+| FDM | 225 us | 6.562% | 0.005047 | -25.736 dB | 100/100 | 838.996 us |
+| 前置DM-RS | 375 us | 7.082% | 0.004446 | -25.683 dB | 100/100 | 986.250 us |
+
+无CFO/SFO的30帧隔离对照中，DM-RS的EVM/CSI NMSE为5.823%/-45.982 dB，FDM为7.378%/-40.890 dB，说明梳齿+时域OCC估计本身有效；加入300 Hz/20 ppm后，前置CSI到数据区的时间差仍使EVM略高，但预FEC BER已低于FDM。当前结论是“统一帧与闭环通过，工程跟踪仍可继续优化”，不是“所有信道条件下DM-RS必然改善EVM”。原始CSV位于`measurement\dmrs_comparison\rank4_fdm`和`measurement\dmrs_comparison\rank4_nr-dmrs_tracked`。
 
 默认三径 TDL、300 Hz CFO、20 ppm SFO、每个 SNR 5 个噪声种子：
 
@@ -466,3 +502,51 @@ cpp_phy\run_cpp_sensing_plot.cmd 50
 完整时域共享前端也已验证：Rank-2/64-QAM经过TDL、300 Hz CFO、20 ppm SFO、ZC同步、去CP和FFT后，同一接收网格同时送入通信与感知，64/64帧CRC通过，延迟5点、慢时间+1 bin目标检测正确。仿真器现在保留本地正式发送网格作为感知参考，真实硬件由本地发射链提供同一参考。
 
 最终硬件只接 `libyunsdr`。官方2026.2公开头文件已确认提供设备开关、RX/TX采样率与本振配置、多端口读写、时间戳和通道overflow/underflow事件接口；但当前工作区没有目标设备对应的Windows `.lib`、DLL、驱动或厂家样例，因此本轮不提交不可链接、不可运行的设备代码。取得这些文件后，适配器填充现有 `DynamicLinkCaptureFrame`/采集环形缓冲，并映射硬件时间戳、连续序号和事件；同步、MIMO检测、LDPC和感知核心保持不变。
+
+### Rank-4正式频域帧手动验证
+
+Rank-4已完成四端口正式发送网格、FDM导频信道估计、控制头MRC软译码、4×4 MMSE、LDPC和CRC闭环。默认运行：
+
+```bat
+cd /d E:\openisac\OpenISAC-main
+cpp_phy\run_cpp_4x4_formal_diagnostics.cmd
+```
+
+手动选择参数：
+
+```bat
+cpp_phy\run_cpp_4x4_formal_diagnostics.cmd --frames 20 --snr 50 --modulation 64QAM --payload-bytes 1132 --tx-correlation 0.2 --rx-correlation 0.2 --check --output measurement\cpp_4x4_formal_diagnostics
+```
+
+`--modulation`支持 `QPSK`、`16QAM`、`64QAM`、`256QAM`；`--payload-bytes 0`表示使用当前MCS最大容量；`--check`要求每一帧控制头、CRC和用户负载全部通过。输出目录包含汇总CSV、四层星座CSV和PNG图。这个入口尚未加入ZC前导、CFO/SFO与视频UDP，不能等同于现有2×2连续时域链路。
+
+### Rank-4四通道时域同步验证
+
+第三阶段入口已加入端口0 ZC前导、四路联合定时、CP-CFO、两数据符号SFO相位校正和连续 `SEARCH/TRACK/REACQUIRE` 状态：
+
+```bat
+cpp_phy\run_cpp_4x4_time_diagnostics.cmd
+```
+
+默认注入300 Hz CFO、20 ppm SFO，定时从20点开始并每帧漂移1点。手动参数示例：
+
+```bat
+cpp_phy\run_cpp_4x4_time_diagnostics.cmd --frames 20 --snr 50 --modulation 64QAM --payload-bytes 0 --timing 20 --timing-drift 1 --cfo 300 --sfo 20 --tx-correlation 0.2 --rx-correlation 0.2 --ldpc-threads 12 --check --output measurement\cpp_4x4_time_diagnostics
+```
+
+`frames.csv`逐帧记录同步模式、定时、CFO/SFO、噪声估计、EVM、CSI NMSE、CRC和耗时；`summary.csv`给出汇总和各阶段均值；星座图显示四层MMSE输出。Rank-4接收器复用FFT、网格、CSI、噪声样本、控制LLR、均衡符号及动态帧译码工作区，并将18个LDPC码块分配给持久线程池。默认12线程，可用 `--ldpc-threads 1..19` 调整；应以目标电脑的P99而不是只看均值选线程数。
+
+本机50帧VS2019 Release、12线程复测：CRC及负载50/50，纯接收均值856.5 us、P50 820.9 us、P99 974.4 us；原基线均值1504.9 us，提升1.76倍。平均分段为同步55.3 us、FFT+SFO 62.8 us、CSI 122.0 us、控制头及4×4检测236.3 us、软解映射98.4 us、LDPC/CRC 281.7 us。LDPC实际最大迭代数为2；预热后的接收和LDPC缓冲区扩容帧数均为0。当前三符号空口帧长225 us，接收均值仍约为空口周期3.8倍。另需注意，这个入口先按Rank-4导频模板估计CSI，再用控制头验证Rank/MCS；统一Rank-1/2/4盲选模板尚未合并。
+
+### Rank-4双缓冲流水验证
+
+`Rank4TimePipeline` 有两个独立 `Rank4TimeWorkspace` 槽位。前台完成波形仿真、同步、FFT/SFO、CSI、控制头、4×4 MMSE和软解映射；后台固定线程池只执行LDPC、字节打包和CRC。一个后台消费者保证输出顺序与提交顺序一致。物理同步状态在定时和控制头通过后即可进入TRACK，不等待后台CRC；CRC仍决定载荷能否交付。
+
+运行200帧、12线程基准：
+
+```bat
+cd /d E:\openisac\OpenISAC-main
+cpp_phy\run_cpp_4x4_time_pipeline_benchmark.cmd 200 12
+```
+
+本机结果为CRC及载荷200/200通过、预热后工作区和LDPC扩容均为0。串行接收均值810.9 us；前端均值/P50/P99为534.7/532.1/563.4 us，后台FEC为283.7/284.7/364.6 us，队列等待P50/P99为9.4/25.2 us。若输入已经是四路采集IQ，双缓冲的工程服务周期预计受534.7 us前端限制；但当前 `submit()` 内仍包含发射与TDL信道生成，实际完整仿真间隔只从4136.0 us降到3463.3 us，即1.19倍。结果位于 `measurement\cpp_4x4_time_pipeline`；在加入四路预生成/采集IQ入口前，不把534.7 us作为实测硬件吞吐。

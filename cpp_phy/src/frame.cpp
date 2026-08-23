@@ -246,9 +246,19 @@ std::uint64_t bch_decode(std::array<std::uint8_t, 127> bits) {
 
 }  // namespace
 
+const char* pilot_mode_name(PilotMode mode) noexcept {
+    switch (mode) {
+        case PilotMode::fdm: return "fdm";
+        case PilotMode::nr_dmrs: return "nr-dmrs";
+    }
+    return "unknown";
+}
+
 FormalFrameLayout build_formal_frame_layout(const FormalFrameProfile& profile) {
     if (profile.fft_size != 1024u || profile.control_re_count != 128u ||
-        profile.transmit_rank < 1u || profile.transmit_rank > 2u ||
+        (profile.transmit_rank != 1u && profile.transmit_rank != 2u &&
+         profile.transmit_rank != 4u) ||
+        (profile.transmit_rank == 4u && profile.pilot_spacing != 2u) ||
         1008u % profile.bits_per_symbol != 0u) {
         throw std::invalid_argument("unsupported formal-frame profile");
     }
@@ -281,6 +291,9 @@ FormalFrameLayout build_formal_frame_layout(const FormalFrameProfile& profile) {
         const int fft = static_cast<int>(profile.fft_size);
         return static_cast<std::uint16_t>((centered % fft + fft) % fft);
     };
+    for (const int centered : active) {
+        layout.active_fft_indices.push_back(native_index(centered));
+    }
     for (const int centered : active) {
         if (pilot_set.count(centered) == 0u) {
             layout.data_fft_indices.push_back(native_index(centered));
@@ -348,11 +361,19 @@ std::uint8_t transmit_rank_flag(unsigned transmit_rank) {
     if (transmit_rank == 2u) {
         return 0x01u;
     }
-    throw std::invalid_argument("transmit rank must be 1 or 2");
+    if (transmit_rank == 4u) {
+        return 0x02u;
+    }
+    throw std::invalid_argument("transmit rank must be 1, 2 or 4");
 }
 
 unsigned transmit_rank_from_flags(std::uint8_t flags) noexcept {
-    return (flags & 0x01u) != 0u ? 2u : 1u;
+    switch (flags & 0x03u) {
+        case 0x00u: return 1u;
+        case 0x01u: return 2u;
+        case 0x02u: return 4u;
+        default: return 0u;
+    }
 }
 
 std::uint64_t pack_mini_header(const MiniHeader& header) {

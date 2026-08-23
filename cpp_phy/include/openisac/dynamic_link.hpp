@@ -21,6 +21,7 @@ enum class SynchronizationMode : std::uint8_t {
 };
 
 struct DynamicLinkSimulationConfig {
+    PilotMode pilot_mode = PilotMode::fdm;
     float snr_db = 40.0f;
     std::size_t timing_offset_samples = 20u;
     float cfo_hz = 300.0f;
@@ -60,6 +61,7 @@ enum class NoiseVarianceMode : std::uint8_t {
 // Hardware-facing receiver parameters. These values describe receiver policy
 // and capture-buffer bounds; they do not contain simulated channel truth.
 struct DynamicLinkReceiverConfig {
+    PilotMode pilot_mode = PilotMode::fdm;
     NoiseVarianceMode noise_variance_mode = NoiseVarianceMode::pilot_residual;
     float fixed_noise_variance = 1.0e-4f;
     float minimum_noise_variance = 1.0e-8f;
@@ -119,18 +121,24 @@ struct DynamicLinkWorkspace {
     std::vector<std::complex<float>> fft_scratch;
     std::vector<std::complex<float>> ofdm_samples;
     std::vector<std::complex<float>> rx_grid;
+    std::vector<std::complex<float>> dmrs_rx_grid;
     TimingEstimate timing_estimate;
     std::vector<Channel2x2> channels;
     FdmPilotChannelEstimatorWorkspace channel_estimation;
+    std::vector<ChannelNxN> dmrs_channels;
+    FdmPilotChannelEstimatorWorkspaceNxN dmrs_channel_estimation;
     std::vector<float> control_llrs;
     std::vector<std::complex<float>> equalized;
     std::vector<float> variances;
     std::vector<Channel2x2> adaptation_channels;
     std::vector<std::array<float, 2>> adaptation_mse;
     std::vector<std::complex<float>> pilot_reference_grid;
+    std::vector<std::complex<float>> dmrs_reference_grid;
     std::vector<float> noise_power_samples;
     std::uint32_t pilot_reference_seed = 0u;
     bool pilot_reference_valid = false;
+    std::uint32_t dmrs_reference_seed = 0u;
+    bool dmrs_reference_valid = false;
     DynamicFrameDecodeWorkspace frame_decode;
     std::size_t capacity_growths = 0u;
     std::size_t frames_processed = 0u;
@@ -162,6 +170,8 @@ struct DynamicLinkTiming {
 };
 
 struct DynamicLinkSimulationResult {
+    PilotMode pilot_mode = PilotMode::fdm;
+    std::size_t frame_symbols = formal_frame_symbols(PilotMode::fdm);
     LinkMode transmitted_mode{};
     LinkMode decoded_mode{};
     LinkDecision recommendation{};

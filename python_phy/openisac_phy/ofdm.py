@@ -30,4 +30,3 @@ def demodulate(samples: np.ndarray, fft_size: int, cp_length: int) -> np.ndarray
         raise ValueError("sample length does not match fft_size + cp_length")
     useful = samples[..., cp_length:]
     return np.fft.fft(useful, axis=-1) / math.sqrt(fft_size)
-

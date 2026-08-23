@@ -1,7 +1,7 @@
 # Python PHY到C++实时实现约束
 
-版本日期：2026-08-22  
-适用基线：2×2空间复用、1024/128 CP-OFDM、15.36 Msps、64-QAM。  
+版本日期：2026-08-22
+适用基线：2×2空间复用、1024/128 CP-OFDM、15.36 Msps、64-QAM。
 目标：Python作为算法黄金模型，同时保证接收算法能在Windows/Linux C++ CPU实时实现。
 
 ## 1. 基本原则
@@ -105,7 +105,7 @@ configs/mimo_2x2_spatial_multiplexing_realtime_1024.yaml
 
 ### MCS联动
 
-允许：基于后检测SINR/EVM的固定阈值表选择QPSK/16-QAM/64-QAM/256-QAM，并加入滞回。  
+允许：基于后检测SINR/EVM的固定阈值表选择QPSK/16-QAM/64-QAM/256-QAM，并加入滞回。
 禁止：每帧运行机器学习推理、非线性搜索或大规模链路预测。
 
 Python参考现已采用一帧反馈延迟：CRC或质量下降立即降档，升档连续确认3帧并逐级执行。rank和MCS写入下一帧mini-header，热路径只保留平均Gram、闭式特征值、阈值比较和小状态机。40 dB验收比固定Rank-2/64-QAM提高约12.9% goodput；28 dB压力点把CRC失败率从16.7%降至2.1%。

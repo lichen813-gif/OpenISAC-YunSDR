@@ -1,10 +1,11 @@
 /build*/
-build*/
+**/build*/
 capture/*.mat
 capture/plot_results
 *.log
-_tmp*/
-_scratch*/
+_*
+!docs/_astro/
+!docs/_astro/**
 /.claude
 
 measurement/
@@ -12,11 +13,10 @@ measurement/
 .DS_Store
 *.pyc
 __pycache__/
-.venv/
-.matplotlib/
+.pytest_cache/
 *.egg-info/
+.matplotlib/
 site/node_modules/
 site/.astro/
 site/dist/
 .omx/
-vlc-*.txt

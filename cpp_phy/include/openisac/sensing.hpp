@@ -9,7 +9,7 @@
 namespace openisac {
 
 // Sensing profile aligned with the current formal communication PHY:
-// 1024 subcarriers, two data OFDM symbols, two physical Tx/Rx ports and one
+// 1024 subcarriers, two data OFDM symbols, 2x2 or 4x4 physical ports and one
 // channel snapshot per 225-us frame. The hardware timestamp unit is deliberately
 // left to the capture adapter; metric axes use frame_period_seconds.
 struct DynamicSensingConfig {
@@ -130,6 +130,16 @@ public:
         std::uint64_t timestamp,
         const std::vector<std::complex<float>>& transmit_grid,
         const std::vector<std::complex<float>>& receive_grid);
+
+    // Push already-estimated MIMO channel responses. frequency_response uses
+    // [link = rx*transmit_ports+tx][fft] layout. The processor performs a
+    // range/Doppler transform per link and noncoherently sums link powers, so
+    // Rank-4 sensing does not require cross-RF-chain phase calibration.
+    bool push_channel_frame(
+        std::uint64_t capture_sequence,
+        std::uint64_t timestamp,
+        const std::vector<std::complex<float>>& frequency_response,
+        const std::vector<std::uint8_t>& active_subcarrier_mask);
 
     const DynamicSensingResult& last_result() const noexcept;
     std::size_t frames_accumulated() const noexcept;

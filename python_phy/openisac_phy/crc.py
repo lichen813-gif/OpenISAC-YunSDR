@@ -23,4 +23,3 @@ def check_crc16(frame: bytes) -> bool:
         return False
     expected = int.from_bytes(frame[-2:], byteorder="big")
     return crc16_ccitt(frame[:-2]) == expected
-

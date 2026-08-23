@@ -173,6 +173,104 @@ PhaseSlopeEstimate estimate_sfo_phase_slope(
     return estimate;
 }
 
+PhaseSlopeEstimate estimate_reference_residual_phase_slope_nxn(
+    const std::vector<std::complex<float>>& receive_grid,
+    const std::vector<std::complex<float>>& reference_grid,
+    const std::vector<std::uint16_t>& pilot_fft_indices,
+    const std::vector<ChannelNxN>& channels,
+    std::size_t symbol_index,
+    std::size_t fft_size,
+    std::size_t ports) {
+    if (fft_size == 0u || ports == 0u ||
+        ports > maximum_spatial_streams || pilot_fft_indices.size() < 2u ||
+        receive_grid.size() != reference_grid.size() ||
+        receive_grid.size() % (fft_size * ports) != 0u ||
+        channels.size() * ports != receive_grid.size() ||
+        symbol_index >= receive_grid.size() / (fft_size * ports)) {
+        throw std::invalid_argument(
+            "invalid reference residual phase-slope dimensions");
+    }
+    struct Reference {
+        double subcarrier;
+        std::complex<double> correlation;
+    };
+    std::vector<Reference> references;
+    references.reserve(pilot_fft_indices.size());
+    for (const auto fft : pilot_fft_indices) {
+        if (fft >= fft_size) {
+            throw std::invalid_argument("phase-tracking pilot lies outside FFT");
+        }
+        const auto& channel = channels[symbol_index * fft_size + fft];
+        std::complex<double> correlation{};
+        for (std::size_t rx = 0u; rx < ports; ++rx) {
+            std::complex<float> predicted{};
+            for (std::size_t tx = 0u; tx < ports; ++tx) {
+                predicted += channel.values[
+                    rx * maximum_spatial_streams + tx] * reference_grid[
+                    (symbol_index * fft_size + fft) * ports + tx];
+            }
+            const auto received = receive_grid[
+                (symbol_index * fft_size + fft) * ports + rx];
+            correlation += std::conj(
+                static_cast<std::complex<double>>(predicted)) *
+                static_cast<std::complex<double>>(received);
+        }
+        const double centered = fft < fft_size / 2u
+            ? static_cast<double>(fft)
+            : static_cast<double>(fft) - static_cast<double>(fft_size);
+        references.push_back({centered, correlation});
+    }
+    std::sort(references.begin(), references.end(), [](const auto& left,
+                                                        const auto& right) {
+        return left.subcarrier < right.subcarrier;
+    });
+    constexpr double two_pi = 6.28318530717958647692;
+    std::vector<double> phases(references.size());
+    phases.front() = std::arg(references.front().correlation);
+    for (std::size_t index = 1u; index < references.size(); ++index) {
+        double phase = std::arg(references[index].correlation);
+        while (phase - phases[index - 1u] > 0.5 * two_pi) phase -= two_pi;
+        while (phase - phases[index - 1u] < -0.5 * two_pi) phase += two_pi;
+        phases[index] = phase;
+    }
+    double sum_w = 0.0;
+    double sum_x = 0.0;
+    double sum_y = 0.0;
+    double sum_xx = 0.0;
+    double sum_xy = 0.0;
+    for (std::size_t index = 0u; index < references.size(); ++index) {
+        const double weight = std::max(
+            std::abs(references[index].correlation), 1.0e-15);
+        const double x = references[index].subcarrier;
+        const double y = phases[index];
+        sum_w += weight;
+        sum_x += weight * x;
+        sum_y += weight * y;
+        sum_xx += weight * x * x;
+        sum_xy += weight * x * y;
+    }
+    const double denominator = sum_w * sum_xx - sum_x * sum_x;
+    if (std::abs(denominator) <= std::numeric_limits<double>::epsilon()) {
+        throw std::runtime_error("reference pilots cannot determine phase slope");
+    }
+    PhaseSlopeEstimate estimate;
+    estimate.slope_radians_per_subcarrier = static_cast<float>(
+        (sum_w * sum_xy - sum_x * sum_y) / denominator);
+    estimate.intercept_radians = static_cast<float>(
+        (sum_y - estimate.slope_radians_per_subcarrier * sum_x) / sum_w);
+    std::complex<double> aligned{};
+    double magnitude_sum = 0.0;
+    for (const auto& reference : references) {
+        const double fitted = estimate.intercept_radians +
+            estimate.slope_radians_per_subcarrier * reference.subcarrier;
+        aligned += reference.correlation * std::polar(1.0, -fitted);
+        magnitude_sum += std::abs(reference.correlation);
+    }
+    estimate.coherence = static_cast<float>(
+        std::abs(aligned) / std::max(magnitude_sum, 1.0e-30));
+    return estimate;
+}
+
 void correct_second_symbol_phase_inplace(
     std::vector<std::complex<float>>& receive_grid,
     const PhaseSlopeEstimate& estimate,
@@ -182,20 +280,39 @@ void correct_second_symbol_phase_inplace(
         receive_grid.size() != 2u * fft_size * receive_antennas) {
         throw std::invalid_argument("invalid differential-phase correction dimensions");
     }
-    const std::complex<float> phase_step = std::polar(
-        1.0f, -estimate.slope_radians_per_subcarrier);
-    std::complex<float> correction = std::polar(
-        1.0f, -estimate.intercept_radians);
+    correct_symbol_phase_inplace(
+        receive_grid, estimate, fft_size, receive_antennas, 1u, 1.0f);
+}
+
+void correct_symbol_phase_inplace(
+    std::vector<std::complex<float>>& receive_grid,
+    const PhaseSlopeEstimate& estimate,
+    std::size_t fft_size,
+    std::size_t receive_antennas,
+    std::size_t symbol_index,
+    float symbol_intervals) {
+    if (fft_size == 0u || receive_antennas == 0u ||
+        receive_grid.size() % (fft_size * receive_antennas) != 0u ||
+        symbol_index >= receive_grid.size() / (fft_size * receive_antennas) ||
+        !std::isfinite(symbol_intervals)) {
+        throw std::invalid_argument("invalid OFDM-symbol phase correction dimensions");
+    }
+    const float intercept = estimate.intercept_radians * symbol_intervals;
+    const float slope =
+        estimate.slope_radians_per_subcarrier * symbol_intervals;
+    const std::complex<float> phase_step = std::polar(1.0f, -slope);
+    std::complex<float> correction = std::polar(1.0f, -intercept);
     const std::size_t centered_wrap = fft_size / 2u;
     for (std::size_t fft = 0u; fft < fft_size; ++fft) {
         if (fft == centered_wrap) {
-            const float wrapped_phase = estimate.intercept_radians -
-                estimate.slope_radians_per_subcarrier *
-                    static_cast<float>(centered_wrap);
+            const float wrapped_phase = intercept -
+                slope * static_cast<float>(centered_wrap);
             correction = std::polar(1.0f, -wrapped_phase);
         }
         for (std::size_t rx = 0u; rx < receive_antennas; ++rx) {
-            receive_grid[(fft_size + fft) * receive_antennas + rx] *= correction;
+            receive_grid[
+                (symbol_index * fft_size + fft) * receive_antennas + rx] *=
+                correction;
         }
         correction *= phase_step;
     }

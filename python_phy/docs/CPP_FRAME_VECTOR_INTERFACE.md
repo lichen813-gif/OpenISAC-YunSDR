@@ -6,7 +6,7 @@
 .venv\Scripts\python.exe experiments\export_cpp_frame_vectors.py
 ```
 
-输出目录为`measurement/cpp_frame_vectors/`。`manifest.json`记录每个文件的类型、形状、字节数和SHA-256；所有多字节数均为小端，packed bit在每字节内按MSB优先，复数采用`std::complex<float>`兼容的real/imag交错布局。
+生成器默认输出到`measurement/cpp_frame_vectors/`；经过Python/C++一致性确认的版本化快照保存在`cpp_phy/tests/vectors/`，干净克隆后的CTest直接使用该快照。`manifest.json`记录每个文件的类型、形状、字节数和SHA-256；所有多字节数均为小端，packed bit在每字节内按MSB优先，复数采用`std::complex<float>`兼容的real/imag交错布局。
 
 主要向量包括：
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace openisac {
@@ -118,6 +119,95 @@ DetectionNxN detect_nxn(
         }
     }
     return result;
+}
+
+float condition_number_nxn(const ChannelNxN& channel) {
+    const std::size_t streams = channel.streams;
+    if (streams < 1u || streams > maximum_spatial_streams) {
+        throw std::invalid_argument("MIMO condition stream count must be in [1,8]");
+    }
+    constexpr std::size_t real_dimension = 2u * maximum_spatial_streams;
+    std::array<double, real_dimension * real_dimension> matrix{};
+    const auto index = [=](std::size_t row, std::size_t column) {
+        return row * real_dimension + column;
+    };
+    for (std::size_t left = 0u; left < streams; ++left) {
+        for (std::size_t right = 0u; right < streams; ++right) {
+            std::complex<double> gram{};
+            for (std::size_t rx = 0u; rx < streams; ++rx) {
+                gram += std::conj(static_cast<std::complex<double>>(
+                            channel.values[rx * nmax + left])) *
+                        static_cast<std::complex<double>>(
+                            channel.values[rx * nmax + right]);
+            }
+            matrix[index(left, right)] = gram.real();
+            matrix[index(left, streams + right)] = -gram.imag();
+            matrix[index(streams + left, right)] = gram.imag();
+            matrix[index(streams + left, streams + right)] = gram.real();
+        }
+    }
+
+    const std::size_t dimension = 2u * streams;
+    for (std::size_t iteration = 0u;
+         iteration < 16u * dimension * dimension; ++iteration) {
+        std::size_t p = 0u;
+        std::size_t q = 1u;
+        double largest = 0.0;
+        double diagonal_scale = 0.0;
+        for (std::size_t row = 0u; row < dimension; ++row) {
+            diagonal_scale = std::max(
+                diagonal_scale, std::abs(matrix[index(row, row)]));
+            for (std::size_t column = row + 1u;
+                 column < dimension; ++column) {
+                const double value = std::abs(matrix[index(row, column)]);
+                if (value > largest) {
+                    largest = value;
+                    p = row;
+                    q = column;
+                }
+            }
+        }
+        if (largest <= std::max(1.0e-14, diagonal_scale * 1.0e-12)) {
+            break;
+        }
+        const double app = matrix[index(p, p)];
+        const double aqq = matrix[index(q, q)];
+        const double apq = matrix[index(p, q)];
+        const double tau = (aqq - app) / (2.0 * apq);
+        const double t = std::copysign(
+            1.0 / (std::abs(tau) + std::sqrt(1.0 + tau * tau)), tau);
+        const double cosine = 1.0 / std::sqrt(1.0 + t * t);
+        const double sine = t * cosine;
+        for (std::size_t k = 0u; k < dimension; ++k) {
+            if (k == p || k == q) {
+                continue;
+            }
+            const double akp = matrix[index(k, p)];
+            const double akq = matrix[index(k, q)];
+            const double rotated_p = cosine * akp - sine * akq;
+            const double rotated_q = sine * akp + cosine * akq;
+            matrix[index(k, p)] = rotated_p;
+            matrix[index(p, k)] = rotated_p;
+            matrix[index(k, q)] = rotated_q;
+            matrix[index(q, k)] = rotated_q;
+        }
+        matrix[index(p, p)] = app - t * apq;
+        matrix[index(q, q)] = aqq + t * apq;
+        matrix[index(p, q)] = 0.0;
+        matrix[index(q, p)] = 0.0;
+    }
+
+    double minimum = std::numeric_limits<double>::infinity();
+    double maximum = 0.0;
+    for (std::size_t diagonal = 0u; diagonal < dimension; ++diagonal) {
+        const double value = std::max(0.0, matrix[index(diagonal, diagonal)]);
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+    }
+    if (!(maximum > 0.0) || minimum <= maximum * 1.0e-12) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return static_cast<float>(std::sqrt(maximum / minimum));
 }
 
 }  // namespace openisac

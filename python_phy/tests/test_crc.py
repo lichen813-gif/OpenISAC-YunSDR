@@ -10,4 +10,3 @@ def test_crc_detects_corruption() -> None:
     frame = bytearray(append_crc16(b"OpenISAC"))
     frame[2] ^= 0x01
     assert not check_crc16(bytes(frame))
-

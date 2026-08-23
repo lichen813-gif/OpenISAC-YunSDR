@@ -73,6 +73,74 @@ void normalize_average_link_power(ImpulseResponse2x2& response) {
     }
 }
 
+using RealMatrixNxN = std::array<
+    float, maximum_spatial_streams * maximum_spatial_streams>;
+
+RealMatrixNxN exponential_correlation_cholesky(
+    std::size_t streams,
+    float rho) {
+    if (streams == 0u || streams > maximum_spatial_streams ||
+        !std::isfinite(rho) || std::abs(rho) >= 1.0f) {
+        throw std::invalid_argument(
+            "generic TDL dimensions or spatial correlation are invalid");
+    }
+    RealMatrixNxN lower{};
+    for (std::size_t row = 0u; row < streams; ++row) {
+        for (std::size_t column = 0u; column <= row; ++column) {
+            const std::size_t separation = row > column
+                ? row - column : column - row;
+            float value = 1.0f;
+            for (std::size_t step = 0u; step < separation; ++step) {
+                value *= rho;
+            }
+            for (std::size_t inner = 0u; inner < column; ++inner) {
+                value -= lower[row * maximum_spatial_streams + inner] *
+                         lower[column * maximum_spatial_streams + inner];
+            }
+            if (row == column) {
+                if (!(value > 0.0f) || !std::isfinite(value)) {
+                    throw std::invalid_argument(
+                        "generic TDL correlation matrix is not positive definite");
+                }
+                lower[row * maximum_spatial_streams + column] = std::sqrt(value);
+            } else {
+                lower[row * maximum_spatial_streams + column] =
+                    value /
+                    lower[column * maximum_spatial_streams + column];
+            }
+        }
+    }
+    return lower;
+}
+
+void normalize_average_link_power(ImpulseResponseNxN& response) {
+    double total_power = 0.0;
+    for (std::size_t rx = 0u; rx < response.streams; ++rx) {
+        for (std::size_t tx = 0u; tx < response.streams; ++tx) {
+            const auto& link = response.links[
+                rx * maximum_spatial_streams + tx];
+            for (const auto& value : link) {
+                total_power += std::norm(value);
+            }
+        }
+    }
+    if (!(total_power > 0.0) || !std::isfinite(total_power)) {
+        throw std::invalid_argument("generic TDL channel has zero or invalid power");
+    }
+    const float links = static_cast<float>(
+        response.streams * response.streams);
+    const float scale = std::sqrt(links / static_cast<float>(total_power));
+    for (std::size_t rx = 0u; rx < response.streams; ++rx) {
+        for (std::size_t tx = 0u; tx < response.streams; ++tx) {
+            auto& link = response.links[
+                rx * maximum_spatial_streams + tx];
+            for (auto& value : link) {
+                value *= scale;
+            }
+        }
+    }
+}
+
 }  // namespace
 
 ImpulseResponse2x2 build_deterministic_tdl_2x2(const std::vector<TdlTap>& taps) {
@@ -179,6 +247,80 @@ ImpulseResponse2x2 build_correlated_tdl_2x2(
     return response;
 }
 
+ImpulseResponseNxN build_correlated_tdl_nxn(
+    const std::vector<TdlTap>& taps,
+    const TdlSpatialCorrelationNxNConfig& correlation) {
+    validate_taps(taps);
+    const std::size_t streams = correlation.streams;
+    const auto transmit_root = exponential_correlation_cholesky(
+        streams, correlation.transmit_correlation);
+    const auto receive_root = exponential_correlation_cholesky(
+        streams, correlation.receive_correlation);
+    std::size_t maximum_delay = 0u;
+    for (const auto& tap : taps) {
+        maximum_delay = std::max(maximum_delay, tap.delay_samples);
+    }
+    ImpulseResponseNxN response;
+    response.streams = streams;
+    for (std::size_t rx = 0u; rx < streams; ++rx) {
+        for (std::size_t tx = 0u; tx < streams; ++tx) {
+            response.links[rx * maximum_spatial_streams + tx].assign(
+                maximum_delay + 1u, {});
+        }
+    }
+
+    using ComplexMatrix = std::array<
+        std::complex<float>,
+        maximum_spatial_streams * maximum_spatial_streams>;
+    std::uint32_t random_state = correlation.random_seed == 0u
+        ? 0xA341316Cu : correlation.random_seed;
+    constexpr float pi = 3.14159265358979323846f;
+    for (const auto& tap : taps) {
+        ComplexMatrix independent{};
+        ComplexMatrix receive_correlated{};
+        ComplexMatrix correlated{};
+        for (std::size_t rx = 0u; rx < streams; ++rx) {
+            for (std::size_t tx = 0u; tx < streams; ++tx) {
+                independent[rx * maximum_spatial_streams + tx] =
+                    gaussian_complex(random_state);
+            }
+        }
+        for (std::size_t rx = 0u; rx < streams; ++rx) {
+            for (std::size_t tx = 0u; tx < streams; ++tx) {
+                for (std::size_t source = 0u; source < streams; ++source) {
+                    receive_correlated[rx * maximum_spatial_streams + tx] +=
+                        receive_root[rx * maximum_spatial_streams + source] *
+                        independent[source * maximum_spatial_streams + tx];
+                }
+            }
+        }
+        for (std::size_t rx = 0u; rx < streams; ++rx) {
+            for (std::size_t tx = 0u; tx < streams; ++tx) {
+                for (std::size_t source = 0u; source < streams; ++source) {
+                    correlated[rx * maximum_spatial_streams + tx] +=
+                        receive_correlated[
+                            rx * maximum_spatial_streams + source] *
+                        transmit_root[
+                            tx * maximum_spatial_streams + source];
+                }
+            }
+        }
+        const float amplitude = std::pow(10.0f, tap.gain_db / 20.0f);
+        const float phase = tap.phase_degrees * pi / 180.0f;
+        const std::complex<float> path = amplitude *
+            std::complex<float>{std::cos(phase), std::sin(phase)};
+        for (std::size_t rx = 0u; rx < streams; ++rx) {
+            for (std::size_t tx = 0u; tx < streams; ++tx) {
+                response.links[rx * maximum_spatial_streams + tx]
+                    [tap.delay_samples] += path *
+                    correlated[rx * maximum_spatial_streams + tx];
+            }
+        }
+    }
+    normalize_average_link_power(response);
+    return response;
+}
+
 std::vector<TdlTap> evaluate_tdl_taps(
     const std::vector<TdlTap>& taps,
     double time_seconds) {
@@ -248,6 +390,71 @@ Channel2x2 tdl_frequency_response(
         }
     }
     return {links[0], links[1], links[2], links[3]};
+}
+
+void apply_tdl_nxn_symbol(
+    const std::array<
+        std::vector<std::complex<float>>, maximum_spatial_streams>& transmitted,
+    const ImpulseResponseNxN& impulse_response,
+    std::array<
+        std::vector<std::complex<float>>, maximum_spatial_streams>& received) {
+    const std::size_t streams = impulse_response.streams;
+    if (streams == 0u || streams > maximum_spatial_streams) {
+        throw std::invalid_argument("generic TDL stream count must be in [1,8]");
+    }
+    const std::size_t samples = transmitted[0].size();
+    for (std::size_t tx = 0u; tx < streams; ++tx) {
+        if (transmitted[tx].size() != samples) {
+            throw std::invalid_argument(
+                "generic TDL transmit branches must have equal length");
+        }
+    }
+    for (std::size_t rx = 0u; rx < streams; ++rx) {
+        received[rx].assign(samples, {});
+    }
+    for (std::size_t rx = 0u; rx < streams; ++rx) {
+        for (std::size_t tx = 0u; tx < streams; ++tx) {
+            const auto& response = impulse_response.links[
+                rx * maximum_spatial_streams + tx];
+            for (std::size_t sample = 0u; sample < samples; ++sample) {
+                for (std::size_t delay = 0u;
+                     delay < response.size() && delay <= sample; ++delay) {
+                    received[rx][sample] += transmitted[tx][sample - delay] *
+                                            response[delay];
+                }
+            }
+        }
+    }
+}
+
+ChannelNxN tdl_frequency_response_nxn(
+    const ImpulseResponseNxN& impulse_response,
+    std::size_t fft_index,
+    std::size_t fft_size) {
+    if (impulse_response.streams == 0u ||
+        impulse_response.streams > maximum_spatial_streams ||
+        fft_size == 0u || fft_index >= fft_size) {
+        throw std::invalid_argument("invalid generic TDL FFT coordinate");
+    }
+    ChannelNxN result;
+    result.streams = impulse_response.streams;
+    constexpr float pi = 3.14159265358979323846f;
+    for (std::size_t rx = 0u; rx < result.streams; ++rx) {
+        for (std::size_t tx = 0u; tx < result.streams; ++tx) {
+            const auto& link = impulse_response.links[
+                rx * maximum_spatial_streams + tx];
+            auto& value = result.values[
+                rx * maximum_spatial_streams + tx];
+            for (std::size_t delay = 0u; delay < link.size(); ++delay) {
+                const float phase = -2.0f * pi *
+                    static_cast<float>(fft_index * delay) /
+                    static_cast<float>(fft_size);
+                value += link[delay] *
+                    std::complex<float>{std::cos(phase), std::sin(phase)};
+            }
+        }
+    }
+    return result;
 }
 
 }  // namespace openisac

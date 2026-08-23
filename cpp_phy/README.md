@@ -5,10 +5,10 @@
 ## 当前正式帧参数
 
 - FFT 1024，CP 128；每帧 1 个 ZC 前导和 2 个数据 OFDM 符号；
-- 672 个数据子载波，216 个梳状导频和 8 个相位参考；
-- 128 个控制 RE，1216 个有效载荷物理 RE；
-- 两个物理发射端口，实际载荷可由控制头切换 Rank 1/2 和 QPSK、16/64/256-QAM；
-- LDPC(1008,504)，每帧按 Rank/MCS 容量容纳 2 到 19 个码块；Rank 2、64-QAM 基准为 14 块、880 字节用户数据加 2 字节 CRC；
+- Rank 1/2 使用 672 个数据子载波、216 个梳状导频和 8 个相位参考；Rank 4 使用 448 个数据子载波、440 个四端口FDM导频和 8 个相位参考；
+- 128 个控制 RE；控制头Rank字段为 `00=Rank-1`、`01=Rank-2`、`10=Rank-4`、`11=保留`；
+- Rank 1/2 保持两个物理发射端口，Rank 4 使用四个物理发射端口；三种Rank均支持QPSK、16/64/256-QAM；
+- LDPC(1008,504)，每帧容量随Rank/MCS变化；Rank 2、64-QAM基准为14块、880字节用户数据，Rank 4、64-QAM为18块、1132字节用户数据，均另加2字节CRC；
 - 发射链顺序为 CRC、LDPC 编码、扰码、21×48 分块交织、QAM 映射。
 
 ## 已实现与验证
@@ -32,10 +32,23 @@
 - `DynamicLinkWorkspace` 复用时域流、FFT、信道、LLR、均衡和链路自适应顶层缓冲区；OFDM、SFO、ZC 定时和 LS-CSI 均提供复用输出接口，最大 Rank/MCS 预热后连续帧不再发生这些缓冲区的容量增长；
 - 完整动态链路输出同步、FFT+CSI、检测+自适应、控制头+LDPC/CRC、仿真诊断和总耗时；真值 NMSE/EVM 诊断明确排除在接收算法耗时之外；
 - 固定最大 8 流存储的通用 1×1 到 8×8 ZF/MMSE Cholesky 检测器；2×2 继续保留专用快速路径；
+- 独立Rank-4高阶QAM OFDM算法闭环：4路FFT/CP、指数Toeplitz/Kronecker相关TDL、16路FDM导频LS-CSI和4×4 MMSE；默认密集导频网格每端口间隔8，避免稀疏CSI误差被Rank-4求解放大；
+- Rank-4已接入正式控制头、四端口发送网格、软控制译码、生产LDPC/CRC链路；固定三径相关TDL的正式帧回归以CRC和逐字节负载一致性为最终判据；
+- Rank-4完整三符号时域闭环：端口0 ZC前导、四路联合SEARCH/TRACK/REACQUIRE定时、CP-CFO、20 ppm SFO相位校正、4×4 TDL/CSI/MMSE以及LDPC/CRC；
 - 与当前正式 Rank-1/2 高阶 QAM 网格对齐的 2×2 已知波形感知信道估计，以及 64 帧距离-多普勒处理；
 - 与 Python v2 黄金向量逐项核对资源索引、控制字段、14 个码块的扰码/交织结果、2432 个 QAM 符号、频域网格，以及两个数据 OFDM 符号的全部 4608 个时域复采样点。
 
-动态帧库已经能真正按控制头切换 Rank/MCS，并可通过 `DynamicLinkReceiverState` 在连续调用间保持滤波 CSI；现有 `openisac_phy_diagnostics` 为保持历史 FER 曲线可比，仍固定发送 Rank 2/64-QAM，它输出的 Rank/MCS 是下一帧建议。尚未接入独立核心的是 4/8 发射端口的完整导频与资源网格、跨进程 CSI 状态持久化、网络实时 I/O 和最终 `libyunsdr` 采集适配器。4×4/8×8 检测内核已经迁入并通过无噪声数值回归。
+动态帧库已经能按控制头切换 Rank 1/2/4 与 MCS，并可通过 `DynamicLinkReceiverState` 在现有2×2连续链路调用间保持滤波 CSI；现有 `openisac_phy_diagnostics` 为保持历史 FER 曲线可比，仍固定发送 Rank 2/64-QAM，它输出的 Rank/MCS 是下一帧建议。Rank-4已完成四通道ZC同步、CFO/SFO、连续帧TDL多普勒、导频估计、MMSE、软解调、LDPC、CRC和16链路距离–多普勒感知闭环，并已接入可复用接收工作区、持久LDPC线程池及Windows视频信道仿真桥。统一硬件采集类、4×4阵列角度估计、8发射端口完整网格、跨进程CSI状态持久化和最终 `libyunsdr` 采集适配器尚未完成。
+
+4×4第一阶段可执行 `cpp_phy\run_cpp_4x4_diagnostics.cmd`。默认Rank-4/64-QAM、45 dB、Tx/Rx相关系数0.2和三径TDL的10帧回归得到17,920个QAM符号、未编码BER 0.00505、EVM 6.59%、完美CSI EVM 4.35%、CSI NMSE −41.72 dB；CSV和四层星座图位于 `measurement\cpp_4x4_diagnostics`。该入口尚不包含正式控制头、前导、CFO/SFO或LDPC/CRC，详细边界和下一步见根目录 `4x4_MIMO设计与第一阶段验证.md`。
+
+4×4第二阶段正式帧可执行 `cpp_phy\run_cpp_4x4_formal_diagnostics.cmd`。默认Rank-4/64-QAM、50 dB、4帧满载，每帧1132字节和18个LDPC块；固定回归得到控制头/CRC/负载一致性4/4/4、syndrome失败0、前向BER 0.0039、EVM 6.07%、CSI NMSE −41.01 dB。该入口仍不包含ZC前导、CFO/SFO和视频UDP。
+
+4×4第三阶段时域入口为 `cpp_phy\run_cpp_4x4_time_diagnostics.cmd`。默认5帧满载、300 Hz CFO、20 ppm SFO及每帧1点定时漂移，第一帧全搜索，后续帧使用最多5个候选点的TRACK窗口。命令默认使用12个持久LDPC工作线程，也可用 `--ldpc-threads 1..19` 覆盖。输出位于 `measurement\cpp_4x4_time_diagnostics`。
+
+Rank-4接收器现在复用FFT、网格、CSI、LLR和译码工作区，并用持久线程池并行18个LDPC码块。50帧VS2019 Release、12线程复测为50/50帧CRC及负载通过，接收均值856.5 us、P50 820.9 us、P99 974.4 us；相对原单线程/临时分配基线的均值提升1.76倍。同步、FFT+SFO、CSI、控制/MIMO检测、软解映射和FEC平均分别为55.3、62.8、122.0、236.3、98.4和281.7 us；LDPC实际最多迭代2次，预热后接收工作区和LDPC工作区扩容帧数均为0。相对于225 us空口帧长仍慢约3.8倍。
+
+Rank-4现已增加两槽位 `Rank4TimePipeline`：调用线程按帧序完成同步、CSI、4×4 MMSE和软解映射，后台单消费者使用固定LDPC线程池完成译码、打包和CRC；结果按提交顺序返回，异常按帧延迟抛出。200帧/12线程回归CRC及载荷200/200通过、预热后扩容0；串行接收均值810.9 us，前端均值/P50/P99为534.7/532.1/563.4 us，FEC为283.7/284.7/364.6 us。按未来四路IQ直接输入估算，双缓冲服务周期由约810.9 us降到受前端限制的534.7 us；当前基准的实际仿真间隔还包含发射和TDL生成，为4136.0 us降至3463.3 us（1.19倍），不能把534.7 us描述为已经测得的硬件输入吞吐。运行 `cpp_phy\run_cpp_4x4_time_pipeline_benchmark.cmd 200 12`。
 
 ## VS2019 一键构建
 
@@ -278,7 +291,7 @@ cpp_phy\run_cpp_capture_io_benchmark.cmd 10000
 
 ### 最新物理层感知
 
-`sensing.hpp`/`sensing.cpp` 在同步、去CP和FFT之后接收当前正式帧的已知发送网格与双路接收网格。原工程感知估计采用 `conj(TX) * RX`，只适合单位幅度QPSK；新实现对两个数据OFDM符号执行轻量2×2已知波形LS，因此不会把16/64/256-QAM的幅度变化误当成信道变化。单端口导频/控制RE直接相除，病态或单端口空洞在有效带内线性插值。热路径复用频响、掩码和插值工作区，不使用迭代算法、MUSIC或大矩阵求逆。
+`sensing.hpp`/`sensing.cpp` 在同步、去CP和FFT之后接收当前正式帧的已知发送/接收网格，或直接接收已经估计的MIMO频响。2×2路径对两个数据OFDM符号执行轻量已知波形LS；Rank-4路径使用通信接收器的FDM导频信道估计，对16条Tx→Rx链路分别进行距离IFFT和慢时间多普勒FFT，最后非相干累加功率。这样不要求跨射频链相位校准，也不使用迭代算法、MUSIC或大矩阵求逆。
 
 现已加入可选慢时间复均值静态杂波抑制和积分图二维CA-CFAR。默认训练窗为多普勒3、距离4，保护窗均为1，虚警概率 `1e-5`，检测后执行2×2 bin非极大值抑制；默认只搜索循环距离IFFT的非负延迟半区，避免把负延迟镜像报告成超远目标。关闭杂波抑制可保留静止目标，打开后用于抑制零多普勒直达泄漏或固定反射。
 
@@ -307,7 +320,7 @@ cpp_phy\run_cpp_sensing_plot.cmd 50
 5. 增加双接收通道联合与角度估计，再评估4×4/8×8感知资源网格。
 ## Windows VLC 视频信道仿真
 
-`openisac_phy_video_bridge` 接收本机 UDP 50000 的 MPEG-TS 数据报，将其分片后逐片通过当前完整的 Rank-2/64-QAM、空间相关TDL/AWGN/CFO/SFO、MMSE、LDPC/CRC 链路，并把完整恢复的数据报发送到 UDP 50001。任一分片 CRC 失败时丢弃整个输入数据报。视频桥默认发射/接收相关系数均为0.2，可用 `--tx-correlation`、`--rx-correlation` 和 `--spatial-seed` 手动设置。
+`openisac_phy_video_bridge` 接收本机 UDP 50000 的 MPEG-TS 数据报，将其分片后逐片通过当前完整的 Rank-1/2/4、QPSK/16/64/256-QAM、空间相关TDL/AWGN/CFO/SFO、MRC/MMSE、LDPC/CRC 链路，并把完整恢复的数据报发送到 UDP 50001。任一分片 CRC 失败时丢弃整个输入数据报。Rank-1/2走原2x2动态流水，Rank-4走4x4两槽位时域流水，默认仍为Rank-2，因此旧命令向下兼容。视频桥支持`--pilot-mode fdm|nr-dmrs`；默认`fdm`为原3符号/225 us帧，`nr-dmrs`为ZC+2个兼容Rank-1/2/4的前置DM-RS+2个数据符号，共5符号/375 us。视频桥默认发射/接收相关系数均为0.2，可用 `--tx-correlation`、`--rx-correlation` 和 `--spatial-seed` 手动设置。
 
 不依赖 VLC 的逐字节回环测试：
 
@@ -321,13 +334,23 @@ cpp_phy\test_video_channel_sim.cmd
 cpp_phy\start_vlc_video_demo.cmd "D:\video\sample.mp4" 1500 45
 ```
 
-带手动Rank/MCS、信道参数和实时Python监视窗口的一键入口：
+带手动Rank/MCS和信道参数的一键入口：
 
 ```bat
 cpp_phy\manual_video_phy_test.cmd
 ```
 
-实时监视器由C++低频输出快照、Python/Tkinter+NumPy绘图，显示两层星座、一帧时域波形、四路2x2信道估计、EVM、频偏/SFO/定时估计、FER、信道条件数中位/P90和病态子载波比例，以及相干距离-速度热力图和CFAR目标。星座遥测按当前帧实际LDPC块数截断，不显示固定标签0的帧尾填充RE，避免短分片在64-QAM右上角形成误导性聚团；状态同时记录有效和排除符号数。视频TDL支持可选第四字段多普勒Hz：`delay:gain_db:phase_deg[:doppler_hz]`。默认每两秒额外处理一个128帧感知批次，速度bin间隔约0.897 m/s；其余时间不运行感知FFT。它会自动使用Codex随项目提供的Python环境，不要求系统存在 `py` 或把 `python` 加入PATH。
+实时监视器由C++低频输出快照、Python/Tkinter+NumPy绘图。Rank-1/2显示两层星座和四路2x2信道响应；Rank-4显示四层星座、4条对角信道响应，并用完整16链路生成距离–速度热力图和CFAR目标。Rank-2/4均显示信道条件数中位/P90和病态子载波比例。两种路径都显示导频模式/帧长、一帧时域波形、EVM、频偏/SFO/定时估计和FER。星座遥测按当前帧实际LDPC块数截断，不显示固定标签0的帧尾填充RE。视频TDL支持 `delay:gain_db:phase_deg[:doppler_hz]`，Rank-4按所选225或375 us仿真帧时间推进多普勒相位。默认每两秒额外处理一个128帧感知批次；其余时间不运行感知FFT。脚本自动使用项目Python环境；Rank-4自动使用12个LDPC线程并把VLC转码到默认1000 kbit/s。
+
+统一DM-RS显式回归在Rank-1/2/4、64-QAM、45 dB、300 Hz CFO、20 ppm SFO、相关系数0.02下各运行30个UDP包，全部逐字节恢复且FER为0。Rank-4相同固定种子100帧中，FDM与DM-RS的EVM为6.562%/7.082%，预FEC BER为0.005047/0.004446，均100/100 CRC通过；DM-RS接收均值986.250 us，高于FDM的838.996 us。DM-RS五符号帧的理论净空口吞吐是三符号FDM帧的60%。
+
+Rank-4视频感知综合回归使用64-QAM、45 dB、300 Hz CFO、20 ppm SFO和含69.444 Hz运动路径的空间相关三径：80个UDP包、160个PHY帧全部恢复，FER 0；128帧16链路合并得到87.830 m、69.444 Hz、1.795 m/s，CFAR显示目标1个。四层星座各756点、3508点时域波形、完整16链路CSV和Python `--check` 均通过。
+
+Rank-4/64-QAM默认信道条件下的30包回归得到60个PHY帧、FER 0、30/30逐字节恢复，平均完整仿真处理约3.892 ms/帧；这证明离线视频字节闭环正确，不代表满足225 us实时空口周期。Rank-2和Rank-1旧路径同时完成兼容回归且FER为0。
+
+Rank-4默认启用两个相位对齐数据符号的CSI帧内平均，并采用0.5倍导频残余MMSE加载。45 dB、300 Hz CFO、20 ppm SFO、相关系数0.02的500帧固定种子对照中，EVM由6.938%降至6.605%，预FEC BER由0.005709降至0.005088，500/500帧CRC通过；接收均值增加约13.6 us。`openisac_phy_4x4_time_diagnostics.exe` 可用 `--mmse-scale` 和 `--intra-frame-average` 复现实验。
+
+STBC在架构上可兼容，但应独立于Rank空间复用字段：当前Python模型已有2Tx Alamouti STBC/SFBC，C++正式视频链路尚未实现STBC。后续将采用独立的MIMO模式选择，STBC固定单数据流和两时隙合并，避免把Rank-2空间复用误当成STBC；4Tx正交STBC因码率/复杂度折衷暂不作为首选。
 
 `manual_video_phy_test.cmd` 会等待视频发送完成；发送端正常结束后先等待物理层遥测静默至少3秒以排空入口队列和VLC缓存，再自动关闭本次测试启动的发送/接收VLC、Python监视器和物理层桥接器。接收VLC被关闭、桥接器退出或用户按 `Ctrl+C` 时直接清理。清理按进程ID执行，不影响测试前已经运行的其他VLC实例。
 

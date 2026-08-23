@@ -263,8 +263,8 @@ class LiveMonitor:
         self.refresh_ms = max(200, int(refresh_seconds * 1000.0))
         self.root = tk.Tk()
         self.root.title("OpenISAC 实时物理层监视器")
-        self.root.geometry("1500x980")
-        self.root.minsize(1100, 760)
+        self.root.geometry("1720x920")
+        self.root.minsize(1280, 720)
         self.root.configure(background=COLORS["background"])
         self.root.attributes("-topmost", True)
         self.root.after(1800, lambda: self.root.attributes("-topmost", False))
@@ -279,22 +279,23 @@ class LiveMonitor:
         body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         for row in range(2):
             body.rowconfigure(row, weight=1)
-        for column in range(3):
+        for column in range(4):
             body.columnconfigure(column, weight=1)
-        self.layer0 = Plot(body, "星座图 · Layer 0")
-        self.layer1 = Plot(body, "星座图 · Layer 1")
+        self.layers = [Plot(body, f"星座图 · Layer {layer}") for layer in range(4)]
         self.waveform = Plot(body, "接收时域波形")
-        self.channel = Plot(body, "2×2 信道估计幅频响应")
+        self.channel = Plot(body, "MIMO 信道估计幅频响应")
         self.sensing = Plot(body, "动态感知 · 距离–速度图 / CFAR")
         self.metrics = tk.Label(
             body, justify="left", anchor="nw", background=COLORS["panel"],
             foreground=COLORS["text"], font=("Consolas", 10), padx=18, pady=14,
             relief="solid", borderwidth=1,
         )
-        for widget, row, column in (
-            (self.layer0, 0, 0), (self.layer1, 0, 1), (self.waveform, 0, 2),
-            (self.channel, 1, 0), (self.sensing, 1, 1), (self.metrics, 1, 2),
-        ):
+        widgets = [(plot, 0, layer) for layer, plot in enumerate(self.layers)]
+        widgets += [
+            (self.waveform, 1, 0), (self.channel, 1, 1),
+            (self.sensing, 1, 2), (self.metrics, 1, 3),
+        ]
+        for widget, row, column in widgets:
             widget.grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
         self.last_snapshot = ""
 
@@ -326,23 +327,29 @@ class LiveMonitor:
         assert isinstance(sensing_detections, list)
 
         age = max(0.0, time.time() - number(status, "snapshot_epoch_ms") / 1000.0)
+        rank = int(number(status, "rank", 1.0))
+        condition_text = (
+            f"条件数 {number(status, 'channel_condition_median'):.2f}/"
+            f"{number(status, 'channel_condition_p90'):.2f}"
+        )
         self.header.configure(
             text=(
                 f"OpenISAC  Rank-{status.get('rank', '?')} / {status.get('modulation', '?')}   "
                 f"FFT/CP {status.get('fft_size', '?')}/{status.get('cp_length', '?')}   "
                 f"SNR {number(status, 'snr_db'):.1f} dB   "
-                f"条件数 {number(status, 'channel_condition_median'):.2f}/"
-                f"{number(status, 'channel_condition_p90'):.2f}   "
+                f"{condition_text}   "
                 f"帧 {int(number(status, 'frame_id')):,}   刷新延迟 {age:.1f} s"
             ),
             foreground=COLORS["text"],
         )
 
-        for layer, plot in ((0, self.layer0), (1, self.layer1)):
+        for layer, plot in enumerate(self.layers):
             selected = [row for row in constellation_rows if int(row["layer"]) == layer]
             if not selected:
                 plot.axes("同相 I", "正交 Q")
-                plot.create_text(170, 110, text="Rank-1 模式无 Layer 1", fill=COLORS["muted"])
+                plot.create_text(
+                    170, 110, text=f"Rank-{rank} 模式无 Layer {layer}",
+                    fill=COLORS["muted"])
                 continue
             plot.constellation(
                 np.asarray([float(row["ideal_i"]) for row in selected]),
@@ -363,15 +370,20 @@ class LiveMonitor:
         fft = np.asarray([int(row["fft"]) for row in channel_rows])
         order = np.fft.fftshift(np.arange(len(fft)))
         centered = np.arange(-len(fft) // 2, len(fft) // 2)
-        channel_complex: dict[str, np.ndarray] = {}
         channel_series = []
-        for link, color in (("h00", COLORS["cyan"]), ("h01", COLORS["yellow"]),
-                            ("h10", COLORS["green"]), ("h11", COLORS["purple"])):
+        links = (
+            (("h00", COLORS["cyan"]), ("h11", COLORS["yellow"]),
+             ("h22", COLORS["green"]), ("h33", COLORS["purple"]))
+            if rank == 4 else
+            (("h00", COLORS["cyan"]), ("h01", COLORS["yellow"]),
+             ("h10", COLORS["green"]), ("h11", COLORS["purple"]))
+        )
+        self.channel.title = f"{rank}×{rank} 信道估计幅频响应"
+        for link, color in links:
             values = np.asarray([
                 complex(float(row[f"{link}_i"]), float(row[f"{link}_q"]))
                 for row in channel_rows
             ])
-            channel_complex[link] = values
             magnitude = 20.0 * np.log10(np.maximum(np.abs(values[order]), 1e-9))
             channel_series.append((centered, magnitude, color, link.upper()))
         self.channel.line_plot(channel_series, "子载波索引", "幅度 dB")
@@ -380,15 +392,25 @@ class LiveMonitor:
         range_spacing = number(status, "sensing_range_spacing_m")
         packets_in = int(number(status, "udp_packets_in"))
         packets_out = int(number(status, "udp_packets_out"))
+        mimo_metrics = (
+            f"条件数 中位/P90     {number(status, 'channel_condition_median'):7.2f} / "
+            f"{number(status, 'channel_condition_p90'):7.2f}\n"
+            f"病态子载波 >10      {number(status, 'ill_conditioned_subcarrier_percent'):9.2f} %\n"
+        )
+        if rank == 4:
+            mimo_metrics += (
+                f"感知功率合并链路    {int(number(status, 'sensing_link_count')):9d}\n"
+            )
         metrics_text = (
             "实时测量\n\n"
+            f"导频/帧             {status.get('pilot_mode', 'fdm'):>9s} / "
+            f"{int(number(status, 'frame_symbols')):d} 符号, "
+            f"{number(status, 'frame_period_us'):.0f} us\n"
             f"EVM                 {number(status, 'evm_percent'):9.3f} %\n"
             f"信道估计 NMSE       {number(status, 'channel_nmse_db'):9.3f} dB\n"
             f"空间相关 Tx/Rx      {number(status, 'tx_spatial_correlation'):7.3f} / "
             f"{number(status, 'rx_spatial_correlation'):7.3f}\n"
-            f"条件数 中位/P90     {number(status, 'channel_condition_median'):7.2f} / "
-            f"{number(status, 'channel_condition_p90'):7.2f}\n"
-            f"病态子载波 >10      {number(status, 'ill_conditioned_subcarrier_percent'):9.2f} %\n"
+            f"{mimo_metrics}"
             f"频偏 真值/估计      {number(status, 'cfo_true_hz'):7.2f} / "
             f"{number(status, 'cfo_estimated_hz'):7.2f} Hz\n"
             f"频偏估计误差        {number(status, 'cfo_error_hz'):9.3f} Hz\n"

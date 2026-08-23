@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)][string]$VideoFile,
-    [Parameter(Position = 1)][ValidateSet(1, 2)][int]$Rank = 2,
+    [Parameter(Position = 1)][ValidateSet(1, 2, 4)][int]$Rank = 2,
     [Parameter(Position = 2)][ValidateSet('QPSK', '16QAM', '64QAM', '256QAM')][string]$Modulation = '64QAM',
     [Parameter(Position = 3)][double]$SnrDb = 45,
     [Parameter(Position = 4)][double]$CfoHz = 300,
@@ -10,7 +10,9 @@ param(
     [Parameter(Position = 8)][ValidateRange(0.2, 3600)][double]$RefreshSeconds = 2,
     [Parameter(Position = 9)][ValidateRange(0, 512)][int]$SensingCoherentFrames = 128,
     [Parameter(Position = 10)][ValidateRange(-0.95, 0.95)][double]$TxCorrelation = 0.2,
-    [Parameter(Position = 11)][ValidateRange(-0.95, 0.95)][double]$RxCorrelation = 0.2
+    [Parameter(Position = 11)][ValidateRange(-0.95, 0.95)][double]$RxCorrelation = 0.2,
+    [Parameter(Position = 12)][ValidateRange(250, 5000)][int]$VideoBitrateKbps = 1000,
+    [Parameter(Position = 13)][ValidateSet('fdm', 'nr-dmrs')][string]$PilotMode = 'fdm'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +23,14 @@ if ($interactive) {
     $defaultVideo = Get-ChildItem -LiteralPath $repositoryRoot -Filter '1920x1080_2Mbps_2.mp4' -File -Recurse |
         Select-Object -First 1
     if ($null -ne $defaultVideo) { $VideoFile = $defaultVideo.FullName }
+    if ($null -eq $defaultVideo) {
+        # Keep this Windows PowerShell 5.1 script ASCII-only. UTF-8 files
+        # without a BOM are otherwise decoded using the legacy ANSI code page.
+        $videoSourceDirectoryName = [string][char]0x89C6 + [char]0x9891 + [char]0x6E90
+        $defaultVideo = Get-ChildItem -LiteralPath (Join-Path $repositoryRoot $videoSourceDirectoryName) -Filter '*.mp4' -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $defaultVideo) { $VideoFile = $defaultVideo.FullName }
+    }
 }
 
 function Read-DefaultValue {
@@ -41,7 +51,7 @@ if ($interactive) {
     Write-Host 'Press Enter to keep each default value.'
     Write-Host ''
     $VideoFile = Read-DefaultValue 'Video file' $VideoFile
-    $Rank = [int](Read-DefaultValue 'Spatial Rank, 1 or 2' ([string]$Rank))
+    $Rank = [int](Read-DefaultValue 'Spatial Rank, 1, 2 or 4' ([string]$Rank))
     $Modulation = Read-DefaultValue 'Modulation QPSK/16QAM/64QAM/256QAM' $Modulation
     $SnrDb = [double](Read-DefaultValue 'SNR dB' ([string]$SnrDb))
     $CfoHz = [double](Read-DefaultValue 'Carrier frequency offset Hz' ([string]$CfoHz))
@@ -52,13 +62,19 @@ if ($interactive) {
     $SensingCoherentFrames = [int](Read-DefaultValue 'Sensing coherent frames, 0/16/32/64/128/256/512' ([string]$SensingCoherentFrames))
     $TxCorrelation = [double](Read-DefaultValue 'Transmit spatial correlation, -0.95 to 0.95' ([string]$TxCorrelation))
     $RxCorrelation = [double](Read-DefaultValue 'Receive spatial correlation, -0.95 to 0.95' ([string]$RxCorrelation))
+    $VideoBitrateKbps = [int](Read-DefaultValue 'Rank-4 VLC transcoding bitrate kbit/s' ([string]$VideoBitrateKbps))
+    $PilotMode = Read-DefaultValue 'Pilot mode fdm/nr-dmrs' $PilotMode
 }
 
 $allowedModulations = @('QPSK', '16QAM', '64QAM', '256QAM')
-if ($Rank -notin @(1, 2)) { throw 'Rank must be 1 or 2.' }
+if ($Rank -notin @(1, 2, 4)) { throw 'Rank must be 1, 2 or 4.' }
 if ($Modulation.ToUpperInvariant() -notin $allowedModulations) {
     throw 'Modulation must be QPSK, 16QAM, 64QAM or 256QAM.'
 }
+if ($PilotMode.ToLowerInvariant() -notin @('fdm', 'nr-dmrs')) {
+    throw 'Pilot mode must be fdm or nr-dmrs.'
+}
+$PilotMode = $PilotMode.ToLowerInvariant()
 if ($TimingSamples -lt 0 -or $TimingSamples -gt 128) {
     throw 'Timing offset must be between 0 and 128 samples.'
 }
@@ -102,6 +118,7 @@ New-Item -ItemType Directory -Force -Path $telemetry | Out-Null
 $bridgeArguments = @(
     '--rank', [string]$Rank,
     '--modulation', $Modulation,
+    '--pilot-mode', $PilotMode,
     '--fft', '1024',
     '--cp', '128',
     '--subcarrier-spacing', '15000',
@@ -111,20 +128,30 @@ $bridgeArguments = @(
     '--timing', [string]$TimingSamples,
     '--tdl', $Tdl,
     '--queue-packets', '8192',
+    '--workers', $(if ($Rank -eq 4) { '12' } else { '8' }),
+    '--tx-correlation', [string]$TxCorrelation,
+    '--rx-correlation', [string]$RxCorrelation,
+    '--mmse-scale', '0.5',
+    '--spatial-seed', '49239'
+)
+$bridgeArguments += @(
     '--telemetry-dir', (Quote-ProcessArgument $telemetry),
     '--telemetry-interval', [string]$RefreshSeconds,
     '--telemetry-points', '4096',
     '--sensing-coherent', [string]$SensingCoherentFrames,
-    '--sensing-range-bins', '128',
-    '--tx-correlation', [string]$TxCorrelation,
-    '--rx-correlation', [string]$RxCorrelation,
-    '--spatial-seed', '49239'
+    '--sensing-range-bins', '128'
 )
 
 Write-Host ''
 Write-Host "Starting Rank-$Rank / $Modulation, SNR $SnrDb dB, CFO $CfoHz Hz, SFO $SfoPpm ppm" -ForegroundColor Cyan
 Write-Host 'Formal frame: FFT 1024, CP 128, 15 kHz spacing, LDPC + CRC16'
-Write-Host "Dynamic sensing: $SensingCoherentFrames coherent frames; TDL fourth field is Doppler Hz"
+Write-Host "Pilot mode: $PilotMode; frame symbols: $(if ($PilotMode -eq 'nr-dmrs') { 5 } else { 3 })"
+if ($Rank -le 2) {
+    Write-Host "Dynamic sensing: $SensingCoherentFrames coherent frames; TDL fourth field is Doppler Hz"
+} else {
+    Write-Host "Rank-4 sensing: 16-link power combining, $SensingCoherentFrames coherent frames." -ForegroundColor Cyan
+    Write-Host "VLC input will be transcoded to H.264 at $VideoBitrateKbps kbit/s."
+}
 Write-Host "MIMO spatial correlation: Tx=$TxCorrelation, Rx=$RxCorrelation, seed=49239"
 
 Add-Type @'
@@ -206,9 +233,13 @@ try {
         '--no-one-instance', 'udp://@:50001', '--network-caching=500'
     ) -PassThru
     Start-Sleep -Seconds 1
+    $streamOutput = '#standard{access=udp,mux=ts,dst=127.0.0.1:50000}'
+    if ($Rank -eq 4) {
+        $streamOutput = "#transcode{vcodec=h264,vb=$VideoBitrateKbps,acodec=mpga,ab=96,channels=2}:standard{access=udp,mux=ts,dst=127.0.0.1:50000}"
+    }
     $senderProcess = Start-Process -FilePath $vlc -WindowStyle Hidden -ArgumentList @(
         '--intf', 'dummy', '--no-one-instance', (Quote-ProcessArgument $VideoFile),
-        '--sout', '#standard{access=udp,mux=ts,dst=127.0.0.1:50000}',
+        '--sout', $streamOutput,
         '--play-and-exit'
     ) -PassThru
 

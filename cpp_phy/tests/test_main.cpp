@@ -13,9 +13,13 @@
 #include "openisac/ldpc_framing.hpp"
 #include "openisac/mimo2x2.hpp"
 #include "openisac/mimo_nxn.hpp"
+#include "openisac/mimo_nxn_link.hpp"
 #include "openisac/ofdm.hpp"
 #include "openisac/preamble_sync.hpp"
 #include "openisac/qam.hpp"
+#include "openisac/rank4_formal_link.hpp"
+#include "openisac/rank4_time_link.hpp"
+#include "openisac/rank4_time_pipeline.hpp"
 #include "openisac/sampling_offset.hpp"
 #include "openisac/sensing.hpp"
 #include "openisac/tdl_channel.hpp"
@@ -313,6 +317,113 @@ void test_fdm_pilot_channel_estimation() {
         require_complex_close(channel.h10, expected.h10, 1.0e-6f, "pilot LS H10 failed");
         require_complex_close(channel.h11, expected.h11, 1.0e-6f, "pilot LS H11 failed");
     }
+}
+
+void test_nr_dmrs_channel_estimation() {
+    openisac::FormalFrameProfile profile;
+    profile.transmit_rank = 4u;
+    profile.pilot_spacing = 2u;
+    const auto layout = openisac::build_formal_frame_layout(profile);
+    for (const std::size_t ports : {1u, 2u, 4u}) {
+        std::vector<std::complex<float>> reference;
+        openisac::build_nr_dmrs_reference_grid(
+            profile.fft_size, layout.active_fft_indices, ports,
+            0xD4A5u, reference);
+        std::vector<std::complex<float>> received(reference.size());
+        std::array<std::array<std::complex<float>, 4>, 4> truth{};
+        for (std::size_t rx = 0u; rx < ports; ++rx) {
+            for (std::size_t tx = 0u; tx < ports; ++tx) {
+                truth[rx][tx] = {
+                    0.25f + 0.11f * static_cast<float>(rx + 1u) +
+                        0.07f * static_cast<float>(tx),
+                    -0.18f + 0.05f * static_cast<float>(rx) -
+                        0.03f * static_cast<float>(tx)};
+            }
+        }
+        for (std::size_t time = 0u; time < 2u; ++time) {
+            for (const auto fft : layout.active_fft_indices) {
+                float total_power = 0.0f;
+                for (std::size_t tx = 0u; tx < ports; ++tx) {
+                    total_power += std::norm(reference[
+                        (time * profile.fft_size + fft) * ports + tx]);
+                }
+                require_close(total_power, 1.0f, 1.0e-6f,
+                              "NR DM-RS total power normalization failed");
+                for (std::size_t rx = 0u; rx < ports; ++rx) {
+                    std::complex<float> sample{};
+                    for (std::size_t tx = 0u; tx < ports; ++tx) {
+                        sample += truth[rx][tx] * reference[
+                            (time * profile.fft_size + fft) * ports + tx];
+                    }
+                    received[(time * profile.fft_size + fft) * ports + rx] =
+                        sample;
+                }
+            }
+        }
+        std::vector<openisac::ChannelNxN> estimated;
+        openisac::FdmPilotChannelEstimatorWorkspaceNxN workspace;
+        openisac::estimate_nr_dmrs_channel_linear_nxn(
+            received, reference, layout.active_fft_indices, 2u,
+            profile.fft_size, ports, estimated, workspace);
+        for (std::size_t time = 0u; time < 2u; ++time) {
+            for (const auto fft : layout.active_fft_indices) {
+                const auto& channel = estimated[time * profile.fft_size + fft];
+                for (std::size_t rx = 0u; rx < ports; ++rx) {
+                    for (std::size_t tx = 0u; tx < ports; ++tx) {
+                        require_complex_close(
+                            channel.values[
+                                rx * openisac::maximum_spatial_streams + tx],
+                            truth[rx][tx], 2.0e-5f,
+                            "NR DM-RS CDM/OCC channel estimate failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+void test_nr_dmrs_rank_compatibility() {
+    require(
+        std::abs(openisac::formal_frame_period_seconds(
+                     openisac::PilotMode::fdm) - 225.0e-6) < 1.0e-12 &&
+            std::abs(openisac::formal_frame_period_seconds(
+                         openisac::PilotMode::nr_dmrs) - 375.0e-6) < 1.0e-12,
+        "pilot-mode frame periods are inconsistent with FFT/CP sampling");
+    const std::string matrix_root = OPENISAC_MATRIX_DIR;
+    const openisac::Ldpc5041008 codec(
+        openisac::join_path(matrix_root, "LDPC_504_1008.alist"),
+        openisac::join_path(matrix_root, "LDPC_504_1008G.alist"));
+    for (const unsigned rank : {1u, 2u}) {
+        openisac::DynamicLinkSimulationConfig config;
+        config.pilot_mode = openisac::PilotMode::nr_dmrs;
+        config.snr_db = 50.0f;
+        config.cfo_hz = 300.0f;
+        config.sfo_ppm = 20.0f;
+        config.enable_correlated_spatial_tdl = true;
+        config.transmit_spatial_correlation = 0.2f;
+        config.receive_spatial_correlation = 0.2f;
+        config.random_seed = 0xD100u + rank;
+        const auto result = openisac::simulate_dynamic_tdl_frame(
+            {rank, Modulation::qam64}, static_cast<std::uint16_t>(100u + rank),
+            codec, config);
+        require(result.timing_ok && result.header_ok && result.crc_ok &&
+                    result.pilot_mode == openisac::PilotMode::nr_dmrs &&
+                    result.frame_symbols == 5u,
+                "SISO/2x2 NR DM-RS full-link compatibility failed");
+    }
+
+    openisac::Rank4TimeSimulationConfig rank4;
+    rank4.pilot_mode = openisac::PilotMode::nr_dmrs;
+    rank4.snr_db = 50.0f;
+    rank4.cfo_hz = 300.0f;
+    rank4.sfo_ppm = 20.0f;
+    rank4.random_seed = 0xD400u;
+    const auto result = openisac::simulate_rank4_time_frame(404u, rank4, codec);
+    require(result.timing_ok && result.header_ok && result.crc_ok &&
+                result.payload_match &&
+                result.pilot_mode == openisac::PilotMode::nr_dmrs &&
+                result.frame_symbols == 5u,
+            "4x4 NR DM-RS full-link compatibility failed");
 }
 
 void test_sampling_offset() {
@@ -764,6 +875,316 @@ void test_scalable_mimo_detector() {
         1.0e-6f, "generic MMSE disagrees with specialized 2x2 detector");
     require_close(mmse.predicted_mse[0], 1.0f / 6.0f, 1.0e-6f,
                   "generic MMSE predicted MSE failed");
+
+    require_close(
+        openisac::condition_number_nxn(identity), 1.0f, 1.0e-5f,
+        "generic identity condition number failed");
+    openisac::ChannelNxN diagonal;
+    diagonal.streams = 4u;
+    diagonal.values[0u] = {4.0f, 0.0f};
+    diagonal.values[nmax + 1u] = {2.0f, 0.0f};
+    diagonal.values[2u * nmax + 2u] = {1.0f, 0.0f};
+    diagonal.values[3u * nmax + 3u] = {0.5f, 0.0f};
+    require_close(
+        openisac::condition_number_nxn(diagonal), 8.0f, 1.0e-4f,
+        "generic diagonal condition number failed");
+
+}
+
+void test_rank4_ofdm_algorithm_closure() {
+    openisac::NxNOfdmSimulationConfig config;
+    config.streams = 4u;
+    config.frames = 2u;
+    config.bits_per_symbol = 6u;
+    config.snr_db = 45.0f;
+    config.pilot_spacing = 2u;
+    config.transmit_correlation = 0.2f;
+    config.receive_correlation = 0.2f;
+    config.channel_seed = 311383u;
+    const auto result = openisac::simulate_nxn_ofdm_link(config);
+    require(result.streams == 4u, "Rank-4 algorithm closure stream count failed");
+    require(result.pilot_subcarriers == 448u,
+            "Rank-4 dense FDM pilot allocation failed");
+    require(result.data_subcarriers == 448u,
+            "Rank-4 data allocation failed");
+    require(result.detected_symbols == 3584u,
+            "Rank-4 detected symbol count failed");
+    require(result.ber < 0.01f,
+            "Rank-4 uncoded BER exceeds first-stage threshold");
+    require(result.evm_percent < 8.0f,
+            "Rank-4 estimated-CSI EVM exceeds first-stage threshold");
+    require(result.channel_nmse_db < -38.0f,
+            "Rank-4 FDM pilot CSI NMSE exceeds first-stage threshold");
+}
+
+void test_rank4_formal_ldpc_crc_closure() {
+    const std::string matrix_root = OPENISAC_MATRIX_DIR;
+    const openisac::Ldpc5041008 codec(
+        openisac::join_path(matrix_root, "LDPC_504_1008.alist"),
+        openisac::join_path(matrix_root, "LDPC_504_1008G.alist"));
+    openisac::Rank4FormalSimulationConfig config;
+    config.frames = 1u;
+    config.snr_db = 50.0f;
+    config.modulation = Modulation::qam64;
+    const auto result = openisac::simulate_rank4_formal_link(config, codec);
+    require(result.user_payload_bytes_per_frame == 1132u,
+            "Rank-4 formal payload capacity changed");
+    require(result.ldpc_blocks_per_frame == 18u,
+            "Rank-4 formal LDPC capacity changed");
+    require(result.header_passes == 1u,
+            "Rank-4 formal soft control failed");
+    require(result.crc_passes == 1u && result.payload_matches == 1u,
+            "Rank-4 formal LDPC/CRC closure failed");
+    require(result.syndrome_failures == 0u,
+            "Rank-4 formal LDPC syndrome failed");
+    require(result.pre_fec_ber < 0.01f,
+            "Rank-4 formal pre-FEC BER exceeds threshold");
+    require(result.evm_percent < 8.0f,
+            "Rank-4 formal EVM exceeds threshold");
+    require(result.channel_nmse_db < -38.0f,
+            "Rank-4 formal channel NMSE exceeds threshold");
+}
+
+void test_rank4_time_synchronization_closure() {
+    const std::string matrix_root = OPENISAC_MATRIX_DIR;
+    const openisac::Ldpc5041008 codec(
+        openisac::join_path(matrix_root, "LDPC_504_1008.alist"),
+        openisac::join_path(matrix_root, "LDPC_504_1008G.alist"));
+    openisac::Rank4TimeSimulationConfig config;
+    config.snr_db = 50.0f;
+    config.modulation = Modulation::qam64;
+    config.sfo_ppm = 20.0f;
+    config.cfo_hz = 300.0f;
+    config.csi_smoothing_alpha = 1.0f;
+    openisac::Rank4TimeReceiverState state;
+    openisac::Rank4TimeWorkspace workspace;
+    openisac::LdpcFrameDecoder decoder(codec, 4u);
+
+    auto baseline_config = config;
+    baseline_config.snr_db = 45.0f;
+    baseline_config.transmit_correlation = 0.02f;
+    baseline_config.receive_correlation = 0.02f;
+    baseline_config.average_intra_frame_csi = false;
+    baseline_config.mmse_regularization_scale = 1.0f;
+    baseline_config.random_seed = 0x80A0u;
+    auto optimized_config = baseline_config;
+    optimized_config.average_intra_frame_csi = true;
+    optimized_config.mmse_regularization_scale = 0.5f;
+    const auto baseline = openisac::simulate_rank4_time_frame(
+        49000u, baseline_config, codec);
+    const auto optimized = openisac::simulate_rank4_time_frame(
+        49000u, optimized_config, codec);
+    require(baseline.crc_ok && optimized.crc_ok &&
+                optimized.evm_percent < baseline.evm_percent &&
+                optimized.pre_fec_ber <= baseline.pre_fec_ber,
+            "Rank-4 low-complexity EVM optimization regressed");
+
+    for (std::size_t frame = 0u; frame < 3u; ++frame) {
+        config.timing_offset_samples = 20u + frame;
+        config.random_seed = static_cast<std::uint32_t>(0x8100u + frame * 31u);
+        const auto result = openisac::simulate_rank4_time_frame(
+            static_cast<std::uint16_t>(frame), config, codec, &state,
+            &workspace, &decoder);
+        require(result.timing_ok && result.header_ok && result.crc_ok &&
+                    result.payload_match && result.syndrome_failures == 0u,
+                "Rank-4 time-domain synchronization/LDPC closure failed");
+        require(std::abs(result.cfo_error_hz) < 10.0f &&
+                    std::abs(result.residual_sfo_ppm) < 0.1f,
+                "Rank-4 CFO/SFO correction exceeded threshold");
+        require(result.evm_percent < 8.0f,
+                "Rank-4 synchronized EVM exceeded threshold");
+        require(result.pre_fec_ber < 0.01f,
+                "Rank-4 synchronized pre-FEC BER exceeded threshold");
+        require(result.ldpc_worker_threads == 4u,
+                "Rank-4 did not use persistent LDPC worker pool");
+        if (frame > 0u) {
+            require(result.workspace_growths_this_frame == 0u &&
+                        result.ldpc_capacity_growths_this_frame == 0u,
+                    "warmed Rank-4 receive path grew buffers");
+        }
+        if (frame == 0u) {
+            require(result.synchronization_mode_used ==
+                        openisac::Rank4SynchronizationMode::search &&
+                        result.timing_candidates_evaluated > 5u,
+                    "Rank-4 first frame did not perform full search");
+        } else {
+            require(result.synchronization_mode_used ==
+                        openisac::Rank4SynchronizationMode::track &&
+                        !result.tracking_fallback &&
+                        result.timing_candidates_evaluated <= 5u,
+                    "Rank-4 locked frame did not use tracking window");
+        }
+    }
+    config.timing_offset_samples = 31u;
+    config.random_seed = 0x8200u;
+    const auto jump = openisac::simulate_rank4_time_frame(
+        10u, config, codec, &state, &workspace, &decoder);
+    require(jump.timing_ok && jump.header_ok && jump.crc_ok &&
+                jump.payload_match && jump.tracking_fallback &&
+                jump.synchronization_mode_used ==
+                    openisac::Rank4SynchronizationMode::reacquire &&
+                state.reacquisition_count == 1u,
+            "Rank-4 timing jump did not reacquire and preserve payload");
+
+    std::vector<std::uint8_t> video_payload(777u);
+    for (std::size_t index = 0u; index < video_payload.size(); ++index) {
+        video_payload[index] = static_cast<std::uint8_t>(
+            (index * 37u + 19u) & 0xFFu);
+    }
+    config.timing_offset_samples = 31u;
+    config.random_seed = 0x8280u;
+    const auto explicit_payload = openisac::simulate_rank4_time_payload_frame(
+        video_payload, 11u, config, codec, &state, &workspace, &decoder);
+    require(explicit_payload.crc_ok && explicit_payload.payload_match &&
+                explicit_payload.user_payload == video_payload,
+            "Rank-4 explicit video payload did not round-trip byte-for-byte");
+}
+
+void test_rank4_time_double_buffer_pipeline() {
+    const std::string matrix_root = OPENISAC_MATRIX_DIR;
+    const openisac::Ldpc5041008 codec(
+        openisac::join_path(matrix_root, "LDPC_504_1008.alist"),
+        openisac::join_path(matrix_root, "LDPC_504_1008G.alist"));
+    openisac::Rank4TimeSimulationConfig config;
+    config.snr_db = 50.0f;
+    config.modulation = Modulation::qam64;
+    config.sfo_ppm = 20.0f;
+    config.cfo_hz = 300.0f;
+    config.csi_smoothing_alpha = 1.0f;
+    openisac::Rank4TimePipeline pipeline(codec, 4u);
+    for (std::size_t warm = 0u; warm < pipeline.slot_count(); ++warm) {
+        config.random_seed = static_cast<std::uint32_t>(0x8300u + warm * 17u);
+        pipeline.submit(
+            warm, static_cast<std::uint16_t>(50000u + warm), config);
+    }
+    for (std::size_t warm = 0u; warm < pipeline.slot_count(); ++warm) {
+        const auto result = pipeline.receive();
+        require(result.link.crc_ok && result.link.payload_match,
+                "Rank-4 pipeline warm-up failed");
+    }
+
+    constexpr std::size_t frame_count = 4u;
+    std::vector<openisac::Rank4TimePipelineResult> results;
+    results.reserve(frame_count);
+    for (std::size_t frame = 0u; frame < frame_count; ++frame) {
+        if (frame >= pipeline.slot_count()) {
+            results.push_back(pipeline.receive());
+        }
+        config.random_seed = static_cast<std::uint32_t>(0x8400u + frame * 19u);
+        pipeline.submit(
+            frame, static_cast<std::uint16_t>(frame), config);
+    }
+    while (results.size() < frame_count) {
+        results.push_back(pipeline.receive());
+    }
+    for (std::size_t frame = 0u; frame < frame_count; ++frame) {
+        const auto& result = results[frame];
+        require(result.frame_id == frame && result.link.timing_ok &&
+                    result.link.header_ok && result.link.crc_ok &&
+                    result.link.payload_match &&
+                    result.link.syndrome_failures == 0u,
+                "Rank-4 pipeline order/CRC closure failed");
+        require(result.link.ldpc_worker_threads == 4u &&
+                    result.link.workspace_growths_this_frame == 0u &&
+                    result.link.ldpc_capacity_growths_this_frame == 0u,
+                "warmed Rank-4 pipeline grew buffers or lost workers");
+        require(result.timing.receiver_front_us > 0.0 &&
+                    result.timing.fec_wall_us > 0.0 &&
+                    result.timing.latency_us >= result.timing.fec_wall_us,
+                "Rank-4 pipeline timing was not populated");
+    }
+
+    std::vector<std::uint8_t> explicit_payload(991u);
+    for (std::size_t index = 0u; index < explicit_payload.size(); ++index) {
+        explicit_payload[index] = static_cast<std::uint8_t>(
+            (index * 53u + 7u) & 0xFFu);
+    }
+    config.random_seed = 0x8500u;
+    pipeline.submit_payload(100u, explicit_payload, 100u, config);
+    const auto explicit_result = pipeline.receive();
+    require(explicit_result.frame_id == 100u &&
+                explicit_result.link.crc_ok &&
+                explicit_result.link.payload_match &&
+                explicit_result.link.user_payload == explicit_payload,
+            "Rank-4 double-buffer pipeline lost explicit video payload bytes");
+}
+
+void test_rank4_time_sensing_frontend() {
+    const std::string matrix_root = OPENISAC_MATRIX_DIR;
+    const openisac::Ldpc5041008 codec(
+        openisac::join_path(matrix_root, "LDPC_504_1008.alist"),
+        openisac::join_path(matrix_root, "LDPC_504_1008G.alist"));
+    openisac::Rank4TimeSimulationConfig link_config;
+    link_config.snr_db = 50.0f;
+    link_config.modulation = Modulation::qam64;
+    link_config.sfo_ppm = 20.0f;
+    link_config.cfo_hz = 300.0f;
+    link_config.csi_smoothing_alpha = 1.0f;
+    link_config.enable_sensing_snapshot = true;
+    link_config.taps = {
+        {0u, 0.0f, 0.0f, 0.0f},
+        {5u, -3.0f, 27.0f, 69.444444f},
+    };
+    openisac::DynamicSensingConfig sensing_config;
+    sensing_config.transmit_ports = 4u;
+    sensing_config.receive_ports = 4u;
+    sensing_config.coherent_frames = 64u;
+    sensing_config.doppler_fft_size = 64u;
+    sensing_config.enable_static_clutter_suppression = true;
+    sensing_config.cfar_false_alarm_probability = 1.0e-6f;
+    openisac::DynamicSensingProcessor sensing(sensing_config);
+    openisac::Rank4TimeReceiverState state;
+    openisac::Rank4TimeWorkspace workspace;
+    openisac::LdpcFrameDecoder decoder(codec, 4u);
+    std::size_t crc_successes = 0u;
+    for (std::size_t frame = 0u;
+         frame < sensing_config.coherent_frames; ++frame) {
+        link_config.channel_time_seconds = frame * 225.0e-6;
+        link_config.random_seed = static_cast<std::uint32_t>(
+            0x8680u + frame * 31u);
+        const auto result = openisac::simulate_rank4_time_frame(
+            static_cast<std::uint16_t>(frame), link_config, codec,
+            &state, &workspace, &decoder);
+        require(result.sensing_channel_frequency_response.size() ==
+                    16u * 1024u &&
+                    result.sensing_active_subcarrier_mask.size() == 1024u,
+                "Rank-4 sensing snapshot dimensions changed");
+        const bool ready = sensing.push_channel_frame(
+            frame, frame * 225'000u,
+            result.sensing_channel_frequency_response,
+            result.sensing_active_subcarrier_mask);
+        require(ready == (frame + 1u == sensing_config.coherent_frames),
+                "Rank-4 sensing batch completed at the wrong frame");
+        if (result.crc_ok && result.payload_match) {
+            ++crc_successes;
+        }
+    }
+    const auto& result = sensing.last_result();
+    const std::size_t expected_doppler =
+        sensing_config.doppler_fft_size / 2u + 1u;
+    const auto range_error = result.strongest_peak.range_bin > 5u
+        ? result.strongest_peak.range_bin - 5u
+        : 5u - result.strongest_peak.range_bin;
+    const auto doppler_error =
+        result.strongest_peak.doppler_bin > expected_doppler
+        ? result.strongest_peak.doppler_bin - expected_doppler
+        : expected_doppler - result.strongest_peak.doppler_bin;
+    const bool cfar_found = std::any_of(
+        result.detections.begin(), result.detections.end(),
+        [&](const openisac::DynamicSensingDetection& detection) {
+            const auto range_delta = detection.peak.range_bin > 5u
+                ? detection.peak.range_bin - 5u
+                : 5u - detection.peak.range_bin;
+            const auto doppler_delta =
+                detection.peak.doppler_bin > expected_doppler
+                ? detection.peak.doppler_bin - expected_doppler
+                : expected_doppler - detection.peak.doppler_bin;
+            return range_delta <= 1u && doppler_delta <= 1u;
+        });
+    require(crc_successes == sensing_config.coherent_frames &&
+                result.ready && range_error <= 1u && doppler_error <= 1u &&
+                cfar_found,
+            "Rank-4 communication/range-Doppler/CFAR closure failed");
 }
 
 void test_dynamic_rank_mcs_frames() {
@@ -771,17 +1192,26 @@ void test_dynamic_rank_mcs_frames() {
     const openisac::Ldpc5041008 codec(
         openisac::join_path(matrix_root, "LDPC_504_1008.alist"),
         openisac::join_path(matrix_root, "LDPC_504_1008G.alist"));
-    const std::array<LinkMode, 8> modes{{
+    const std::array<LinkMode, 12> modes{{
         {1u, Modulation::qpsk}, {1u, Modulation::qam16},
         {1u, Modulation::qam64}, {1u, Modulation::qam256},
         {2u, Modulation::qpsk}, {2u, Modulation::qam16},
         {2u, Modulation::qam64}, {2u, Modulation::qam256},
+        {4u, Modulation::qpsk}, {4u, Modulation::qam16},
+        {4u, Modulation::qam64}, {4u, Modulation::qam256},
     }};
+    require(openisac::transmit_rank_flag(4u) == 0x02u &&
+                openisac::transmit_rank_from_flags(0x02u) == 4u &&
+                openisac::transmit_rank_from_flags(0x03u) == 0u,
+            "Rank-4/reserved control flag mapping failed");
     std::uint16_t sequence = 100u;
     for (const auto mode : modes) {
         FormalFrameProfile profile;
         profile.transmit_rank = mode.rank;
         profile.bits_per_symbol = openisac::modulation_bits(mode.modulation);
+        if (mode.rank == 4u) {
+            profile.pilot_spacing = 2u;
+        }
         const auto expected_layout = openisac::build_formal_frame_layout(profile);
         std::vector<std::uint8_t> payload(expected_layout.user_payload_bytes);
         for (std::size_t index = 0u; index < payload.size(); ++index) {
@@ -800,8 +1230,34 @@ void test_dynamic_rank_mcs_frames() {
                 "dynamic frame Rank/MCS flags failed");
         require(encoded.payload_symbols.size() == expected_layout.payload_layer_symbols,
                 "dynamic frame payload symbol capacity failed");
-        require(encoded.tx_grid.size() == 2u * 1024u * 2u,
+        const std::size_t physical_ports = mode.rank == 4u ? 4u : 2u;
+        require(encoded.physical_ports == physical_ports,
+                "dynamic frame physical port count failed");
+        require(encoded.tx_grid.size() == 2u * 1024u * physical_ports,
                 "dynamic frame resource grid shape failed");
+        if (mode.rank == 4u) {
+            require(encoded.layout.data_fft_indices.size() == 448u &&
+                        encoded.layout.pilot_fft_indices.size() == 440u &&
+                        encoded.layout.phase_reference_fft_indices.size() == 8u &&
+                        encoded.layout.payload_layer_symbols == 3072u,
+                    "Rank-4 formal resource allocation changed");
+            std::vector<std::complex<float>> reference_grid;
+            openisac::build_dynamic_pilot_reference_grid(
+                0xC057u, mode, reference_grid);
+            require(reference_grid.size() == encoded.tx_grid.size(),
+                    "Rank-4 receiver pilot reference shape failed");
+            for (const auto fft : encoded.layout.pilot_fft_indices) {
+                for (std::size_t time = 0u; time < 2u; ++time) {
+                    for (std::size_t port = 0u; port < physical_ports; ++port) {
+                        const std::size_t index =
+                            (time * 1024u + fft) * physical_ports + port;
+                        require_complex_close(
+                            reference_grid[index], encoded.tx_grid[index], 1.0e-7f,
+                            "Rank-4 receiver pilot reference mismatch");
+                    }
+                }
+            }
+        }
         if (mode.rank == 1u) {
             for (std::size_t payload_index = 0u;
                  payload_index < encoded.layout.payload_time_indices.size();
@@ -2093,6 +2549,8 @@ int main() {
         std::cout << "PASS ZC timing and 2x2 TDL\n";
         test_fdm_pilot_channel_estimation();
         std::cout << "PASS FDM pilot LS channel estimation\n";
+        test_nr_dmrs_channel_estimation();
+        std::cout << "PASS 1/2/4-port NR DM-RS CDM/OCC channel estimation\n";
         test_sampling_offset();
         std::cout << "PASS cubic SFO resampler and phase-slope tracker\n";
         test_formal_golden_vectors();
@@ -2100,11 +2558,23 @@ int main() {
         test_ldpc_reusable_and_parallel_decoder();
         std::cout << "PASS reusable and 4-thread LDPC frame decoder\n";
         test_dynamic_rank_mcs_frames();
-        std::cout << "PASS dynamic Rank-1/2 QPSK/16/64/256-QAM frames\n";
+        std::cout << "PASS dynamic Rank-1/2/4 QPSK/16/64/256-QAM frames\n";
         test_mimo();
         std::cout << "PASS 2x2 ZF/MMSE\n";
         test_scalable_mimo_detector();
         std::cout << "PASS fixed-storage 4x4/8x8 ZF/MMSE\n";
+        test_rank4_ofdm_algorithm_closure();
+        std::cout << "PASS Rank-4 high-order OFDM/pilot/TDL/MMSE closure\n";
+        test_rank4_formal_ldpc_crc_closure();
+        std::cout << "PASS Rank-4 formal soft-control/LDPC/CRC closure\n";
+        test_rank4_time_synchronization_closure();
+        std::cout << "PASS Rank-4 ZC/CFO/SFO continuous time-domain closure\n";
+        test_nr_dmrs_rank_compatibility();
+        std::cout << "PASS SISO/2x2/4x4 NR DM-RS compatibility\n";
+        test_rank4_time_double_buffer_pipeline();
+        std::cout << "PASS two-slot Rank-4 front-end/FEC pipeline\n";
+        test_rank4_time_sensing_frontend();
+        std::cout << "PASS Rank-4 communication/range-Doppler/CFAR closure\n";
         test_link_adaptation();
         std::cout << "PASS Rank/MCS controller\n";
         test_cross_frame_rank_mcs_loop();

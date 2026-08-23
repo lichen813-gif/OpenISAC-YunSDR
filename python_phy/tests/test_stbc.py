@@ -28,4 +28,3 @@ def test_alamouti_total_transmit_power_is_normalized() -> None:
     grid = alamouti_encode_grid(symbols)
     total_power = np.mean(np.sum(np.abs(grid) ** 2, axis=-1))
     assert np.isclose(total_power, 1.0, rtol=0.03)
-

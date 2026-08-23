@@ -17,6 +17,56 @@ int centered_index(std::size_t native, std::size_t fft_size) {
                : static_cast<int>(native);
 }
 
+float dmrs_sign(
+    std::uint32_t seed,
+    int centered_subcarrier,
+    std::size_t group) noexcept {
+    std::uint64_t mixed = static_cast<std::uint64_t>(seed) ^
+        (static_cast<std::uint64_t>(
+             static_cast<std::int64_t>(centered_subcarrier)) *
+         0x85EBCA77ull) ^
+        (static_cast<std::uint64_t>(group) * 0xC2B2AE3Dull);
+    mixed ^= mixed >> 16u;
+    mixed *= 0x7FEB352Dull;
+    mixed ^= mixed >> 15u;
+    return (mixed & 1u) == 0u ? 1.0f : -1.0f;
+}
+
+void validate_active_grid(
+    const std::vector<std::uint16_t>& active,
+    std::size_t fft_size,
+    bool require_pairs) {
+    if (active.empty()) {
+        throw std::invalid_argument("NR DM-RS requires occupied subcarriers");
+    }
+    int previous = -static_cast<int>(fft_size);
+    std::size_t run_length = 0u;
+    for (std::size_t index = 0u; index < active.size(); ++index) {
+        if (active[index] >= fft_size) {
+            throw std::invalid_argument("NR DM-RS subcarrier is outside FFT");
+        }
+        const int centered = centered_index(active[index], fft_size);
+        if (index != 0u && centered <= previous) {
+            throw std::invalid_argument(
+                "NR DM-RS occupied subcarriers must be centered-frequency ordered");
+        }
+        if (index == 0u || centered != previous + 1) {
+            if (require_pairs && run_length != 0u && (run_length & 1u) != 0u) {
+                throw std::invalid_argument(
+                    "NR DM-RS four-port contiguous runs must contain pairs");
+            }
+            run_length = 1u;
+        } else {
+            ++run_length;
+        }
+        previous = centered;
+    }
+    if (require_pairs && (run_length & 1u) != 0u) {
+        throw std::invalid_argument(
+            "NR DM-RS four-port contiguous runs must contain pairs");
+    }
+}
+
 void periodic_linear_grid(
     const std::vector<Point>& sorted,
     int period,
@@ -60,6 +110,56 @@ void periodic_linear_grid(
             : static_cast<std::size_t>(target);
         output[time * static_cast<std::size_t>(period) + native].*component =
             left.second + fraction * (right.second - left.second);
+    }
+}
+
+void periodic_linear_grid_nxn(
+    const std::vector<FdmPilotChannelEstimatorWorkspaceNxN::Point>& sorted,
+    int period,
+    std::size_t time,
+    std::size_t receive_port,
+    std::size_t transmit_port,
+    std::vector<ChannelNxN>& output) {
+    if (sorted.empty()) {
+        throw std::invalid_argument("channel interpolation requires pilot estimates");
+    }
+    const std::size_t component =
+        receive_port * maximum_spatial_streams + transmit_port;
+    if (sorted.size() == 1u) {
+        for (int target = -period / 2; target < period / 2; ++target) {
+            const std::size_t native = target < 0
+                ? static_cast<std::size_t>(target + period)
+                : static_cast<std::size_t>(target);
+            output[time * static_cast<std::size_t>(period) + native]
+                .values[component] = sorted.front().second;
+        }
+        return;
+    }
+    std::size_t upper = 0u;
+    for (int target = -period / 2; target < period / 2; ++target) {
+        while (upper < sorted.size() && sorted[upper].first <= target) {
+            ++upper;
+        }
+        FdmPilotChannelEstimatorWorkspaceNxN::Point left;
+        FdmPilotChannelEstimatorWorkspaceNxN::Point right;
+        if (upper == 0u) {
+            left = {sorted.back().first - period, sorted.back().second};
+            right = sorted.front();
+        } else if (upper == sorted.size()) {
+            left = sorted.back();
+            right = {sorted.front().first + period, sorted.front().second};
+        } else {
+            left = sorted[upper - 1u];
+            right = sorted[upper];
+        }
+        const float fraction = static_cast<float>(target - left.first) /
+                               static_cast<float>(right.first - left.first);
+        const std::size_t native = target < 0
+            ? static_cast<std::size_t>(target + period)
+            : static_cast<std::size_t>(target);
+        output[time * static_cast<std::size_t>(period) + native]
+            .values[component] =
+                left.second + fraction * (right.second - left.second);
     }
 }
 
@@ -166,6 +266,240 @@ void estimate_fdm_pilot_channel_linear_2x2(
             estimates[1][0], period, time, output, &Channel2x2::h10);
         periodic_linear_grid(
             estimates[1][1], period, time, output, &Channel2x2::h11);
+    }
+}
+
+std::vector<ChannelNxN> estimate_fdm_pilot_channel_linear_nxn(
+    const std::vector<std::complex<float>>& receive_grid,
+    const std::vector<std::complex<float>>& transmit_grid,
+    const std::vector<std::uint16_t>& pilot_fft_indices,
+    std::size_t time_symbols,
+    std::size_t fft_size,
+    std::size_t ports) {
+    std::vector<ChannelNxN> output;
+    FdmPilotChannelEstimatorWorkspaceNxN workspace;
+    estimate_fdm_pilot_channel_linear_nxn(
+        receive_grid, transmit_grid, pilot_fft_indices, time_symbols,
+        fft_size, ports, output, workspace);
+    return output;
+}
+
+void estimate_fdm_pilot_channel_linear_nxn(
+    const std::vector<std::complex<float>>& receive_grid,
+    const std::vector<std::complex<float>>& transmit_grid,
+    const std::vector<std::uint16_t>& pilot_fft_indices,
+    std::size_t time_symbols,
+    std::size_t fft_size,
+    std::size_t ports,
+    std::vector<ChannelNxN>& output,
+    FdmPilotChannelEstimatorWorkspaceNxN& workspace) {
+    if (time_symbols == 0u || fft_size == 0u || (fft_size & 1u) != 0u ||
+        ports == 0u || ports > maximum_spatial_streams ||
+        pilot_fft_indices.empty() ||
+        receive_grid.size() != time_symbols * fft_size * ports ||
+        transmit_grid.size() != time_symbols * fft_size * ports) {
+        throw std::invalid_argument(
+            "invalid generic FDM pilot channel-estimation dimensions");
+    }
+    output.assign(time_symbols * fft_size, ChannelNxN{});
+    for (auto& channel : output) {
+        channel.streams = ports;
+    }
+    for (std::size_t time = 0u; time < time_symbols; ++time) {
+        auto& estimates = workspace.estimates;
+        const std::size_t points_per_port =
+            pilot_fft_indices.size() / ports + 1u;
+        for (std::size_t rx = 0u; rx < ports; ++rx) {
+            for (std::size_t tx = 0u; tx < ports; ++tx) {
+                auto& points = estimates[rx][tx];
+                points.clear();
+                if (points.capacity() < points_per_port) {
+                    ++workspace.capacity_growths;
+                    points.reserve(points_per_port);
+                }
+            }
+        }
+        for (const std::size_t pilot : pilot_fft_indices) {
+            if (pilot >= fft_size) {
+                throw std::invalid_argument("pilot index is outside FFT grid");
+            }
+            std::size_t active_tx = ports;
+            std::complex<float> known{};
+            for (std::size_t tx = 0u; tx < ports; ++tx) {
+                const auto value = transmit_grid[
+                    (time * fft_size + pilot) * ports + tx];
+                if (std::abs(value) > 1.0e-7f) {
+                    if (active_tx != ports) {
+                        throw std::invalid_argument(
+                            "FDM pilot tone has multiple active Tx ports");
+                    }
+                    active_tx = tx;
+                    known = value;
+                }
+            }
+            if (active_tx == ports) {
+                throw std::invalid_argument("FDM pilot tone has no active Tx port");
+            }
+            const int centered = centered_index(pilot, fft_size);
+            for (std::size_t rx = 0u; rx < ports; ++rx) {
+                const auto received = receive_grid[
+                    (time * fft_size + pilot) * ports + rx];
+                estimates[rx][active_tx].push_back(
+                    {centered, received / known});
+            }
+        }
+        const auto ordered = [](
+            const FdmPilotChannelEstimatorWorkspaceNxN::Point& left,
+            const FdmPilotChannelEstimatorWorkspaceNxN::Point& right) {
+            return left.first < right.first;
+        };
+        for (std::size_t rx = 0u; rx < ports; ++rx) {
+            for (std::size_t tx = 0u; tx < ports; ++tx) {
+                auto& points = estimates[rx][tx];
+                if (!std::is_sorted(points.begin(), points.end(), ordered)) {
+                    std::sort(points.begin(), points.end(), ordered);
+                }
+                if (points.empty()) {
+                    throw std::invalid_argument(
+                        "FDM pilot allocation misses one Tx port");
+                }
+                periodic_linear_grid_nxn(
+                    points, static_cast<int>(fft_size), time,
+                    rx, tx, output);
+            }
+        }
+    }
+}
+
+void build_nr_dmrs_reference_grid(
+    std::size_t fft_size,
+    const std::vector<std::uint16_t>& active_fft_indices,
+    std::size_t ports,
+    std::uint32_t seed,
+    std::vector<std::complex<float>>& reference_grid) {
+    if (fft_size == 0u || (ports != 1u && ports != 2u && ports != 4u)) {
+        throw std::invalid_argument("NR DM-RS supports 1, 2 or 4 ports");
+    }
+    validate_active_grid(active_fft_indices, fft_size, ports == 4u);
+    reference_grid.assign(2u * fft_size * ports, {});
+    if (ports <= 2u) {
+        const float scale = ports == 1u
+            ? 1.0f : 0.7071067811865475f;
+        for (std::size_t index = 0u; index < active_fft_indices.size(); ++index) {
+            const auto fft = active_fft_indices[index];
+            const float base = dmrs_sign(
+                seed, centered_index(fft, fft_size), index);
+            for (std::size_t time = 0u; time < 2u; ++time) {
+                for (std::size_t tx = 0u; tx < ports; ++tx) {
+                    const float code = tx == 0u || time == 0u ? 1.0f : -1.0f;
+                    reference_grid[(time * fft_size + fft) * ports + tx] =
+                        {base * scale * code, 0.0f};
+                }
+            }
+        }
+        return;
+    }
+
+    // Four ports use two interleaved frequency combs.  Each comb carries two
+    // ports separated by a two-symbol OCC.  Unlike a four-way frequency/time
+    // Walsh block, this does not assume that adjacent subcarriers see exactly
+    // the same channel, which is important for frequency-selective TDL paths.
+    constexpr float scale = 0.7071067811865475f;
+    for (std::size_t index = 0u; index < active_fft_indices.size(); ++index) {
+        const auto fft = active_fft_indices[index];
+        const std::size_t first_tx = (index & 1u) * 2u;
+        const float base = dmrs_sign(
+            seed, centered_index(fft, fft_size), index);
+        for (std::size_t time = 0u; time < 2u; ++time) {
+            reference_grid[(time * fft_size + fft) * ports + first_tx] =
+                {base * scale, 0.0f};
+            reference_grid[
+                (time * fft_size + fft) * ports + first_tx + 1u] =
+                {base * scale * (time == 0u ? 1.0f : -1.0f), 0.0f};
+        }
+    }
+}
+
+void estimate_nr_dmrs_channel_linear_nxn(
+    const std::vector<std::complex<float>>& receive_grid,
+    const std::vector<std::complex<float>>& reference_grid,
+    const std::vector<std::uint16_t>& active_fft_indices,
+    std::size_t data_time_symbols,
+    std::size_t fft_size,
+    std::size_t ports,
+    std::vector<ChannelNxN>& output,
+    FdmPilotChannelEstimatorWorkspaceNxN& workspace) {
+    if (data_time_symbols == 0u || fft_size == 0u ||
+        (ports != 1u && ports != 2u && ports != 4u) ||
+        receive_grid.size() != 2u * fft_size * ports ||
+        reference_grid.size() != receive_grid.size()) {
+        throw std::invalid_argument("invalid NR DM-RS estimator dimensions");
+    }
+    validate_active_grid(active_fft_indices, fft_size, ports == 4u);
+    auto& estimates = workspace.estimates;
+    const std::size_t points_per_port = active_fft_indices.size() + 1u;
+    for (std::size_t rx = 0u; rx < ports; ++rx) {
+        for (std::size_t tx = 0u; tx < ports; ++tx) {
+            auto& points = estimates[rx][tx];
+            points.clear();
+            if (points.capacity() < points_per_port) {
+                points.reserve(points_per_port);
+                ++workspace.capacity_growths;
+            }
+        }
+    }
+
+    const std::size_t group_width = 1u;
+    for (std::size_t index = 0u; index < active_fft_indices.size();
+         index += group_width) {
+        for (std::size_t rx = 0u; rx < ports; ++rx) {
+            for (std::size_t tx = 0u; tx < ports; ++tx) {
+                std::complex<float> matched{};
+                float reference_power = 0.0f;
+                for (std::size_t time = 0u; time < 2u; ++time) {
+                    for (std::size_t frequency = 0u;
+                         frequency < group_width; ++frequency) {
+                        const auto fft = active_fft_indices[index + frequency];
+                        const auto known = reference_grid[
+                            (time * fft_size + fft) * ports + tx];
+                        const auto received = receive_grid[
+                            (time * fft_size + fft) * ports + rx];
+                        matched += std::conj(known) * received;
+                        reference_power += std::norm(known);
+                    }
+                }
+                if (!(reference_power > 0.0f)) {
+                    // In four-port mode this tone belongs to the other
+                    // frequency comb.  The missing point is interpolated from
+                    // this port's neighboring comb tones below.
+                    continue;
+                }
+                const auto estimate = matched / reference_power;
+                for (std::size_t frequency = 0u;
+                     frequency < group_width; ++frequency) {
+                    const auto fft = active_fft_indices[index + frequency];
+                    estimates[rx][tx].push_back(
+                        {centered_index(fft, fft_size), estimate});
+                }
+            }
+        }
+    }
+
+    output.assign(data_time_symbols * fft_size, ChannelNxN{});
+    for (auto& channel : output) {
+        channel.streams = ports;
+    }
+    for (std::size_t rx = 0u; rx < ports; ++rx) {
+        for (std::size_t tx = 0u; tx < ports; ++tx) {
+            if (estimates[rx][tx].empty()) {
+                throw std::runtime_error("NR DM-RS allocation misses one port");
+            }
+            for (std::size_t time = 0u; time < data_time_symbols; ++time) {
+                periodic_linear_grid_nxn(
+                    estimates[rx][tx], static_cast<int>(fft_size), time,
+                    rx, tx, output);
+            }
+        }
     }
 }
 

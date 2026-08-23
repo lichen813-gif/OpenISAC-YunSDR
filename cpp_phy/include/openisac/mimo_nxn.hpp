@@ -29,4 +29,8 @@ DetectionNxN detect_nxn(
     float noise_variance,
     LinearDetector detector);
 
+// Low-rate diagnostic condition number based on the singular values of H.
+// This is intended for telemetry/link adaptation, not the per-RE detector.
+float condition_number_nxn(const ChannelNxN& channel);
+
 }  // namespace openisac

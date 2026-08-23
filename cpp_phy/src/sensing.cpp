@@ -19,7 +19,8 @@ bool is_power_of_two(std::size_t value) {
 
 void validate_config(const DynamicSensingConfig& config) {
     if (config.fft_size == 0u || config.data_symbols != 2u ||
-        config.transmit_ports != 2u || config.receive_ports != 2u ||
+        config.transmit_ports == 0u || config.transmit_ports > 8u ||
+        config.receive_ports == 0u || config.receive_ports > 8u ||
         config.selected_transmit_port >= config.transmit_ports ||
         config.selected_receive_port >= config.receive_ports ||
         config.coherent_frames == 0u ||
@@ -111,6 +112,10 @@ void estimate_dynamic_sensing_channel_2x2(
     const DynamicSensingConfig& config,
     DynamicSensingChannelEstimate& estimate) {
     validate_config(config);
+    if (config.transmit_ports != 2u || config.receive_ports != 2u) {
+        throw std::invalid_argument(
+            "known-waveform grid estimator currently requires 2x2 ports");
+    }
     const std::size_t expected =
         config.data_symbols * config.fft_size * config.transmit_ports;
     const std::size_t expected_receive =
@@ -262,19 +267,25 @@ struct DynamicSensingProcessor::Impl {
     explicit Impl(const DynamicSensingConfig& config_value)
         : config(config_value),
           frequency_history(
-              config.coherent_frames * config.fft_size,
+              config.transmit_ports * config.receive_ports *
+                  config.coherent_frames * config.fft_size,
               std::complex<float>{}),
           range_history(
-              config.coherent_frames * config.range_fft_size,
+              config.transmit_ports * config.receive_ports *
+                  config.coherent_frames * config.range_fft_size,
               std::complex<float>{}),
-          clutter_mean(config.fft_size, std::complex<float>{}),
+          clutter_mean(
+              config.transmit_ports * config.receive_ports * config.fft_size,
+              std::complex<float>{}),
           range_scratch(config.range_fft_size, std::complex<float>{}),
           doppler_scratch(
               config.doppler_fft_size, std::complex<float>{}),
           cfar_integral(
               (config.doppler_fft_size + 1u) *
                   (config.range_fft_size + 1u),
-              0.0) {
+              0.0),
+          combined_power(
+              config.doppler_fft_size * config.range_fft_size, 0.0f) {
         validate_config(config);
         result.range_doppler_map.resize(
             config.doppler_fft_size * config.range_fft_size);
@@ -285,6 +296,72 @@ struct DynamicSensingProcessor::Impl {
         direct_estimates = 0u;
         interpolated_estimates = 0u;
         batch_active_mask.clear();
+        batch_link_count = 0u;
+    }
+
+    bool push_channel_estimates(
+        std::uint64_t capture_sequence,
+        std::uint64_t timestamp,
+        const std::vector<std::complex<float>>& frequency_response,
+        const std::vector<std::uint8_t>& active_subcarrier_mask,
+        std::size_t link_count,
+        std::size_t direct_count,
+        std::size_t interpolated_count) {
+        if (link_count == 0u ||
+            link_count > config.transmit_ports * config.receive_ports ||
+            frequency_response.size() != link_count * config.fft_size ||
+            active_subcarrier_mask.size() != config.fft_size) {
+            throw std::invalid_argument(
+                "dynamic sensing channel snapshot dimensions do not match");
+        }
+        bool reset_batch = false;
+        if (sequence_valid && capture_sequence != last_sequence + 1u &&
+            config.reset_on_sequence_gap) {
+            ++sequence_gap_resets;
+            reset_batch = true;
+        }
+        if (timestamp_valid && timestamp < last_timestamp) {
+            ++timestamp_regressions;
+            reset_batch = true;
+        }
+        if (reset_batch) {
+            clear_batch();
+        }
+        sequence_valid = true;
+        last_sequence = capture_sequence;
+        timestamp_valid = true;
+        last_timestamp = timestamp;
+
+        if (frame_count > 0u &&
+            (batch_active_mask != active_subcarrier_mask ||
+             batch_link_count != link_count)) {
+            clear_batch();
+        }
+        if (frame_count == 0u) {
+            batch_first_sequence = capture_sequence;
+            batch_first_timestamp = timestamp;
+            batch_active_mask = active_subcarrier_mask;
+            batch_link_count = link_count;
+        }
+        for (std::size_t link = 0u; link < link_count; ++link) {
+            std::copy(
+                frequency_response.begin() + static_cast<std::ptrdiff_t>(
+                    link * config.fft_size),
+                frequency_response.begin() + static_cast<std::ptrdiff_t>(
+                    (link + 1u) * config.fft_size),
+                frequency_history.begin() + static_cast<std::ptrdiff_t>(
+                    (link * config.coherent_frames + frame_count) *
+                        config.fft_size));
+        }
+        direct_estimates += direct_count;
+        interpolated_estimates += interpolated_count;
+        ++frame_count;
+        if (frame_count < config.coherent_frames) {
+            return false;
+        }
+        compute_result();
+        clear_batch();
+        return true;
     }
 
     void compute_result() {
@@ -301,75 +378,91 @@ struct DynamicSensingProcessor::Impl {
         if (config.enable_static_clutter_suppression) {
             const float inverse_frames =
                 1.0f / static_cast<float>(config.coherent_frames);
-            for (std::size_t frame = 0u;
-                 frame < config.coherent_frames; ++frame) {
-                for (std::size_t fft = 0u; fft < config.fft_size; ++fft) {
-                    clutter_mean[fft] +=
-                        frequency_history[frame * config.fft_size + fft] *
-                        inverse_frames;
+            for (std::size_t link = 0u; link < batch_link_count; ++link) {
+                for (std::size_t frame = 0u;
+                     frame < config.coherent_frames; ++frame) {
+                    for (std::size_t fft = 0u;
+                         fft < config.fft_size; ++fft) {
+                        clutter_mean[link * config.fft_size + fft] +=
+                            frequency_history[
+                                (link * config.coherent_frames + frame) *
+                                    config.fft_size + fft] *
+                            inverse_frames;
+                    }
                 }
             }
         }
 
-        for (std::size_t frame = 0u;
-             frame < config.coherent_frames; ++frame) {
-            std::fill(range_scratch.begin(), range_scratch.end(),
-                      std::complex<float>{});
-            std::size_t active_index = 0u;
-            const int half = static_cast<int>(config.fft_size / 2u);
-            for (std::size_t order = 0u; order < config.fft_size; ++order) {
-                const int centered = static_cast<int>(order) - half;
-                const std::size_t native = centered_to_native(
-                    centered, config.fft_size);
-                if (batch_active_mask[native] == 0u) {
-                    continue;
-                }
-                const float window = config.enable_range_window
-                    ? hamming(active_index, active_count)
-                    : 1.0f;
-                const std::size_t padded_native = centered >= 0
-                    ? static_cast<std::size_t>(centered)
-                    : static_cast<std::size_t>(
-                        static_cast<int>(config.range_fft_size) + centered);
-                range_scratch[padded_native] =
-                    (frequency_history[frame * config.fft_size + native] -
-                     clutter_mean[native]) *
-                    window;
-                ++active_index;
-            }
-            fft_inplace(range_scratch, true);
-            std::copy(
-                range_scratch.begin(), range_scratch.end(),
-                range_history.begin() + static_cast<std::ptrdiff_t>(
-                    frame * config.range_fft_size));
-        }
-
-        std::fill(
-            result.range_doppler_map.begin(),
-            result.range_doppler_map.end(), std::complex<float>{});
-        for (std::size_t range = 0u;
-             range < config.range_fft_size; ++range) {
-            std::fill(doppler_scratch.begin(), doppler_scratch.end(),
-                      std::complex<float>{});
+        for (std::size_t link = 0u; link < batch_link_count; ++link) {
             for (std::size_t frame = 0u;
                  frame < config.coherent_frames; ++frame) {
-                const float window = config.enable_doppler_window
-                    ? hamming(frame, config.coherent_frames)
-                    : 1.0f;
-                doppler_scratch[frame] =
-                    range_history[frame * config.range_fft_size + range] *
-                    window;
+                std::fill(range_scratch.begin(), range_scratch.end(),
+                          std::complex<float>{});
+                std::size_t active_index = 0u;
+                const int half = static_cast<int>(config.fft_size / 2u);
+                for (std::size_t order = 0u;
+                     order < config.fft_size; ++order) {
+                    const int centered = static_cast<int>(order) - half;
+                    const std::size_t native = centered_to_native(
+                        centered, config.fft_size);
+                    if (batch_active_mask[native] == 0u) {
+                        continue;
+                    }
+                    const float window = config.enable_range_window
+                        ? hamming(active_index, active_count)
+                        : 1.0f;
+                    const std::size_t padded_native = centered >= 0
+                        ? static_cast<std::size_t>(centered)
+                        : static_cast<std::size_t>(
+                            static_cast<int>(config.range_fft_size) + centered);
+                    range_scratch[padded_native] =
+                        (frequency_history[
+                             (link * config.coherent_frames + frame) *
+                                 config.fft_size + native] -
+                         clutter_mean[link * config.fft_size + native]) *
+                        window;
+                    ++active_index;
+                }
+                fft_inplace(range_scratch, true);
+                std::copy(
+                    range_scratch.begin(), range_scratch.end(),
+                    range_history.begin() + static_cast<std::ptrdiff_t>(
+                        (link * config.coherent_frames + frame) *
+                            config.range_fft_size));
             }
-            fft_inplace(doppler_scratch, false);
-            for (std::size_t native = 0u;
-                 native < config.doppler_fft_size; ++native) {
-                const std::size_t shifted =
-                    (native + config.doppler_fft_size / 2u) %
-                    config.doppler_fft_size;
-                result.range_doppler_map[
-                    shifted * config.range_fft_size + range] =
-                    doppler_scratch[native];
+        }
+
+        std::fill(combined_power.begin(), combined_power.end(), 0.0f);
+        for (std::size_t link = 0u; link < batch_link_count; ++link) {
+            for (std::size_t range = 0u;
+                 range < config.range_fft_size; ++range) {
+                std::fill(doppler_scratch.begin(), doppler_scratch.end(),
+                          std::complex<float>{});
+                for (std::size_t frame = 0u;
+                     frame < config.coherent_frames; ++frame) {
+                    const float window = config.enable_doppler_window
+                        ? hamming(frame, config.coherent_frames)
+                        : 1.0f;
+                    doppler_scratch[frame] = range_history[
+                        (link * config.coherent_frames + frame) *
+                            config.range_fft_size + range] * window;
+                }
+                fft_inplace(doppler_scratch, false);
+                for (std::size_t native = 0u;
+                     native < config.doppler_fft_size; ++native) {
+                    const std::size_t shifted =
+                        (native + config.doppler_fft_size / 2u) %
+                        config.doppler_fft_size;
+                    combined_power[
+                        shifted * config.range_fft_size + range] +=
+                        std::norm(doppler_scratch[native]);
+                }
             }
+        }
+        for (std::size_t index = 0u;
+             index < result.range_doppler_map.size(); ++index) {
+            result.range_doppler_map[index] = {
+                std::sqrt(std::max(combined_power[index], 0.0f)), 0.0f};
         }
 
         const float range_spacing = speed_of_light_mps /
@@ -587,11 +680,13 @@ struct DynamicSensingProcessor::Impl {
     std::vector<std::complex<float>> doppler_scratch;
     std::vector<double> cfar_integral;
     std::vector<CfarCandidate> cfar_candidates;
+    std::vector<float> combined_power;
     std::vector<std::uint8_t> batch_active_mask;
     DynamicSensingResult result{};
     std::size_t frame_count = 0u;
     std::size_t direct_estimates = 0u;
     std::size_t interpolated_estimates = 0u;
+    std::size_t batch_link_count = 0u;
     bool sequence_valid = false;
     std::uint64_t last_sequence = 0u;
     bool timestamp_valid = false;
@@ -613,55 +708,30 @@ bool DynamicSensingProcessor::push_frame(
     std::uint64_t timestamp,
     const std::vector<std::complex<float>>& transmit_grid,
     const std::vector<std::complex<float>>& receive_grid) {
-    bool reset_batch = false;
-    if (impl_->sequence_valid && capture_sequence != impl_->last_sequence + 1u) {
-        if (impl_->config.reset_on_sequence_gap) {
-            ++impl_->sequence_gap_resets;
-            reset_batch = true;
-        }
-    }
-    if (impl_->timestamp_valid && timestamp < impl_->last_timestamp) {
-        ++impl_->timestamp_regressions;
-        reset_batch = true;
-    }
-    if (reset_batch) {
-        impl_->clear_batch();
-    }
-    impl_->sequence_valid = true;
-    impl_->last_sequence = capture_sequence;
-    impl_->timestamp_valid = true;
-    impl_->last_timestamp = timestamp;
-
     estimate_dynamic_sensing_channel_2x2(
         transmit_grid, receive_grid, impl_->config,
         impl_->channel_estimate);
-    if (impl_->frame_count > 0u &&
-        impl_->batch_active_mask !=
-            impl_->channel_estimate.active_subcarrier_mask) {
-        impl_->clear_batch();
-    }
-    if (impl_->frame_count == 0u) {
-        impl_->batch_first_sequence = capture_sequence;
-        impl_->batch_first_timestamp = timestamp;
-        impl_->batch_active_mask =
-            impl_->channel_estimate.active_subcarrier_mask;
-    }
-    std::copy(
-        impl_->channel_estimate.frequency_response.begin(),
-        impl_->channel_estimate.frequency_response.end(),
-        impl_->frequency_history.begin() + static_cast<std::ptrdiff_t>(
-            impl_->frame_count * impl_->config.fft_size));
-    impl_->direct_estimates +=
-        impl_->channel_estimate.directly_estimated_subcarriers;
-    impl_->interpolated_estimates +=
-        impl_->channel_estimate.interpolated_subcarriers;
-    ++impl_->frame_count;
-    if (impl_->frame_count < impl_->config.coherent_frames) {
-        return false;
-    }
-    impl_->compute_result();
-    impl_->clear_batch();
-    return true;
+    return impl_->push_channel_estimates(
+        capture_sequence, timestamp,
+        impl_->channel_estimate.frequency_response,
+        impl_->channel_estimate.active_subcarrier_mask, 1u,
+        impl_->channel_estimate.directly_estimated_subcarriers,
+        impl_->channel_estimate.interpolated_subcarriers);
+}
+
+bool DynamicSensingProcessor::push_channel_frame(
+    std::uint64_t capture_sequence,
+    std::uint64_t timestamp,
+    const std::vector<std::complex<float>>& frequency_response,
+    const std::vector<std::uint8_t>& active_subcarrier_mask) {
+    const std::size_t link_count =
+        impl_->config.transmit_ports * impl_->config.receive_ports;
+    const std::size_t active = static_cast<std::size_t>(std::count(
+        active_subcarrier_mask.begin(), active_subcarrier_mask.end(),
+        static_cast<std::uint8_t>(1u)));
+    return impl_->push_channel_estimates(
+        capture_sequence, timestamp, frequency_response,
+        active_subcarrier_mask, link_count, active, 0u);
 }
 
 const DynamicSensingResult&

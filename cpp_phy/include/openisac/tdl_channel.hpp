@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openisac/mimo2x2.hpp"
+#include "openisac/mimo_nxn.hpp"
 
 #include <array>
 #include <complex>
@@ -29,6 +30,22 @@ struct TdlSpatialCorrelationConfig {
     std::uint32_t random_seed = 0xC057u;
 };
 
+struct TdlSpatialCorrelationNxNConfig {
+    std::size_t streams = 4u;
+    // Exponential Toeplitz covariance R[i,j] = rho^abs(i-j).
+    float transmit_correlation = 0.0f;
+    float receive_correlation = 0.0f;
+    std::uint32_t random_seed = 0x4C057u;
+};
+
+struct ImpulseResponseNxN {
+    std::size_t streams = 0u;
+    // Row-major links[receive * maximum_spatial_streams + transmit].
+    std::array<
+        std::vector<std::complex<float>>,
+        maximum_spatial_streams * maximum_spatial_streams> links;
+};
+
 ImpulseResponse2x2 build_deterministic_tdl_2x2(const std::vector<TdlTap>& taps);
 
 // Kronecker model H_l = R_rx^(1/2) W_l R_tx^(1/2). W_l uses a local,
@@ -37,6 +54,13 @@ ImpulseResponse2x2 build_deterministic_tdl_2x2(const std::vector<TdlTap>& taps);
 ImpulseResponse2x2 build_correlated_tdl_2x2(
     const std::vector<TdlTap>& taps,
     const TdlSpatialCorrelationConfig& correlation);
+
+// Generic Kronecker-correlated square MIMO TDL. The Toeplitz covariance and
+// fixed-size Cholesky factors keep the implementation suitable for 4x4/8x8
+// real-time C++ processing.
+ImpulseResponseNxN build_correlated_tdl_nxn(
+    const std::vector<TdlTap>& taps,
+    const TdlSpatialCorrelationNxNConfig& correlation);
 
 // Evaluate a time-varying TDL snapshot without changing path delay or power.
 std::vector<TdlTap> evaluate_tdl_taps(
@@ -54,6 +78,18 @@ void apply_tdl_2x2_symbol(
 
 Channel2x2 tdl_frequency_response(
     const ImpulseResponse2x2& impulse_response,
+    std::size_t fft_index,
+    std::size_t fft_size);
+
+void apply_tdl_nxn_symbol(
+    const std::array<
+        std::vector<std::complex<float>>, maximum_spatial_streams>& transmitted,
+    const ImpulseResponseNxN& impulse_response,
+    std::array<
+        std::vector<std::complex<float>>, maximum_spatial_streams>& received);
+
+ChannelNxN tdl_frequency_response_nxn(
+    const ImpulseResponseNxN& impulse_response,
     std::size_t fft_index,
     std::size_t fft_size);
 

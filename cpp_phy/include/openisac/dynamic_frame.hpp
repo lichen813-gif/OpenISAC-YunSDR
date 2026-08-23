@@ -32,7 +32,9 @@ struct EncodedDynamicFrame {
     std::vector<std::uint8_t> control_labels;
     std::vector<std::uint8_t> payload_labels;
     std::vector<std::complex<float>> payload_symbols;
-    // [two OFDM data symbols][1024 subcarriers][two physical Tx ports]
+    std::size_t physical_ports = 2u;
+    // [two OFDM data symbols][1024 subcarriers][physical Tx ports]. Legacy
+    // Rank-1/2 frames retain two ports; Rank-4 frames use four.
     std::vector<std::complex<float>> tx_grid;
 };
 
@@ -60,10 +62,15 @@ EncodedDynamicFrame encode_dynamic_frame(
     const Ldpc5041008& codec,
     std::uint32_t pilot_seed = 0xC057u);
 
-// Build only the receiver-known FDM pilot and phase-reference REs for the two
-// physical ports. Payload and control REs remain zero.
+// Build only the receiver-known FDM pilot and phase-reference REs. The legacy
+// overload preserves the established two-port Rank-2 reference grid.
 void build_dynamic_pilot_reference_grid(
     std::uint32_t pilot_seed,
+    std::vector<std::complex<float>>& reference_grid);
+
+void build_dynamic_pilot_reference_grid(
+    std::uint32_t pilot_seed,
+    LinkMode mode,
     std::vector<std::complex<float>>& reference_grid);
 
 void prepare_dynamic_frame_llrs(

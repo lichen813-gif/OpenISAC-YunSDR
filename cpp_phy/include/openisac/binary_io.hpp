@@ -36,4 +36,3 @@ inline std::string join_path(const std::string& directory, const std::string& fi
 }
 
 }  // namespace openisac
-

@@ -18,4 +18,3 @@ def test_llr_sign_matches_msb_first_labels() -> None:
         llrs = max_log_llrs(symbols, 0.1, bits_per_symbol)
         expected_bits = labels_to_bits(labels, bits_per_symbol)
         assert np.array_equal(llrs < 0.0, expected_bits.astype(bool))
-

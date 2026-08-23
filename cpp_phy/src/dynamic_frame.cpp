@@ -17,31 +17,37 @@ FormalFrameProfile profile_for_mode(LinkMode mode) {
     FormalFrameProfile profile;
     profile.bits_per_symbol = modulation_bits(mode.modulation);
     profile.transmit_rank = mode.rank;
+    if (mode.rank == 4u) {
+        profile.pilot_spacing = 2u;
+    }
     return profile;
 }
 
 const FormalFrameLayout& cached_layout_for_mode(LinkMode mode) {
     const unsigned bits = modulation_bits(mode.modulation);
-    if ((mode.rank != 1u && mode.rank != 2u) ||
+    if ((mode.rank != 1u && mode.rank != 2u && mode.rank != 4u) ||
         (bits != 2u && bits != 4u && bits != 6u && bits != 8u)) {
         throw std::invalid_argument("unsupported cached Rank/MCS layout");
     }
-    static const std::array<FormalFrameLayout, 8> layouts = [] {
-        std::array<FormalFrameLayout, 8> result;
+    static const std::array<FormalFrameLayout, 12> layouts = [] {
+        std::array<FormalFrameLayout, 12> result;
         constexpr std::array<Modulation, 4> modulations{{
             Modulation::qpsk, Modulation::qam16,
             Modulation::qam64, Modulation::qam256}};
-        for (unsigned rank = 1u; rank <= 2u; ++rank) {
+        constexpr std::array<unsigned, 3> ranks{{1u, 2u, 4u}};
+        for (std::size_t rank_index = 0u; rank_index < ranks.size(); ++rank_index) {
             for (std::size_t modulation = 0u;
                  modulation < modulations.size(); ++modulation) {
-                result[(rank - 1u) * modulations.size() + modulation] =
+                result[rank_index * modulations.size() + modulation] =
                     build_formal_frame_layout(
-                        profile_for_mode({rank, modulations[modulation]}));
+                        profile_for_mode({ranks[rank_index], modulations[modulation]}));
             }
         }
         return result;
     }();
-    return layouts[(mode.rank - 1u) * 4u + bits / 2u - 1u];
+    const std::size_t rank_index = mode.rank == 1u ? 0u :
+        (mode.rank == 2u ? 1u : 2u);
+    return layouts[rank_index * 4u + bits / 2u - 1u];
 }
 
 float pilot_sign(
@@ -139,9 +145,10 @@ EncodedDynamicFrame encode_dynamic_frame(
             SquareQAM::modulate(result.payload_labels[index], bits);
     }
 
-    constexpr std::size_t physical_ports = 2u;
+    const std::size_t physical_ports = mode.rank == 4u ? 4u : 2u;
+    result.physical_ports = physical_ports;
     result.tx_grid.assign(2u * result.profile.fft_size * physical_ports, {});
-    const float payload_scale = mode.rank == 2u ? 0.7071067811865475244f : 1.0f;
+    const float payload_scale = 1.0f / std::sqrt(static_cast<float>(mode.rank));
     for (std::size_t payload = 0u;
          payload < result.layout.payload_time_indices.size(); ++payload) {
         const std::size_t time = result.layout.payload_time_indices[payload];
@@ -183,9 +190,17 @@ EncodedDynamicFrame encode_dynamic_frame(
 void build_dynamic_pilot_reference_grid(
     std::uint32_t pilot_seed,
     std::vector<std::complex<float>>& reference_grid) {
-    FormalFrameProfile profile;
+    build_dynamic_pilot_reference_grid(
+        pilot_seed, {2u, Modulation::qam64}, reference_grid);
+}
+
+void build_dynamic_pilot_reference_grid(
+    std::uint32_t pilot_seed,
+    LinkMode mode,
+    std::vector<std::complex<float>>& reference_grid) {
+    const FormalFrameProfile profile = profile_for_mode(mode);
     const auto layout = build_formal_frame_layout(profile);
-    constexpr std::size_t physical_ports = 2u;
+    const std::size_t physical_ports = mode.rank == 4u ? 4u : 2u;
     constexpr unsigned data_symbols = 2u;
     reference_grid.assign(
         static_cast<std::size_t>(data_symbols) * profile.fft_size *

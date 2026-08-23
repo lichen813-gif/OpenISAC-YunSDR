@@ -72,4 +72,3 @@ def alamouti_combine_grid(
     variance = np.asarray(noise_variance, dtype=np.float64)
     equivalent_variance = np.broadcast_to(variance, gain.shape) / (TX_SCALE**2 * gain)
     return symbols, equivalent_variance
-

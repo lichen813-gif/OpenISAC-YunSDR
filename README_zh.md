@@ -31,6 +31,12 @@ sudo apt install -y build-essential cmake pkg-config \
 
 另外安装 AFF3CT 3.0.2 或更高版本并记下安装前缀。本版本不需要安装 UHD。
 
+## 算法仿真
+
+- Windows C++ PHY：[总体说明](cpp_phy/README.md)、[正式帧结构](Windows_C++_PHY正式帧结构与使用说明.md)、[VLC视频测试](Windows_VLC视频信道仿真使用说明.md)
+- Python黄金模型：[模型与验证说明](python_phy/README.md)
+- 设计路线：[Python MIMO到C++](Python_MIMO到C++实施路线.md)、[4×4/DM-RS验证](4x4_MIMO设计与第一阶段验证.md)
+
 ## 编译
 
 ```bash
@@ -41,6 +47,18 @@ cmake --build build -j"$(nproc)"
 ```
 
 AFF3CT 位于系统标准路径时可省略 `-DAFF3CT_ROOT`。主要产物为 `build/ChannelSimulator`、`build/BS` 和 `build/UE`。
+
+## 仓库结构
+
+| 路径 | 说明 |
+| :--- | :--- |
+| `src/`、`include/` | 核心 C++ PHY、感知、线程与运行时逻辑 |
+| `config/` | BS/UE纯仿真配置样例 |
+| `scripts/` | Python 前端、网页配置控制台、Linux 性能调优脚本 |
+| `python_phy/` | 跨Windows/Linux的纯Python算法模型、配置、实验和单元测试 |
+| `cpp_phy/` | 独立于UHD的C++17 PHY核心、VS2019脚本、基准、视频桥和实时监视器 |
+| `capture/` | 离线感知结果绘图工具 |
+| `docs/` | 项目静态站点，以及架构/信号处理说明页 |
 
 Python 工具环境：
 
