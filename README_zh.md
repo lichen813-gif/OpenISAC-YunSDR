@@ -2,7 +2,7 @@
 
 [English](README.md) | [设计文档](docs/design/README.md) | [更新日志](CHANGELOG.md)
 
-本仓库第一版包含完整的 C++/Python 程序源码、配置文件和中英文设计说明，不包含视频文件。
+本仓库当前版本包含完整的 C++/Python 程序源码、配置文件和中英文设计说明，不包含视频文件。
 
 > 当前后端状态：本版本仅支持软件信道仿真。原 UHD/USRP 实现、编译依赖和硬件配置已全部移除。仓库保留厂商无关的 `RadioBackend` 边界，供后续接入 `libyunsdr`；只有在真实后端实现并验证后，才会更新具体接口名称和配置，当前不预设或虚构 `libyunsdr` API。
 

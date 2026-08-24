@@ -2,7 +2,7 @@
 
 [中文说明](README_zh.md) | [Design documents](docs/design/README.md) | [Changelog](CHANGELOG.md)
 
-This repository contains the complete C++/Python source, configurations, and design documents for the first release. Video files are intentionally excluded.
+This repository contains the complete C++/Python source, configurations, and design documents for the current release. Video files are intentionally excluded.
 
 > Current backend status: this revision is simulation-only. The previous UHD/USRP implementation, build dependency, and hardware presets have been removed. `RadioBackend` remains as a vendor-neutral boundary for future `libyunsdr` integration; concrete `libyunsdr` API names and configuration will be documented only after that backend is implemented and tested.
 
