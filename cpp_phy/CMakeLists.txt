@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(OPENISAC_ENABLE_AVX2 "Enable AVX2 for optimized targets" OFF)
+option(OPENISAC_PHY_LIBRARY_ONLY
+    "Build only the reusable openisac_phy library" OFF)
 set(
     OPENISAC_GOLDEN_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors"
@@ -55,6 +57,10 @@ else()
     if(OPENISAC_ENABLE_AVX2)
         target_compile_options(openisac_phy PRIVATE -mavx2)
     endif()
+endif()
+
+if(OPENISAC_PHY_LIBRARY_ONLY)
+    return()
 endif()
 
 enable_testing()
@@ -242,13 +248,40 @@ if(WIN32)
             /W4 /permissive- /EHsc /fp:precise /Zc:__cplusplus /utf-8)
     endif()
     add_test(
-        NAME openisac_video_rank1_compatibility
+        NAME openisac_video_siso_compatibility
         COMMAND openisac_phy_video_bridge --self-test 5 --rank 1
+                --tx-ports 1 --rx-ports 1 --mimo-mode spatial
                 --modulation 64QAM --snr 45 --sensing-coherent 0)
+    add_test(
+        NAME openisac_video_siso_dmrs_compatibility
+        COMMAND openisac_phy_video_bridge --self-test 5 --rank 1
+                --tx-ports 1 --rx-ports 1 --mimo-mode spatial
+                --modulation 64QAM --pilot-mode nr-dmrs --snr 45
+                --sensing-coherent 0)
+    add_test(
+        NAME openisac_video_stbc_compatibility
+        COMMAND openisac_phy_video_bridge --self-test 5 --rank 1
+                --mimo-mode stbc --modulation 64QAM --snr 45
+                --sensing-coherent 0)
+    add_test(
+        NAME openisac_video_stbc_dmrs_compatibility
+        COMMAND openisac_phy_video_bridge --self-test 5 --rank 1
+                --mimo-mode stbc --modulation 64QAM --pilot-mode nr-dmrs
+                --snr 45 --sensing-coherent 0)
     add_test(
         NAME openisac_video_rank2_compatibility
         COMMAND openisac_phy_video_bridge --self-test 5 --rank 2
                 --modulation 64QAM --snr 45 --sensing-coherent 0)
+    add_test(
+        NAME openisac_video_4port_rank2_compatibility
+        COMMAND openisac_phy_video_bridge --self-test 5 --rank 2
+                --tx-ports 4 --rx-ports 4 --modulation 64QAM
+                --snr 45 --sensing-coherent 0)
+    add_test(
+        NAME openisac_video_4port_rank2_dmrs_compatibility
+        COMMAND openisac_phy_video_bridge --self-test 5 --rank 2
+                --tx-ports 4 --rx-ports 4 --modulation 64QAM
+                --pilot-mode nr-dmrs --snr 45 --sensing-coherent 0)
     add_test(
         NAME openisac_video_rank4_compatibility
         COMMAND openisac_phy_video_bridge --self-test 10 --rank 4

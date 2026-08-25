@@ -889,6 +889,36 @@ void test_scalable_mimo_detector() {
         openisac::condition_number_nxn(diagonal), 8.0f, 1.0e-4f,
         "generic diagonal condition number failed");
 
+    openisac::ChannelNxN physical_identity;
+    physical_identity.streams = 4u;
+    physical_identity.receive_ports = 4u;
+    for (std::size_t port = 0u; port < 4u; ++port) {
+        physical_identity.values[port * nmax + port] = {1.0f, 0.0f};
+    }
+    const auto effective =
+        openisac::apply_fixed_dft_precoder_4x2(physical_identity);
+    require(effective.streams == 2u && effective.receive_ports == 4u,
+            "4x2 precoder produced the wrong rectangular channel shape");
+    require_close(openisac::condition_number_nxn(effective), 1.0f, 1.0e-5f,
+                  "semi-unitary 4x2 precoder condition number failed");
+    const std::array<std::complex<float>, 2> rank2_symbols{{
+        {0.3f, -0.7f}, {-0.2f, 0.5f}}};
+    std::array<std::complex<float>, nmax> four_receive{};
+    constexpr float rank2_scale = 0.70710678118654752440f;
+    for (std::size_t rx = 0u; rx < 4u; ++rx) {
+        for (std::size_t layer = 0u; layer < 2u; ++layer) {
+            four_receive[rx] += effective.values[rx * nmax + layer] *
+                rank2_symbols[layer] * rank2_scale;
+        }
+    }
+    const auto rank2_detected = openisac::detect_nxn(
+        four_receive, effective, 0.0f, LinearDetector::zf);
+    for (std::size_t layer = 0u; layer < 2u; ++layer) {
+        require_complex_close(
+            rank2_detected.symbols[layer], rank2_symbols[layer], 1.0e-6f,
+            "4Rx Rank-2 rectangular ZF recovery failed");
+    }
+
 }
 
 void test_rank4_ofdm_algorithm_closure() {
@@ -978,6 +1008,28 @@ void test_rank4_time_synchronization_closure() {
                 optimized.evm_percent < baseline.evm_percent &&
                 optimized.pre_fec_ber <= baseline.pre_fec_ber,
             "Rank-4 low-complexity EVM optimization regressed");
+
+    auto rank2_config = config;
+    rank2_config.spatial_rank = 2u;
+    rank2_config.snr_db = 45.0f;
+    rank2_config.transmit_correlation = 0.2f;
+    rank2_config.receive_correlation = 0.2f;
+    for (const auto pilot_mode : {
+             openisac::PilotMode::fdm,
+             openisac::PilotMode::nr_dmrs}) {
+        rank2_config.pilot_mode = pilot_mode;
+        rank2_config.random_seed += 0x101u;
+        const auto rank2 = openisac::simulate_rank4_time_frame(
+            static_cast<std::uint16_t>(49100u +
+                (pilot_mode == openisac::PilotMode::nr_dmrs)),
+            rank2_config, codec);
+        require(rank2.spatial_rank == 2u && rank2.timing_ok &&
+                    rank2.header_ok && rank2.crc_ok && rank2.payload_match &&
+                    rank2.syndrome_failures == 0u,
+                "4Tx/4Rx Rank-2 time-domain LDPC/CRC closure failed");
+        require(rank2.evm_percent < 8.0f && rank2.pre_fec_ber < 0.01f,
+                "4Tx/4Rx Rank-2 EVM/BER exceeded threshold");
+    }
 
     for (std::size_t frame = 0u; frame < 3u; ++frame) {
         config.timing_offset_samples = 20u + frame;
@@ -1192,24 +1244,42 @@ void test_dynamic_rank_mcs_frames() {
     const openisac::Ldpc5041008 codec(
         openisac::join_path(matrix_root, "LDPC_504_1008.alist"),
         openisac::join_path(matrix_root, "LDPC_504_1008G.alist"));
-    const std::array<LinkMode, 12> modes{{
+    const std::array<LinkMode, 20> modes{{
         {1u, Modulation::qpsk}, {1u, Modulation::qam16},
         {1u, Modulation::qam64}, {1u, Modulation::qam256},
         {2u, Modulation::qpsk}, {2u, Modulation::qam16},
         {2u, Modulation::qam64}, {2u, Modulation::qam256},
         {4u, Modulation::qpsk}, {4u, Modulation::qam16},
         {4u, Modulation::qam64}, {4u, Modulation::qam256},
+        {1u, Modulation::qpsk, openisac::TransmissionScheme::alamouti_stbc},
+        {1u, Modulation::qam16, openisac::TransmissionScheme::alamouti_stbc},
+        {1u, Modulation::qam64, openisac::TransmissionScheme::alamouti_stbc},
+        {1u, Modulation::qam256, openisac::TransmissionScheme::alamouti_stbc},
+        {2u, Modulation::qpsk,
+         openisac::TransmissionScheme::spatial_multiplexing, 4u},
+        {2u, Modulation::qam16,
+         openisac::TransmissionScheme::spatial_multiplexing, 4u},
+        {2u, Modulation::qam64,
+         openisac::TransmissionScheme::spatial_multiplexing, 4u},
+        {2u, Modulation::qam256,
+         openisac::TransmissionScheme::spatial_multiplexing, 4u},
     }};
     require(openisac::transmit_rank_flag(4u) == 0x02u &&
                 openisac::transmit_rank_from_flags(0x02u) == 4u &&
-                openisac::transmit_rank_from_flags(0x03u) == 0u,
-            "Rank-4/reserved control flag mapping failed");
+                openisac::transmission_mode_flag({
+                    1u, Modulation::qpsk,
+                    openisac::TransmissionScheme::alamouti_stbc}) == 0x03u &&
+                openisac::transmit_rank_from_flags(0x03u) == 1u &&
+                openisac::transmission_scheme_from_flags(0x03u) ==
+                    openisac::TransmissionScheme::alamouti_stbc,
+            "Rank-4/STBC control flag mapping failed");
     std::uint16_t sequence = 100u;
     for (const auto mode : modes) {
         FormalFrameProfile profile;
         profile.transmit_rank = mode.rank;
         profile.bits_per_symbol = openisac::modulation_bits(mode.modulation);
-        if (mode.rank == 4u) {
+        profile.scheme = mode.scheme;
+        if (openisac::physical_transmit_ports(mode) == 4u) {
             profile.pilot_spacing = 2u;
         }
         const auto expected_layout = openisac::build_formal_frame_layout(profile);
@@ -1226,11 +1296,14 @@ void test_dynamic_rank_mcs_frames() {
                 "dynamic frame header block count failed");
         require(openisac::bits_per_symbol_from_flags(encoded.header.flags) ==
                     profile.bits_per_symbol &&
-                    openisac::transmit_rank_from_flags(encoded.header.flags) == mode.rank,
-                "dynamic frame Rank/MCS flags failed");
+                    openisac::transmit_rank_from_flags(encoded.header.flags) == mode.rank &&
+                    openisac::transmission_scheme_from_flags(encoded.header.flags) ==
+                        mode.scheme,
+                "dynamic frame transmission-mode/MCS flags failed");
         require(encoded.payload_symbols.size() == expected_layout.payload_layer_symbols,
                 "dynamic frame payload symbol capacity failed");
-        const std::size_t physical_ports = mode.rank == 4u ? 4u : 2u;
+        const std::size_t physical_ports =
+            openisac::physical_transmit_ports(mode);
         require(encoded.physical_ports == physical_ports,
                 "dynamic frame physical port count failed");
         require(encoded.tx_grid.size() == 2u * 1024u * physical_ports,
@@ -1258,7 +1331,8 @@ void test_dynamic_rank_mcs_frames() {
                 }
             }
         }
-        if (mode.rank == 1u) {
+        if (mode.rank == 1u &&
+            mode.scheme == openisac::TransmissionScheme::spatial_multiplexing) {
             for (std::size_t payload_index = 0u;
                  payload_index < encoded.layout.payload_time_indices.size();
                  ++payload_index) {
@@ -1270,9 +1344,75 @@ void test_dynamic_rank_mcs_frames() {
                     "Rank-1 payload must leave Tx1 silent");
             }
         }
+        if (mode.scheme == openisac::TransmissionScheme::alamouti_stbc) {
+            const std::size_t pairs = encoded.layout.payload_time_indices.size() / 2u;
+            require(encoded.layout.payload_time_indices.size() == pairs * 2u &&
+                        encoded.layout.payload_layer_symbols ==
+                            encoded.layout.payload_time_indices.size(),
+                    "STBC layout must contain equal paired slots");
+            constexpr float scale = 0.70710678118654752440f;
+            for (std::size_t pair = 0u; pair < pairs; ++pair) {
+                const std::size_t second = pair + pairs;
+                const std::size_t data = encoded.layout.payload_data_positions[pair];
+                const std::size_t fft = encoded.layout.data_fft_indices[data];
+                require(encoded.layout.payload_time_indices[pair] == 0u &&
+                            encoded.layout.payload_time_indices[second] == 1u &&
+                            encoded.layout.payload_data_positions[second] == data,
+                        "STBC payload resource pairs changed");
+                require_complex_close(
+                    encoded.tx_grid[fft * 2u],
+                    encoded.payload_symbols[pair] * scale, 1.0e-7f,
+                    "STBC first-slot Tx0 mapping failed");
+                require_complex_close(
+                    encoded.tx_grid[fft * 2u + 1u],
+                    encoded.payload_symbols[second] * scale, 1.0e-7f,
+                    "STBC first-slot Tx1 mapping failed");
+                require_complex_close(
+                    encoded.tx_grid[(1024u + fft) * 2u],
+                    -std::conj(encoded.payload_symbols[second]) * scale, 1.0e-7f,
+                    "STBC second-slot Tx0 mapping failed");
+                require_complex_close(
+                    encoded.tx_grid[(1024u + fft) * 2u + 1u],
+                    std::conj(encoded.payload_symbols[pair]) * scale, 1.0e-7f,
+                    "STBC second-slot Tx1 mapping failed");
+            }
+        }
+        if (physical_ports == 4u && mode.rank == 2u) {
+            constexpr float scale = 0.70710678118654752440f;
+            for (std::size_t payload = 0u;
+                 payload < encoded.layout.payload_time_indices.size(); ++payload) {
+                const std::size_t time =
+                    encoded.layout.payload_time_indices[payload];
+                const std::size_t data =
+                    encoded.layout.payload_data_positions[payload];
+                const std::size_t fft = encoded.layout.data_fft_indices[data];
+                for (std::size_t tx = 0u; tx < 4u; ++tx) {
+                    std::complex<float> expected{};
+                    for (std::size_t layer = 0u; layer < 2u; ++layer) {
+                        expected += openisac::fixed_dft_precoder_4x2(tx, layer) *
+                            encoded.payload_symbols[payload * 2u + layer] * scale;
+                    }
+                    require_complex_close(
+                        encoded.tx_grid[
+                            (time * 1024u + fft) * physical_ports + tx],
+                        expected, 1.0e-7f,
+                        "four-port Rank-2 DFT precoder mapping failed");
+                }
+            }
+        }
         const std::vector<float> variances(encoded.payload_symbols.size(), 1.0e-3f);
-        const auto decoded = openisac::decode_dynamic_frame(
-            encoded.control_labels, encoded.payload_symbols, variances, codec);
+        openisac::DecodedDynamicFrame decoded;
+        if (physical_ports == 4u && mode.rank == 2u) {
+            openisac::PreparedDynamicFrame prepared;
+            openisac::prepare_dynamic_frame_payload_llrs(
+                encoded.header, 1.0f, mode, encoded.payload_symbols,
+                variances, prepared);
+            decoded = openisac::decode_prepared_dynamic_frame(prepared, codec);
+        } else {
+            decoded = openisac::decode_dynamic_frame(
+                encoded.control_labels, encoded.payload_symbols,
+                variances, codec);
+        }
         require(decoded.mode == mode, "dynamic receiver ignored control Rank/MCS");
         require(decoded.header.sequence == sequence,
                 "dynamic receiver sequence mismatch");
@@ -1381,7 +1521,15 @@ void test_dynamic_tdl_receive_chain() {
     config.random_seed = 0x5100u;
     for (const auto mode : {
              LinkMode{1u, Modulation::qam256},
-             LinkMode{2u, Modulation::qam64}}) {
+             LinkMode{2u, Modulation::qam64},
+             LinkMode{1u, Modulation::qpsk,
+                      openisac::TransmissionScheme::alamouti_stbc},
+             LinkMode{1u, Modulation::qam16,
+                      openisac::TransmissionScheme::alamouti_stbc},
+             LinkMode{1u, Modulation::qam64,
+                      openisac::TransmissionScheme::alamouti_stbc},
+             LinkMode{1u, Modulation::qam256,
+                      openisac::TransmissionScheme::alamouti_stbc}}) {
         const auto result = openisac::simulate_dynamic_tdl_frame(
             mode, 0x3210u, codec, config, nullptr, nullptr);
         require(result.timing_ok && result.header_ok,
@@ -1942,6 +2090,90 @@ void test_dynamic_iq_receiver_pipeline() {
     }
     require(rejected_delay,
             "receiver accepted a maximum channel delay outside the CP");
+}
+
+void test_hardware_tx_waveform_receiver_closure() {
+    using openisac::LinkMode;
+    using openisac::Modulation;
+    using openisac::PilotMode;
+    using openisac::TransmissionScheme;
+
+    const std::string matrix_root = OPENISAC_MATRIX_DIR;
+    const openisac::Ldpc5041008 codec(
+        openisac::join_path(matrix_root, "LDPC_504_1008.alist"),
+        openisac::join_path(matrix_root, "LDPC_504_1008G.alist"));
+    const std::array<LinkMode, 3> modes{{
+        {1u, Modulation::qam64, TransmissionScheme::spatial_multiplexing, 1u},
+        {2u, Modulation::qam64, TransmissionScheme::spatial_multiplexing, 2u},
+        {1u, Modulation::qam64, TransmissionScheme::alamouti_stbc, 2u},
+    }};
+    const std::array<PilotMode, 2> pilots{{PilotMode::fdm, PilotMode::nr_dmrs}};
+
+    for (const auto mode : modes) {
+        const std::size_t physical_ports =
+            openisac::physical_transmit_ports(mode);
+        openisac::FormalFrameProfile profile;
+        profile.transmit_rank = mode.rank;
+        profile.bits_per_symbol = openisac::modulation_bits(mode.modulation);
+        profile.scheme = mode.scheme;
+        const auto layout = openisac::build_formal_frame_layout(profile);
+        const std::size_t payload_bytes =
+            std::min<std::size_t>(257u, layout.user_payload_bytes);
+        std::vector<std::uint8_t> payload(payload_bytes);
+        for (std::size_t index = 0u; index < payload.size(); ++index) {
+            payload[index] = static_cast<std::uint8_t>(
+                (index * 53u + mode.rank * 17u + physical_ports) & 0xFFu);
+        }
+
+        for (const auto pilot : pilots) {
+            openisac::DynamicLinkWorkspace generation_workspace;
+            openisac::DynamicLinkTransmitFrame tx;
+            openisac::generate_dynamic_tx_iq_frame(
+                payload, mode, 73u, codec, pilot, 0xC057u, tx,
+                generation_workspace);
+            require(
+                tx.samples.size() == physical_ports &&
+                    !tx.samples.empty() && !tx.samples[0].empty(),
+                "hardware TX waveform has the wrong port or sample count");
+
+            constexpr std::size_t timing_offset = 20u;
+            constexpr std::size_t tail = 32u;
+            openisac::DynamicLinkCaptureFrame capture;
+            capture.capture_sequence = 73u;
+            capture.timestamp = 5000u;
+            capture.pilot_seed = tx.pilot_seed;
+            capture.samples.resize(physical_ports);
+            for (std::size_t port = 0u; port < physical_ports; ++port) {
+                capture.samples[port].assign(
+                    timing_offset + tx.samples[port].size() + tail,
+                    std::complex<float>{});
+                std::copy(
+                    tx.samples[port].begin(), tx.samples[port].end(),
+                    capture.samples[port].begin() +
+                        static_cast<std::ptrdiff_t>(timing_offset));
+            }
+
+            openisac::DynamicLinkReceiverConfig receiver_config;
+            receiver_config.pilot_mode = pilot;
+            receiver_config.noise_variance_mode =
+                openisac::NoiseVarianceMode::fixed;
+            receiver_config.fixed_noise_variance = 1.0e-6f;
+            receiver_config.maximum_timing_offset_samples = 64u;
+            receiver_config.maximum_channel_delay_samples = 16u;
+            openisac::DynamicLinkReceiverState receiver_state;
+            openisac::DynamicLinkWorkspace receiver_workspace;
+            openisac::PreparedDynamicLinkFrame prepared;
+            openisac::prepare_captured_iq_frame(
+                capture, receiver_config, prepared, &receiver_state,
+                receiver_workspace);
+            const auto result = openisac::finish_dynamic_tdl_frame(
+                prepared, codec, receiver_workspace);
+            require(
+                result.timing_ok && result.header_ok && result.crc_ok &&
+                    result.user_payload == payload,
+                "hardware TX waveform did not close through receiver-only PHY");
+        }
+    }
 }
 
 void test_dynamic_sensing_current_phy() {
@@ -2593,6 +2825,8 @@ int main() {
         std::cout << "PASS two-slot complete dynamic-link pipeline\n";
         test_dynamic_iq_receiver_pipeline();
         std::cout << "PASS pre-generated IQ receiver-only pipeline\n";
+        test_hardware_tx_waveform_receiver_closure();
+        std::cout << "PASS SISO/2x2/STBC hardware TX/RX waveform closure\n";
         test_dynamic_sensing_current_phy();
         std::cout << "PASS current-PHY high-order MIMO range-Doppler sensing\n";
         test_dynamic_sensing_time_domain_frontend();

@@ -258,6 +258,8 @@ FormalFrameLayout build_formal_frame_layout(const FormalFrameProfile& profile) {
     if (profile.fft_size != 1024u || profile.control_re_count != 128u ||
         (profile.transmit_rank != 1u && profile.transmit_rank != 2u &&
          profile.transmit_rank != 4u) ||
+        (profile.scheme == TransmissionScheme::alamouti_stbc &&
+         profile.transmit_rank != 1u) ||
         (profile.transmit_rank == 4u && profile.pilot_spacing != 2u) ||
         1008u % profile.bits_per_symbol != 0u) {
         throw std::invalid_argument("unsupported formal-frame profile");
@@ -315,7 +317,11 @@ FormalFrameLayout build_formal_frame_layout(const FormalFrameProfile& profile) {
         layout.control_data_positions.begin(), layout.control_data_positions.end());
     for (std::uint8_t time = 0u; time < 2u; ++time) {
         for (std::size_t data = 0; data < layout.data_fft_indices.size(); ++data) {
-            if (time == 0u && control_set.count(static_cast<std::uint16_t>(data)) != 0u) {
+            const bool control_position =
+                control_set.count(static_cast<std::uint16_t>(data)) != 0u;
+            if ((time == 0u ||
+                 profile.scheme == TransmissionScheme::alamouti_stbc) &&
+                control_position) {
                 continue;
             }
             layout.payload_time_indices.push_back(time);
@@ -367,13 +373,39 @@ std::uint8_t transmit_rank_flag(unsigned transmit_rank) {
     throw std::invalid_argument("transmit rank must be 1, 2 or 4");
 }
 
+std::uint8_t transmission_mode_flag(const LinkMode& mode) {
+    const unsigned ports = physical_transmit_ports(mode);
+    if (mode.scheme == TransmissionScheme::alamouti_stbc) {
+        if (mode.rank != 1u || ports != 2u) {
+            throw std::invalid_argument(
+                "Alamouti STBC requires one stream and two transmit ports");
+        }
+        return 0x03u;
+    }
+    const bool supported =
+        (ports == 1u && mode.rank == 1u) ||
+        (ports == 2u && (mode.rank == 1u || mode.rank == 2u)) ||
+        (ports == 4u && (mode.rank == 2u || mode.rank == 4u));
+    if (!supported) {
+        throw std::invalid_argument("unsupported spatial Rank/Tx-port profile");
+    }
+    return transmit_rank_flag(mode.rank);
+}
+
 unsigned transmit_rank_from_flags(std::uint8_t flags) noexcept {
     switch (flags & 0x03u) {
         case 0x00u: return 1u;
         case 0x01u: return 2u;
         case 0x02u: return 4u;
-        default: return 0u;
+        case 0x03u: return 1u;
     }
+    return 0u;
+}
+
+TransmissionScheme transmission_scheme_from_flags(std::uint8_t flags) noexcept {
+    return (flags & 0x03u) == 0x03u
+        ? TransmissionScheme::alamouti_stbc
+        : TransmissionScheme::spatial_multiplexing;
 }
 
 std::uint64_t pack_mini_header(const MiniHeader& header) {

@@ -66,10 +66,10 @@ struct DynamicSensingChannelEstimate {
 };
 
 // Recover one selected Tx->Rx channel from the two known transmitted data
-// symbols. Full-rank RE use a 2x2 regularized LS solve; single-port pilot/control
-// RE use direct division; remaining active holes are linearly interpolated.
-// This supports the current QPSK/16/64/256-QAM Rank-1/2 waveform and does not
-// assume unit-magnitude QPSK symbols.
+// symbols. SISO and single-port pilot/control RE use direct division; 2x2
+// full-rank RE use a regularized LS solve; remaining active holes are linearly
+// interpolated. This supports the current QPSK/16/64/256-QAM SISO/Rank-1/2
+// waveforms and does not assume unit-magnitude QPSK symbols.
 void estimate_dynamic_sensing_channel_2x2(
     const std::vector<std::complex<float>>& transmit_grid,
     const std::vector<std::complex<float>>& receive_grid,

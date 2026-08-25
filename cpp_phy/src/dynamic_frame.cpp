@@ -3,6 +3,7 @@
 #include "openisac/crc16.hpp"
 #include "openisac/ldpc_frame_decoder.hpp"
 #include "openisac/ldpc_framing.hpp"
+#include "openisac/mimo_nxn.hpp"
 #include "openisac/qam.hpp"
 
 #include <algorithm>
@@ -17,7 +18,8 @@ FormalFrameProfile profile_for_mode(LinkMode mode) {
     FormalFrameProfile profile;
     profile.bits_per_symbol = modulation_bits(mode.modulation);
     profile.transmit_rank = mode.rank;
-    if (mode.rank == 4u) {
+    profile.scheme = mode.scheme;
+    if (physical_transmit_ports(mode) == 4u) {
         profile.pilot_spacing = 2u;
     }
     return profile;
@@ -25,12 +27,21 @@ FormalFrameProfile profile_for_mode(LinkMode mode) {
 
 const FormalFrameLayout& cached_layout_for_mode(LinkMode mode) {
     const unsigned bits = modulation_bits(mode.modulation);
-    if ((mode.rank != 1u && mode.rank != 2u && mode.rank != 4u) ||
+    const unsigned physical_ports = physical_transmit_ports(mode);
+    const bool spatial =
+        mode.scheme == TransmissionScheme::spatial_multiplexing &&
+        ((physical_ports == 1u && mode.rank == 1u) ||
+         (physical_ports == 2u && (mode.rank == 1u || mode.rank == 2u)) ||
+         (physical_ports == 4u && (mode.rank == 2u || mode.rank == 4u)));
+    const bool stbc =
+        mode.scheme == TransmissionScheme::alamouti_stbc &&
+        physical_ports == 2u && mode.rank == 1u;
+    if ((!spatial && !stbc) ||
         (bits != 2u && bits != 4u && bits != 6u && bits != 8u)) {
-        throw std::invalid_argument("unsupported cached Rank/MCS layout");
+        throw std::invalid_argument("unsupported cached PHY mode/MCS layout");
     }
-    static const std::array<FormalFrameLayout, 12> layouts = [] {
-        std::array<FormalFrameLayout, 12> result;
+    static const std::array<FormalFrameLayout, 20> layouts = [] {
+        std::array<FormalFrameLayout, 20> result;
         constexpr std::array<Modulation, 4> modulations{{
             Modulation::qpsk, Modulation::qam16,
             Modulation::qam64, Modulation::qam256}};
@@ -43,11 +54,29 @@ const FormalFrameLayout& cached_layout_for_mode(LinkMode mode) {
                         profile_for_mode({ranks[rank_index], modulations[modulation]}));
             }
         }
+        for (std::size_t modulation = 0u;
+             modulation < modulations.size(); ++modulation) {
+            result[12u + modulation] = build_formal_frame_layout(profile_for_mode({
+                1u, modulations[modulation], TransmissionScheme::alamouti_stbc}));
+        }
+        for (std::size_t modulation = 0u;
+             modulation < modulations.size(); ++modulation) {
+            result[16u + modulation] = build_formal_frame_layout(profile_for_mode({
+                2u, modulations[modulation],
+                TransmissionScheme::spatial_multiplexing, 4u}));
+        }
         return result;
     }();
+    const std::size_t modulation_index = bits / 2u - 1u;
+    if (stbc) {
+        return layouts[12u + modulation_index];
+    }
+    if (physical_ports == 4u && mode.rank == 2u) {
+        return layouts[16u + modulation_index];
+    }
     const std::size_t rank_index = mode.rank == 1u ? 0u :
         (mode.rank == 2u ? 1u : 2u);
-    return layouts[rank_index * 4u + bits / 2u - 1u];
+    return layouts[rank_index * 4u + modulation_index];
 }
 
 float pilot_sign(
@@ -105,7 +134,7 @@ EncodedDynamicFrame encode_dynamic_frame(
         1u,
         static_cast<std::uint8_t>(
             modulation_flag(result.profile.bits_per_symbol) |
-            transmit_rank_flag(result.profile.transmit_rank)),
+            transmission_mode_flag(mode)),
         static_cast<std::uint16_t>(result.information_bytes.size()),
         static_cast<std::uint8_t>(blocks),
         sequence,
@@ -145,18 +174,66 @@ EncodedDynamicFrame encode_dynamic_frame(
             SquareQAM::modulate(result.payload_labels[index], bits);
     }
 
-    const std::size_t physical_ports = mode.rank == 4u ? 4u : 2u;
+    const std::size_t physical_ports = physical_transmit_ports(mode);
     result.physical_ports = physical_ports;
     result.tx_grid.assign(2u * result.profile.fft_size * physical_ports, {});
-    const float payload_scale = 1.0f / std::sqrt(static_cast<float>(mode.rank));
-    for (std::size_t payload = 0u;
-         payload < result.layout.payload_time_indices.size(); ++payload) {
-        const std::size_t time = result.layout.payload_time_indices[payload];
-        const std::size_t data = result.layout.payload_data_positions[payload];
-        const std::size_t fft = result.layout.data_fft_indices[data];
-        for (std::size_t layer = 0u; layer < mode.rank; ++layer) {
-            result.tx_grid[(time * result.profile.fft_size + fft) * physical_ports + layer] =
-                result.payload_symbols[payload * mode.rank + layer] * payload_scale;
+    if (mode.scheme == TransmissionScheme::alamouti_stbc) {
+        const std::size_t pairs = result.layout.payload_time_indices.size() / 2u;
+        if (pairs * 2u != result.layout.payload_time_indices.size()) {
+            throw std::runtime_error("STBC payload layout must contain two equal time slots");
+        }
+        constexpr float stbc_scale = 0.70710678118654752440f;
+        for (std::size_t pair = 0u; pair < pairs; ++pair) {
+            const std::size_t second = pair + pairs;
+            if (result.layout.payload_time_indices[pair] != 0u ||
+                result.layout.payload_time_indices[second] != 1u ||
+                result.layout.payload_data_positions[pair] !=
+                    result.layout.payload_data_positions[second]) {
+                throw std::runtime_error("STBC payload positions are not time-paired");
+            }
+            const std::size_t data = result.layout.payload_data_positions[pair];
+            const std::size_t fft = result.layout.data_fft_indices[data];
+            const auto first = result.payload_symbols[pair];
+            const auto second_symbol = result.payload_symbols[second];
+            result.tx_grid[fft * physical_ports] = first * stbc_scale;
+            result.tx_grid[fft * physical_ports + 1u] =
+                second_symbol * stbc_scale;
+            result.tx_grid[(result.profile.fft_size + fft) * physical_ports] =
+                -std::conj(second_symbol) * stbc_scale;
+            result.tx_grid[(result.profile.fft_size + fft) * physical_ports + 1u] =
+                std::conj(first) * stbc_scale;
+        }
+    } else if (physical_ports == 4u && mode.rank == 2u) {
+        const float payload_scale = 0.70710678118654752440f;
+        for (std::size_t payload = 0u;
+             payload < result.layout.payload_time_indices.size(); ++payload) {
+            const std::size_t time = result.layout.payload_time_indices[payload];
+            const std::size_t data = result.layout.payload_data_positions[payload];
+            const std::size_t fft = result.layout.data_fft_indices[data];
+            for (std::size_t tx = 0u; tx < physical_ports; ++tx) {
+                for (std::size_t layer = 0u; layer < mode.rank; ++layer) {
+                    result.tx_grid[
+                        (time * result.profile.fft_size + fft) * physical_ports + tx] +=
+                        fixed_dft_precoder_4x2(tx, layer) *
+                        result.payload_symbols[payload * mode.rank + layer] *
+                        payload_scale;
+                }
+            }
+        }
+    } else {
+        const float payload_scale =
+            1.0f / std::sqrt(static_cast<float>(mode.rank));
+        for (std::size_t payload = 0u;
+             payload < result.layout.payload_time_indices.size(); ++payload) {
+            const std::size_t time = result.layout.payload_time_indices[payload];
+            const std::size_t data = result.layout.payload_data_positions[payload];
+            const std::size_t fft = result.layout.data_fft_indices[data];
+            for (std::size_t layer = 0u; layer < mode.rank; ++layer) {
+                result.tx_grid[
+                    (time * result.profile.fft_size + fft) * physical_ports + layer] =
+                    result.payload_symbols[payload * mode.rank + layer] *
+                    payload_scale;
+            }
         }
     }
     for (std::size_t control = 0u;
@@ -200,7 +277,7 @@ void build_dynamic_pilot_reference_grid(
     std::vector<std::complex<float>>& reference_grid) {
     const FormalFrameProfile profile = profile_for_mode(mode);
     const auto layout = build_formal_frame_layout(profile);
-    const std::size_t physical_ports = mode.rank == 4u ? 4u : 2u;
+    const std::size_t physical_ports = physical_transmit_ports(mode);
     constexpr unsigned data_symbols = 2u;
     reference_grid.assign(
         static_cast<std::size_t>(data_symbols) * profile.fft_size *
@@ -234,14 +311,28 @@ namespace {
 void prepare_dynamic_frame_impl(
     const MiniHeader& header,
     float marker_metric,
+    const LinkMode* configured_mode,
     const std::vector<std::complex<float>>& equalized_payload_symbols,
     const std::vector<float>& effective_noise_variances,
     PreparedDynamicFrame& prepared) {
     prepared.header = header;
     prepared.marker_metric = marker_metric;
     const unsigned bits = bits_per_symbol_from_flags(prepared.header.flags);
-    prepared.mode = {
-        transmit_rank_from_flags(prepared.header.flags), modulation_from_bits(bits)};
+    const LinkMode header_mode{
+        transmit_rank_from_flags(prepared.header.flags),
+        modulation_from_bits(bits),
+        transmission_scheme_from_flags(prepared.header.flags)};
+    if (configured_mode != nullptr) {
+        if (configured_mode->rank != header_mode.rank ||
+            configured_mode->modulation != header_mode.modulation ||
+            configured_mode->scheme != header_mode.scheme) {
+            throw std::runtime_error(
+                "configured physical-port profile disagrees with frame header");
+        }
+        prepared.mode = *configured_mode;
+    } else {
+        prepared.mode = header_mode;
+    }
     const auto& layout = cached_layout_for_mode(prepared.mode);
     if (prepared.header.payload_blocks == 0u ||
         prepared.header.payload_blocks > layout.ldpc_blocks) {
@@ -354,7 +445,7 @@ void prepare_dynamic_frame_llrs(
     float marker_metric = 0.0f;
     const auto header = decode_control_qpsk_llrs(control_llrs, &marker_metric);
     prepare_dynamic_frame_impl(
-        header, marker_metric, equalized_payload_symbols,
+        header, marker_metric, nullptr, equalized_payload_symbols,
         effective_noise_variances, prepared);
 }
 
@@ -365,8 +456,20 @@ void prepare_dynamic_frame_payload_llrs(
     const std::vector<float>& effective_noise_variances,
     PreparedDynamicFrame& prepared) {
     prepare_dynamic_frame_impl(
-        decoded_header, marker_metric, equalized_payload_symbols,
+        decoded_header, marker_metric, nullptr, equalized_payload_symbols,
         effective_noise_variances, prepared);
+}
+
+void prepare_dynamic_frame_payload_llrs(
+    const MiniHeader& decoded_header,
+    float marker_metric,
+    const LinkMode& configured_mode,
+    const std::vector<std::complex<float>>& equalized_payload_symbols,
+    const std::vector<float>& effective_noise_variances,
+    PreparedDynamicFrame& prepared) {
+    prepare_dynamic_frame_impl(
+        decoded_header, marker_metric, &configured_mode,
+        equalized_payload_symbols, effective_noise_variances, prepared);
 }
 
 DecodedDynamicFrame decode_prepared_dynamic_frame(
@@ -394,7 +497,7 @@ DecodedDynamicFrame decode_dynamic_frame(
     DynamicFrameDecodeWorkspace local_workspace;
     auto& prepared = workspace == nullptr ? local_workspace : *workspace;
     prepare_dynamic_frame_impl(
-        header, marker_metric, equalized_payload_symbols,
+        header, marker_metric, nullptr, equalized_payload_symbols,
         effective_noise_variances, prepared);
     return decode_prepared_dynamic_frame_impl(
         prepared, codec, maximum_ldpc_iterations,

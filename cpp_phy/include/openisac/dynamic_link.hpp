@@ -214,14 +214,36 @@ struct PreparedDynamicLinkFrame {
     bool ready = false;
 };
 
-// Hardware-facing input: timestamp, agreed pilot seed and two complex IQ
-// branches. Receiver thresholds/noise configuration are supplied separately.
+// Hardware-facing input: timestamp, agreed pilot seed and one or two complex
+// IQ branches. Receiver thresholds/noise configuration are supplied separately.
 struct DynamicLinkCaptureFrame {
     std::uint64_t capture_sequence = 0u;
     std::uint64_t timestamp = 0u;
     std::uint32_t pilot_seed = 0xC057u;
     std::vector<std::vector<std::complex<float>>> samples;
 };
+
+// Hardware-facing transmitter output. Unlike DynamicLinkIqFrame, this contains
+// only the formal over-air waveform and never applies a simulated channel,
+// noise, CFO, SFO or timing offset.
+struct DynamicLinkTransmitFrame {
+    LinkMode mode{};
+    std::uint16_t sequence = 0u;
+    std::uint32_t pilot_seed = 0xC057u;
+    PilotMode pilot_mode = PilotMode::fdm;
+    std::vector<std::vector<std::complex<float>>> samples;
+    std::vector<std::complex<float>> transmit_reference_grid;
+};
+
+void generate_dynamic_tx_iq_frame(
+    const std::vector<std::uint8_t>& user_payload,
+    LinkMode mode,
+    std::uint16_t sequence,
+    const Ldpc5041008& codec,
+    PilotMode pilot_mode,
+    std::uint32_t pilot_seed,
+    DynamicLinkTransmitFrame& tx_frame,
+    DynamicLinkWorkspace& generation_workspace);
 
 // Simulator capture with optional truth data. The receiver algorithm consumes
 // the inherited hardware-facing fields and does not require truth fields.

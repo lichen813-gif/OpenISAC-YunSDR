@@ -328,15 +328,31 @@ class LiveMonitor:
 
         age = max(0.0, time.time() - number(status, "snapshot_epoch_ms") / 1000.0)
         rank = int(number(status, "rank", 1.0))
+        tx_ports = int(number(status, "tx_ports", 4.0 if rank == 4 else 2.0))
+        rx_ports = int(number(status, "rx_ports", 4.0 if rank == 4 else 2.0))
+        mimo_mode = status.get("mimo_mode", "spatial_multiplexing")
+        hardware_mode = status.get("hardware_mode") == "1"
+        mode_label = (
+            "Alamouti STBC"
+            if mimo_mode in ("stbc", "alamouti_stbc") else
+            f"{tx_ports}Tx/{rx_ports}Rx Rank-{rank}"
+        )
         condition_text = (
+            "SISO 1×1"
+            if tx_ports == 1 else
             f"条件数 {number(status, 'channel_condition_median'):.2f}/"
             f"{number(status, 'channel_condition_p90'):.2f}"
         )
+        link_context = (
+            f"RF {number(status, 'center_frequency_hz') / 1.0e6:.1f} MHz"
+            if hardware_mode else
+            f"SNR {number(status, 'snr_db'):.1f} dB"
+        )
         self.header.configure(
             text=(
-                f"OpenISAC  Rank-{status.get('rank', '?')} / {status.get('modulation', '?')}   "
+                f"OpenISAC  {mode_label} / {status.get('modulation', '?')}   "
                 f"FFT/CP {status.get('fft_size', '?')}/{status.get('cp_length', '?')}   "
-                f"SNR {number(status, 'snr_db'):.1f} dB   "
+                f"{link_context}   "
                 f"{condition_text}   "
                 f"帧 {int(number(status, 'frame_id')):,}   刷新延迟 {age:.1f} s"
             ),
@@ -348,7 +364,7 @@ class LiveMonitor:
             if not selected:
                 plot.axes("同相 I", "正交 Q")
                 plot.create_text(
-                    170, 110, text=f"Rank-{rank} 模式无 Layer {layer}",
+                    170, 110, text=f"{mode_label} 模式无 Layer {layer}",
                     fill=COLORS["muted"])
                 continue
             plot.constellation(
@@ -374,11 +390,17 @@ class LiveMonitor:
         links = (
             (("h00", COLORS["cyan"]), ("h11", COLORS["yellow"]),
              ("h22", COLORS["green"]), ("h33", COLORS["purple"]))
-            if rank == 4 else
+            if tx_ports == 4 else
+            (("h00", COLORS["cyan"]),)
+            if tx_ports == 1 else
             (("h00", COLORS["cyan"]), ("h01", COLORS["yellow"]),
              ("h10", COLORS["green"]), ("h11", COLORS["purple"]))
         )
-        self.channel.title = f"{rank}×{rank} 信道估计幅频响应"
+        self.channel.title = (
+            "2×2 STBC 信道估计幅频响应"
+            if mimo_mode in ("stbc", "alamouti_stbc") else
+            f"{rx_ports}×{tx_ports} 信道估计幅频响应"
+        )
         for link, color in links:
             values = np.asarray([
                 complex(float(row[f"{link}_i"]), float(row[f"{link}_q"]))
@@ -393,24 +415,28 @@ class LiveMonitor:
         packets_in = int(number(status, "udp_packets_in"))
         packets_out = int(number(status, "udp_packets_out"))
         mimo_metrics = (
+            "SISO 1×1均衡          单流\n"
+            if tx_ports == 1 else
             f"条件数 中位/P90     {number(status, 'channel_condition_median'):7.2f} / "
             f"{number(status, 'channel_condition_p90'):7.2f}\n"
             f"病态子载波 >10      {number(status, 'ill_conditioned_subcarrier_percent'):9.2f} %\n"
         )
-        if rank == 4:
+        if tx_ports == 4:
             mimo_metrics += (
                 f"感知功率合并链路    {int(number(status, 'sensing_link_count')):9d}\n"
             )
-        metrics_text = (
-            "实时测量\n\n"
-            f"导频/帧             {status.get('pilot_mode', 'fdm'):>9s} / "
-            f"{int(number(status, 'frame_symbols')):d} 符号, "
-            f"{number(status, 'frame_period_us'):.0f} us\n"
-            f"EVM                 {number(status, 'evm_percent'):9.3f} %\n"
+        channel_quality_metrics = (
+            "信道估计来源          Y240 实测导频\n"
+            if hardware_mode else
             f"信道估计 NMSE       {number(status, 'channel_nmse_db'):9.3f} dB\n"
             f"空间相关 Tx/Rx      {number(status, 'tx_spatial_correlation'):7.3f} / "
             f"{number(status, 'rx_spatial_correlation'):7.3f}\n"
-            f"{mimo_metrics}"
+        )
+        synchronization_metrics = (
+            f"频偏估计            {number(status, 'cfo_estimated_hz'):9.3f} Hz\n"
+            f"残余 SFO            {number(status, 'sfo_residual_ppm'):9.3f} ppm\n"
+            f"定时估计            {number(status, 'timing_estimated_samples'):9.0f} sample\n"
+            if hardware_mode else
             f"频偏 真值/估计      {number(status, 'cfo_true_hz'):7.2f} / "
             f"{number(status, 'cfo_estimated_hz'):7.2f} Hz\n"
             f"频偏估计误差        {number(status, 'cfo_error_hz'):9.3f} Hz\n"
@@ -418,6 +444,24 @@ class LiveMonitor:
             f"{number(status, 'sfo_residual_ppm'):7.3f} ppm\n"
             f"定时 真值/估计      {number(status, 'timing_true_samples'):7.0f} / "
             f"{number(status, 'timing_estimated_samples'):7.0f} sample\n"
+        )
+        hardware_events = (
+            f"TX超时/下溢         {int(number(status, 'tx_timeouts')):7d} / "
+            f"{int(number(status, 'tx_underflows')):7d}\n"
+            f"RX溢出/时间戳跳变   {int(number(status, 'rx_overflows')):7d} / "
+            f"{int(number(status, 'timestamp_discontinuities')):7d}\n"
+            if hardware_mode else ""
+        )
+        metrics_text = (
+            "实时测量\n\n"
+            f"传输模式             {mode_label:>18s}\n"
+            f"导频/帧             {status.get('pilot_mode', 'fdm'):>9s} / "
+            f"{int(number(status, 'frame_symbols')):d} 符号, "
+            f"{number(status, 'frame_period_us'):.0f} us\n"
+            f"EVM                 {number(status, 'evm_percent'):9.3f} %\n"
+            f"{channel_quality_metrics}"
+            f"{mimo_metrics}"
+            f"{synchronization_metrics}"
             f"同步峰值            {number(status, 'timing_metric'):9.4f}\n"
             f"噪声方差            {number(status, 'noise_variance'):9.3e}\n\n"
             f"星座 有效/排除填充  {int(number(status, 'constellation_valid_symbols')):5d} / "
@@ -431,6 +475,7 @@ class LiveMonitor:
             f"UDP 丢弃            {int(number(status, 'udp_dropped')):,}\n"
             f"PHY 帧               {int(number(status, 'phy_frames')):,}\n"
             f"FER                  {number(status, 'fer_percent'):9.4f} %\n\n"
+            f"{hardware_events}"
             "动态感知\n\n"
             f"相干积累帧数      {int(number(status, 'sensing_coherent_frames')):9d}\n"
             f"距离分辨率          {range_spacing:9.3f} m\n"
@@ -461,7 +506,8 @@ def main() -> None:
         status = snapshot["status"]
         assert isinstance(status, dict)
         print(
-            f"OK: Rank-{status['rank']} {status['modulation']}, "
+            f"OK: {status.get('mimo_mode', 'spatial_multiplexing')} "
+            f"Rank-{status['rank']} {status['modulation']}, "
             f"EVM={number(status, 'evm_percent'):.3f}%, "
             f"CFO estimate={number(status, 'cfo_estimated_hz'):.3f} Hz"
         )

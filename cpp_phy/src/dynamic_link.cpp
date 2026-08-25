@@ -23,7 +23,7 @@ constexpr std::size_t fft_size = 1024u;
 constexpr std::size_t cp_length = 128u;
 constexpr std::size_t symbol_samples = fft_size + cp_length;
 constexpr std::size_t data_symbols = 2u;
-constexpr std::size_t antennas = 2u;
+constexpr std::size_t maximum_dynamic_ports = 2u;
 constexpr float subcarrier_spacing_hz = 15000.0f;
 
 using Clock = std::chrono::steady_clock;
@@ -79,6 +79,41 @@ std::complex<float> mrc_detect_tx0(
             std::conj(channel.h10) * received[1]) / power;
 }
 
+struct AlamoutiDetection2x2 {
+    std::array<std::complex<float>, 2> symbols{};
+    float equivalent_variance = 0.0f;
+};
+
+AlamoutiDetection2x2 detect_alamouti_2x2(
+    const std::array<std::complex<float>, 2>& received_first,
+    const std::array<std::complex<float>, 2>& received_second,
+    const Channel2x2& channel,
+    float noise_variance) {
+    constexpr float transmit_scale = 0.70710678118654752440f;
+    const std::array<std::complex<float>, 2> first_channel{{
+        channel.h00, channel.h10}};
+    const std::array<std::complex<float>, 2> second_channel{{
+        channel.h01, channel.h11}};
+    std::complex<float> first{};
+    std::complex<float> second{};
+    float gain = 0.0f;
+    for (std::size_t receive = 0u; receive < 2u; ++receive) {
+        first += std::conj(first_channel[receive]) * received_first[receive] +
+                 second_channel[receive] * std::conj(received_second[receive]);
+        second += std::conj(second_channel[receive]) * received_first[receive] -
+                  first_channel[receive] * std::conj(received_second[receive]);
+        gain += std::norm(first_channel[receive]) +
+                std::norm(second_channel[receive]);
+    }
+    gain = std::max(gain, 1.0e-12f);
+    const float denominator = transmit_scale * gain;
+    AlamoutiDetection2x2 result;
+    result.symbols = {{first / denominator, second / denominator}};
+    result.equivalent_variance =
+        noise_variance / (transmit_scale * transmit_scale * gain);
+    return result;
+}
+
 Modulation modulation_from_bits(unsigned bits) {
     switch (bits) {
         case 2u: return Modulation::qpsk;
@@ -89,16 +124,23 @@ Modulation modulation_from_bits(unsigned bits) {
     }
 }
 
-const FormalFrameLayout& cached_formal_frame_layout(
-    unsigned transmit_rank,
-    unsigned bits_per_symbol) {
-    if ((transmit_rank != 1u && transmit_rank != 2u) ||
+const FormalFrameLayout& cached_formal_frame_layout(LinkMode mode) {
+    const unsigned bits_per_symbol = modulation_bits(mode.modulation);
+    const unsigned physical_ports = physical_transmit_ports(mode);
+    const bool spatial =
+        mode.scheme == TransmissionScheme::spatial_multiplexing &&
+        ((physical_ports == 1u && mode.rank == 1u) ||
+         (physical_ports == 2u && (mode.rank == 1u || mode.rank == 2u)));
+    const bool stbc =
+        mode.scheme == TransmissionScheme::alamouti_stbc &&
+        physical_transmit_ports(mode) == 2u && mode.rank == 1u;
+    if ((!spatial && !stbc) ||
         (bits_per_symbol != 2u && bits_per_symbol != 4u &&
          bits_per_symbol != 6u && bits_per_symbol != 8u)) {
-        throw std::invalid_argument("unsupported cached Rank/MCS layout");
+        throw std::invalid_argument("unsupported cached PHY mode/MCS layout");
     }
-    static const std::array<FormalFrameLayout, 8> layouts = [] {
-        std::array<FormalFrameLayout, 8> result;
+    static const std::array<FormalFrameLayout, 12> layouts = [] {
+        std::array<FormalFrameLayout, 12> result;
         constexpr std::array<unsigned, 4> modulation_bits{{2u, 4u, 6u, 8u}};
         for (unsigned rank = 1u; rank <= 2u; ++rank) {
             for (std::size_t modulation = 0u;
@@ -110,10 +152,21 @@ const FormalFrameLayout& cached_formal_frame_layout(
                     build_formal_frame_layout(profile);
             }
         }
+        for (std::size_t modulation = 0u;
+             modulation < modulation_bits.size(); ++modulation) {
+            FormalFrameProfile profile;
+            profile.transmit_rank = 1u;
+            profile.bits_per_symbol = modulation_bits[modulation];
+            profile.scheme = TransmissionScheme::alamouti_stbc;
+            result[8u + modulation] = build_formal_frame_layout(profile);
+        }
         return result;
     }();
     const std::size_t modulation = bits_per_symbol / 2u - 1u;
-    return layouts[(transmit_rank - 1u) * 4u + modulation];
+    if (stbc) {
+        return layouts[8u + modulation];
+    }
+    return layouts[(mode.rank - 1u) * 4u + modulation];
 }
 
 std::size_t maximum_tap_delay(const std::vector<TdlTap>& taps) {
@@ -153,33 +206,34 @@ float estimate_pilot_residual_noise_variance(
     const std::vector<std::complex<float>>& receive_grid,
     const std::vector<std::complex<float>>& pilot_reference_grid,
     const std::vector<std::uint16_t>& pilot_fft_indices,
+    std::size_t ports,
     std::vector<float>& power_samples,
     std::size_t& capacity_growths) {
-    const std::size_t expected_samples = pilot_fft_indices.size() * antennas;
+    const std::size_t expected_samples = pilot_fft_indices.size() * ports;
     if (power_samples.capacity() < expected_samples) {
         power_samples.reserve(expected_samples);
         ++capacity_growths;
     }
     power_samples.clear();
     for (const auto fft : pilot_fft_indices) {
-        std::size_t tx = antennas;
-        for (std::size_t candidate = 0u; candidate < antennas; ++candidate) {
+        std::size_t tx = ports;
+        for (std::size_t candidate = 0u; candidate < ports; ++candidate) {
             if (std::norm(
-                    pilot_reference_grid[fft * antennas + candidate]) > 0.0f) {
+                    pilot_reference_grid[fft * ports + candidate]) > 0.0f) {
                 tx = candidate;
                 break;
             }
         }
-        if (tx == antennas) {
+        if (tx == ports) {
             continue;
         }
-        const auto first_reference = pilot_reference_grid[fft * antennas + tx];
+        const auto first_reference = pilot_reference_grid[fft * ports + tx];
         const auto second_reference = pilot_reference_grid[
-            (fft_size + fft) * antennas + tx];
-        for (std::size_t rx = 0u; rx < antennas; ++rx) {
-            const auto first_received = receive_grid[fft * antennas + rx];
+            (fft_size + fft) * ports + tx];
+        for (std::size_t rx = 0u; rx < ports; ++rx) {
+            const auto first_received = receive_grid[fft * ports + rx];
             const auto second_received = receive_grid[
-                (fft_size + fft) * antennas + rx];
+                (fft_size + fft) * ports + rx];
             const auto predicted =
                 first_received / first_reference * second_reference;
             const auto residual = second_received - predicted;
@@ -204,7 +258,7 @@ float estimate_channel_residual_noise_variance(
     std::vector<float>& power_samples,
     std::size_t& capacity_growths) {
     const std::size_t expected_samples =
-        data_symbols * pilot_fft_indices.size() * antennas;
+        data_symbols * pilot_fft_indices.size() * maximum_dynamic_ports;
     if (power_samples.capacity() < expected_samples) {
         power_samples.reserve(expected_samples);
         ++capacity_growths;
@@ -212,18 +266,18 @@ float estimate_channel_residual_noise_variance(
     power_samples.clear();
     for (std::size_t time = 0u; time < data_symbols; ++time) {
         for (const auto fft : pilot_fft_indices) {
-            std::array<std::complex<float>, antennas> transmitted{};
-            for (std::size_t tx = 0u; tx < antennas; ++tx) {
+            std::array<std::complex<float>, maximum_dynamic_ports> transmitted{};
+            for (std::size_t tx = 0u; tx < maximum_dynamic_ports; ++tx) {
                 transmitted[tx] = pilot_reference_grid[
-                    (time * fft_size + fft) * antennas + tx];
+                    (time * fft_size + fft) * maximum_dynamic_ports + tx];
             }
             const auto& channel = channels[time * fft_size + fft];
-            const std::array<std::complex<float>, antennas> predicted{{
+            const std::array<std::complex<float>, maximum_dynamic_ports> predicted{{
                 channel.h00 * transmitted[0] + channel.h01 * transmitted[1],
                 channel.h10 * transmitted[0] + channel.h11 * transmitted[1]}};
-            for (std::size_t rx = 0u; rx < antennas; ++rx) {
+            for (std::size_t rx = 0u; rx < maximum_dynamic_ports; ++rx) {
                 const auto received = receive_grid[
-                    (time * fft_size + fft) * antennas + rx];
+                    (time * fft_size + fft) * maximum_dynamic_ports + rx];
                 power_samples.push_back(std::norm(received - predicted[rx]));
             }
         }
@@ -297,6 +351,107 @@ void DynamicLinkWorkspace::release() noexcept {
     *this = DynamicLinkWorkspace{};
 }
 
+void generate_dynamic_tx_iq_frame(
+    const std::vector<std::uint8_t>& user_payload,
+    LinkMode mode,
+    std::uint16_t sequence,
+    const Ldpc5041008& codec,
+    PilotMode pilot_mode,
+    std::uint32_t pilot_seed,
+    DynamicLinkTransmitFrame& tx_frame,
+    DynamicLinkWorkspace& generation_workspace) {
+    auto& buffers = generation_workspace;
+    const std::size_t physical_ports = physical_transmit_ports(mode);
+    if (physical_ports == 0u || physical_ports > maximum_dynamic_ports ||
+        (physical_ports == 1u &&
+         (mode.rank != 1u ||
+          mode.scheme != TransmissionScheme::spatial_multiplexing))) {
+        throw std::invalid_argument(
+            "dynamic TX supports 1x1 Rank-1, 2x2 Rank-1/2 or 2x2 STBC");
+    }
+    const auto capacity = cached_formal_frame_layout(mode).user_payload_bytes;
+    if (user_payload.empty() || user_payload.size() > capacity) {
+        throw std::invalid_argument(
+            "user payload is empty or exceeds selected Rank/MCS capacity");
+    }
+
+    auto encoded = encode_dynamic_frame(
+        user_payload, mode, sequence, codec, pilot_seed);
+    const std::size_t frame_symbol_count = formal_frame_symbols(pilot_mode);
+    const std::size_t data_symbol_offset = pilot_mode == PilotMode::nr_dmrs
+        ? 3u : 1u;
+
+    for (auto& branch : buffers.tx_time) {
+        resize_tracked(
+            branch, frame_symbol_count * symbol_samples,
+            buffers.capacity_growths);
+        std::fill(branch.begin(), branch.end(), std::complex<float>{});
+    }
+    if (buffers.preamble.size() != symbol_samples) {
+        if (buffers.preamble.capacity() < symbol_samples) {
+            ++buffers.capacity_growths;
+        }
+        buffers.preamble = generate_zc_ofdm_symbol(fft_size, cp_length, 29u);
+    }
+    std::copy(
+        buffers.preamble.begin(), buffers.preamble.end(),
+        buffers.tx_time[0].begin());
+    resize_tracked(
+        buffers.frequency_scratch, fft_size, buffers.capacity_growths);
+    resize_tracked(buffers.fft_scratch, fft_size, buffers.capacity_growths);
+    resize_tracked(
+        buffers.ofdm_samples, symbol_samples, buffers.capacity_growths);
+
+    if (pilot_mode == PilotMode::nr_dmrs) {
+        build_nr_dmrs_reference_grid(
+            fft_size, encoded.layout.active_fft_indices, physical_ports,
+            pilot_seed, buffers.dmrs_reference_grid);
+        for (std::size_t symbol = 0u; symbol < nr_dmrs_symbols; ++symbol) {
+            for (std::size_t tx = 0u; tx < physical_ports; ++tx) {
+                for (std::size_t fft = 0u; fft < fft_size; ++fft) {
+                    buffers.frequency_scratch[fft] =
+                        buffers.dmrs_reference_grid[
+                            (symbol * fft_size + fft) * physical_ports + tx];
+                }
+                ofdm_modulate(
+                    buffers.frequency_scratch, cp_length,
+                    buffers.ofdm_samples, buffers.fft_scratch);
+                std::copy(
+                    buffers.ofdm_samples.begin(), buffers.ofdm_samples.end(),
+                    buffers.tx_time[tx].begin() +
+                        static_cast<std::ptrdiff_t>(
+                            (symbol + 1u) * symbol_samples));
+            }
+        }
+    }
+    for (std::size_t symbol = 0u; symbol < data_symbols; ++symbol) {
+        for (std::size_t tx = 0u; tx < physical_ports; ++tx) {
+            for (std::size_t fft = 0u; fft < fft_size; ++fft) {
+                buffers.frequency_scratch[fft] = encoded.tx_grid[
+                    (symbol * fft_size + fft) * physical_ports + tx];
+            }
+            ofdm_modulate(
+                buffers.frequency_scratch, cp_length,
+                buffers.ofdm_samples, buffers.fft_scratch);
+            std::copy(
+                buffers.ofdm_samples.begin(), buffers.ofdm_samples.end(),
+                buffers.tx_time[tx].begin() +
+                    static_cast<std::ptrdiff_t>(
+                        (symbol + data_symbol_offset) * symbol_samples));
+        }
+    }
+
+    tx_frame.mode = mode;
+    tx_frame.sequence = sequence;
+    tx_frame.pilot_seed = pilot_seed;
+    tx_frame.pilot_mode = pilot_mode;
+    tx_frame.samples.resize(physical_ports);
+    for (std::size_t tx = 0u; tx < physical_ports; ++tx) {
+        tx_frame.samples[tx] = buffers.tx_time[tx];
+    }
+    tx_frame.transmit_reference_grid = std::move(encoded.tx_grid);
+}
+
 namespace {
 
 void generate_dynamic_tdl_iq_frame_impl(
@@ -325,13 +480,20 @@ void generate_dynamic_tdl_iq_frame_impl(
         config.tracking_metric_ratio < 0.0f || config.tracking_metric_ratio > 1.0f) {
         throw std::invalid_argument("invalid dynamic-link SNR/CFO/SFO");
     }
+    const std::size_t physical_ports = physical_transmit_ports(mode);
+    if (physical_ports == 0u || physical_ports > maximum_dynamic_ports ||
+        (physical_ports == 1u &&
+         (mode.rank != 1u ||
+          mode.scheme != TransmissionScheme::spatial_multiplexing))) {
+        throw std::invalid_argument(
+            "dynamic time link supports 1x1 Rank-1, 2x2 Rank-1/2 or 2x2 STBC");
+    }
     const auto impulse = build_simulation_impulse(config);
     const std::size_t maximum_delay = impulse[0][0].size() - 1u;
     if (maximum_delay >= cp_length) {
         throw std::invalid_argument("TDL maximum delay must be shorter than CP");
     }
-    const auto capacity = cached_formal_frame_layout(
-        mode.rank, modulation_bits(mode.modulation)).user_payload_bytes;
+    const auto capacity = cached_formal_frame_layout(mode).user_payload_bytes;
     if (application_payload != nullptr && application_payload->size() > capacity) {
         throw std::invalid_argument(
             "user payload exceeds selected Rank/MCS capacity");
@@ -373,14 +535,14 @@ void generate_dynamic_tdl_iq_frame_impl(
     resize_tracked(buffers.ofdm_samples, symbol_samples, buffers.capacity_growths);
     if (config.pilot_mode == PilotMode::nr_dmrs) {
         build_nr_dmrs_reference_grid(
-            fft_size, encoded.layout.active_fft_indices, antennas,
+            fft_size, encoded.layout.active_fft_indices, physical_ports,
             config.pilot_seed, buffers.dmrs_reference_grid);
         for (std::size_t symbol = 0u; symbol < nr_dmrs_symbols; ++symbol) {
-            for (std::size_t tx = 0u; tx < antennas; ++tx) {
+            for (std::size_t tx = 0u; tx < physical_ports; ++tx) {
                 for (std::size_t fft = 0u; fft < fft_size; ++fft) {
                     buffers.frequency_scratch[fft] =
                         buffers.dmrs_reference_grid[
-                            (symbol * fft_size + fft) * antennas + tx];
+                            (symbol * fft_size + fft) * physical_ports + tx];
                 }
                 ofdm_modulate(
                     buffers.frequency_scratch, cp_length,
@@ -393,10 +555,10 @@ void generate_dynamic_tdl_iq_frame_impl(
         }
     }
     for (std::size_t symbol = 0u; symbol < data_symbols; ++symbol) {
-        for (std::size_t tx = 0u; tx < antennas; ++tx) {
+        for (std::size_t tx = 0u; tx < physical_ports; ++tx) {
             for (std::size_t fft = 0u; fft < fft_size; ++fft) {
                 buffers.frequency_scratch[fft] = encoded.tx_grid[
-                    (symbol * fft_size + fft) * antennas + tx];
+                    (symbol * fft_size + fft) * physical_ports + tx];
             }
             ofdm_modulate(
                 buffers.frequency_scratch, cp_length,
@@ -422,7 +584,7 @@ void generate_dynamic_tdl_iq_frame_impl(
         resize_tracked(branch, symbol_samples, buffers.capacity_growths);
     }
     for (std::size_t symbol = 0u; symbol < frame_symbol_count; ++symbol) {
-        for (std::size_t tx = 0u; tx < antennas; ++tx) {
+        for (std::size_t tx = 0u; tx < maximum_dynamic_ports; ++tx) {
             const auto begin = buffers.tx_time[tx].begin() +
                 static_cast<std::ptrdiff_t>(symbol * symbol_samples);
             std::copy(
@@ -431,7 +593,7 @@ void generate_dynamic_tdl_iq_frame_impl(
         }
         apply_tdl_2x2_symbol(
             buffers.transmitted_symbol, impulse, buffers.received_symbol);
-        for (std::size_t rx = 0u; rx < antennas; ++rx) {
+        for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
             std::copy(
                 buffers.received_symbol[rx].begin(), buffers.received_symbol[rx].end(),
                 buffers.clean_rx[rx].begin() +
@@ -447,13 +609,13 @@ void generate_dynamic_tdl_iq_frame_impl(
     const std::size_t stream_samples =
         config.timing_offset_samples + frame_symbol_count * symbol_samples + tail;
     resize_branches_tracked(
-        buffers.rx_stream, antennas, stream_samples, buffers.capacity_growths);
+        buffers.rx_stream, physical_ports, stream_samples, buffers.capacity_growths);
     for (auto& branch : buffers.rx_stream) {
         for (auto& sample : branch) {
             sample = {normal(random), normal(random)};
         }
     }
-    for (std::size_t rx = 0u; rx < antennas; ++rx) {
+    for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
         for (std::size_t sample = 0u; sample < buffers.clean_rx[rx].size(); ++sample) {
             buffers.rx_stream[rx][config.timing_offset_samples + sample] +=
                 buffers.clean_rx[rx][sample];
@@ -462,7 +624,8 @@ void generate_dynamic_tdl_iq_frame_impl(
     const float normalized_cfo = config.cfo_hz / subcarrier_spacing_hz;
     apply_cfo_normalized_inplace(buffers.rx_stream, normalized_cfo, fft_size);
     resize_branches_tracked(
-        buffers.resampled_stream, antennas, stream_samples, buffers.capacity_growths);
+        buffers.resampled_stream, physical_ports, stream_samples,
+        buffers.capacity_growths);
     resample_sfo_cubic(
         buffers.rx_stream, config.sfo_ppm, buffers.resampled_stream);
     const auto channel_done = Clock::now();
@@ -523,10 +686,17 @@ void prepare_dynamic_iq_frame_impl(
     const std::size_t growths_before = buffers.capacity_growths;
     const bool has_truth = truth != nullptr && truth->has_truth;
     validate_receiver_config(config);
-    if (capture.samples.size() != antennas ||
-        capture.samples[0].size() != capture.samples[1].size() ||
+    const std::size_t physical_ports = capture.samples.size();
+    if (physical_ports == 0u || physical_ports > maximum_dynamic_ports ||
         capture.samples[0].empty()) {
-        throw std::invalid_argument("dynamic IQ frame must contain two equal branches");
+        throw std::invalid_argument(
+            "dynamic IQ frame must contain one or two receive branches");
+    }
+    for (std::size_t rx = 1u; rx < physical_ports; ++rx) {
+        if (capture.samples[rx].size() != capture.samples[0].size()) {
+            throw std::invalid_argument(
+                "dynamic IQ receive branches must have equal length");
+        }
     }
     std::optional<ImpulseResponse2x2> truth_impulse;
     if (has_truth && truth->config.enable_truth_diagnostics) {
@@ -557,9 +727,9 @@ void prepare_dynamic_iq_frame_impl(
     resize_tracked(buffers.fft_scratch, fft_size, buffers.capacity_growths);
     resize_tracked(buffers.ofdm_samples, symbol_samples, buffers.capacity_growths);
     resize_branches_tracked(
-        buffers.resampled_stream, antennas, stream_samples,
+        buffers.resampled_stream, physical_ports, stream_samples,
         buffers.capacity_growths);
-    for (std::size_t rx = 0u; rx < antennas; ++rx) {
+    for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
         std::copy(
             capture.samples[rx].begin(), capture.samples[rx].end(),
             buffers.resampled_stream[rx].begin());
@@ -630,14 +800,14 @@ void prepare_dynamic_iq_frame_impl(
     const auto synchronization_done = Clock::now();
 
     resize_tracked(
-        buffers.rx_grid, data_symbols * fft_size * antennas,
+        buffers.rx_grid, data_symbols * fft_size * physical_ports,
         buffers.capacity_growths);
     if (config.pilot_mode == PilotMode::nr_dmrs) {
         resize_tracked(
-            buffers.dmrs_rx_grid, nr_dmrs_symbols * fft_size * antennas,
+            buffers.dmrs_rx_grid, nr_dmrs_symbols * fft_size * physical_ports,
             buffers.capacity_growths);
         for (std::size_t symbol = 0u; symbol < nr_dmrs_symbols; ++symbol) {
-            for (std::size_t rx = 0u; rx < antennas; ++rx) {
+            for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
                 const auto begin = buffers.resampled_stream[rx].begin() +
                     static_cast<std::ptrdiff_t>(
                         timing.offset + (symbol + 1u) * symbol_samples);
@@ -649,7 +819,7 @@ void prepare_dynamic_iq_frame_impl(
                     buffers.frequency_scratch);
                 for (std::size_t fft = 0u; fft < fft_size; ++fft) {
                     buffers.dmrs_rx_grid[
-                        (symbol * fft_size + fft) * antennas + rx] =
+                        (symbol * fft_size + fft) * physical_ports + rx] =
                         buffers.frequency_scratch[fft];
                 }
             }
@@ -658,7 +828,7 @@ void prepare_dynamic_iq_frame_impl(
         buffers.dmrs_rx_grid.clear();
     }
     for (std::size_t symbol = 0u; symbol < data_symbols; ++symbol) {
-        for (std::size_t rx = 0u; rx < antennas; ++rx) {
+        for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
             const auto begin = buffers.resampled_stream[rx].begin() +
                 static_cast<std::ptrdiff_t>(
                     timing.offset +
@@ -670,18 +840,27 @@ void prepare_dynamic_iq_frame_impl(
                 buffers.ofdm_samples, fft_size, cp_length,
                 buffers.frequency_scratch);
             for (std::size_t fft = 0u; fft < fft_size; ++fft) {
-                buffers.rx_grid[(symbol * fft_size + fft) * antennas + rx] =
+                buffers.rx_grid[
+                    (symbol * fft_size + fft) * physical_ports + rx] =
                     buffers.frequency_scratch[fft];
             }
         }
     }
     const auto fft_grid_done = Clock::now();
-    const auto& reference_layout = cached_formal_frame_layout(2u, 6u);
+    const LinkMode reference_mode{
+        physical_ports == 1u ? 1u : 2u,
+        Modulation::qam64,
+        TransmissionScheme::spatial_multiplexing,
+        static_cast<unsigned>(physical_ports)};
+    const auto& reference_layout = cached_formal_frame_layout(reference_mode);
     if (!buffers.pilot_reference_valid ||
-        buffers.pilot_reference_seed != capture.pilot_seed) {
+        buffers.pilot_reference_seed != capture.pilot_seed ||
+        buffers.pilot_reference_grid.size() !=
+            data_symbols * fft_size * physical_ports) {
         const auto capacity_before = buffers.pilot_reference_grid.capacity();
         build_dynamic_pilot_reference_grid(
-            capture.pilot_seed, buffers.pilot_reference_grid);
+            capture.pilot_seed, reference_mode,
+            buffers.pilot_reference_grid);
         if (buffers.pilot_reference_grid.capacity() > capacity_before) {
             ++buffers.capacity_growths;
         }
@@ -690,10 +869,12 @@ void prepare_dynamic_iq_frame_impl(
     }
     if (config.pilot_mode == PilotMode::nr_dmrs &&
         (!buffers.dmrs_reference_valid ||
-         buffers.dmrs_reference_seed != capture.pilot_seed)) {
+         buffers.dmrs_reference_seed != capture.pilot_seed ||
+         buffers.dmrs_reference_grid.size() !=
+             nr_dmrs_symbols * fft_size * physical_ports)) {
         const auto capacity_before = buffers.dmrs_reference_grid.capacity();
         build_nr_dmrs_reference_grid(
-            fft_size, reference_layout.active_fft_indices, antennas,
+            fft_size, reference_layout.active_fft_indices, physical_ports,
             capture.pilot_seed, buffers.dmrs_reference_grid);
         if (buffers.dmrs_reference_grid.capacity() > capacity_before) {
             ++buffers.capacity_growths;
@@ -703,21 +884,21 @@ void prepare_dynamic_iq_frame_impl(
     }
     const auto sfo = estimate_sfo_phase_slope(
         buffers.rx_grid, reference_layout.phase_reference_fft_indices,
-        fft_size, antennas, symbol_samples);
+        fft_size, physical_ports, symbol_samples);
     if (config.pilot_mode == PilotMode::nr_dmrs) {
         correct_symbol_phase_inplace(
-            buffers.dmrs_rx_grid, sfo, fft_size, antennas, 1u, 1.0f);
+            buffers.dmrs_rx_grid, sfo, fft_size, physical_ports, 1u, 1.0f);
         correct_symbol_phase_inplace(
-            buffers.rx_grid, sfo, fft_size, antennas, 0u, 2.0f);
+            buffers.rx_grid, sfo, fft_size, physical_ports, 0u, 2.0f);
         correct_symbol_phase_inplace(
-            buffers.rx_grid, sfo, fft_size, antennas, 1u, 3.0f);
+            buffers.rx_grid, sfo, fft_size, physical_ports, 1u, 3.0f);
     } else {
         correct_second_symbol_phase_inplace(
-            buffers.rx_grid, sfo, fft_size, antennas);
+            buffers.rx_grid, sfo, fft_size, physical_ports);
     }
     const auto residual_sfo = estimate_sfo_phase_slope(
         buffers.rx_grid, reference_layout.phase_reference_fft_indices,
-        fft_size, antennas, symbol_samples);
+        fft_size, physical_ports, symbol_samples);
     const auto sfo_done = Clock::now();
 
     resize_tracked(
@@ -728,16 +909,16 @@ void prepare_dynamic_iq_frame_impl(
         estimate_nr_dmrs_channel_linear_nxn(
             buffers.dmrs_rx_grid, buffers.dmrs_reference_grid,
             reference_layout.active_fft_indices, data_symbols, fft_size,
-            antennas, buffers.dmrs_channels,
+            physical_ports, buffers.dmrs_channels,
             buffers.dmrs_channel_estimation);
         for (std::size_t time = 0u; time < data_symbols; ++time) {
             const auto phase_tracking =
                 estimate_reference_residual_phase_slope_nxn(
                     buffers.rx_grid, buffers.pilot_reference_grid,
                     reference_layout.pilot_fft_indices,
-                    buffers.dmrs_channels, time, fft_size, antennas);
+                    buffers.dmrs_channels, time, fft_size, physical_ports);
             correct_symbol_phase_inplace(
-                buffers.rx_grid, phase_tracking, fft_size, antennas,
+                buffers.rx_grid, phase_tracking, fft_size, physical_ports,
                 time, 1.0f);
         }
         buffers.capacity_growths +=
@@ -747,9 +928,31 @@ void prepare_dynamic_iq_frame_impl(
             const auto& source = buffers.dmrs_channels[index];
             auto& target = buffers.channels[index];
             target.h00 = source.values[0u * maximum_spatial_streams + 0u];
-            target.h01 = source.values[0u * maximum_spatial_streams + 1u];
-            target.h10 = source.values[1u * maximum_spatial_streams + 0u];
-            target.h11 = source.values[1u * maximum_spatial_streams + 1u];
+            target.h01 = physical_ports == 2u
+                ? source.values[0u * maximum_spatial_streams + 1u]
+                : std::complex<float>{};
+            target.h10 = physical_ports == 2u
+                ? source.values[1u * maximum_spatial_streams + 0u]
+                : std::complex<float>{};
+            target.h11 = physical_ports == 2u
+                ? source.values[1u * maximum_spatial_streams + 1u]
+                : std::complex<float>{};
+        }
+    } else if (physical_ports == 1u) {
+        const std::size_t estimator_growths_before =
+            buffers.dmrs_channel_estimation.capacity_growths;
+        estimate_fdm_pilot_channel_linear_nxn(
+            buffers.rx_grid, buffers.pilot_reference_grid,
+            reference_layout.pilot_fft_indices,
+            data_symbols, fft_size, physical_ports,
+            buffers.dmrs_channels, buffers.dmrs_channel_estimation);
+        buffers.capacity_growths +=
+            buffers.dmrs_channel_estimation.capacity_growths -
+            estimator_growths_before;
+        for (std::size_t index = 0u; index < buffers.channels.size(); ++index) {
+            buffers.channels[index] = Channel2x2{};
+            buffers.channels[index].h00 =
+                buffers.dmrs_channels[index].values[0u];
         }
     } else {
         const std::size_t estimator_growths_before =
@@ -774,6 +977,7 @@ void prepare_dynamic_iq_frame_impl(
         raw_noise_variance = estimate_pilot_residual_noise_variance(
             buffers.rx_grid, buffers.pilot_reference_grid,
             reference_layout.pilot_fft_indices,
+            physical_ports,
             buffers.noise_power_samples, buffers.capacity_growths);
         noise_variance_estimated = true;
     }
@@ -841,13 +1045,18 @@ void prepare_dynamic_iq_frame_impl(
                 const auto truth_channel =
                     tdl_frequency_response(*truth_impulse, fft, fft_size);
                 const auto& estimate = channels[time * fft_size + fft];
-                channel_error += std::norm(estimate.h00 - truth_channel.h00) +
-                                 std::norm(estimate.h01 - truth_channel.h01) +
-                                 std::norm(estimate.h10 - truth_channel.h10) +
-                                 std::norm(estimate.h11 - truth_channel.h11);
-                channel_reference +=
-                    std::norm(truth_channel.h00) + std::norm(truth_channel.h01) +
-                    std::norm(truth_channel.h10) + std::norm(truth_channel.h11);
+                channel_error += std::norm(estimate.h00 - truth_channel.h00);
+                channel_reference += std::norm(truth_channel.h00);
+                if (physical_ports == 2u) {
+                    channel_error +=
+                        std::norm(estimate.h01 - truth_channel.h01) +
+                        std::norm(estimate.h10 - truth_channel.h10) +
+                        std::norm(estimate.h11 - truth_channel.h11);
+                    channel_reference +=
+                        std::norm(truth_channel.h01) +
+                        std::norm(truth_channel.h10) +
+                        std::norm(truth_channel.h11);
+                }
             }
         }
     }
@@ -863,8 +1072,10 @@ void prepare_dynamic_iq_frame_impl(
         const std::size_t data = reference_layout.control_data_positions[control];
         const std::size_t fft = reference_layout.data_fft_indices[data];
         const std::array<std::complex<float>, 2> received{{
-            buffers.rx_grid[fft * antennas],
-            buffers.rx_grid[fft * antennas + 1u]}};
+            buffers.rx_grid[fft * physical_ports],
+            physical_ports == 2u
+                ? buffers.rx_grid[fft * physical_ports + 1u]
+                : std::complex<float>{}}};
         float variance = 0.0f;
         const auto symbol = mrc_detect_tx0(
             received, channels[fft], variance, noise_variance);
@@ -875,7 +1086,10 @@ void prepare_dynamic_iq_frame_impl(
 
     float preliminary_marker_metric = 0.0f;
     MiniHeader preliminary_header;
-    LinkMode received_mode{1u, Modulation::qpsk};
+    LinkMode received_mode{
+        1u, Modulation::qpsk,
+        TransmissionScheme::spatial_multiplexing,
+        static_cast<unsigned>(physical_ports)};
     bool preliminary_header_ok = true;
     try {
         preliminary_header = decode_control_qpsk_llrs(
@@ -883,12 +1097,13 @@ void prepare_dynamic_iq_frame_impl(
         received_mode = {
             transmit_rank_from_flags(preliminary_header.flags),
             modulation_from_bits(
-                bits_per_symbol_from_flags(preliminary_header.flags))};
+                bits_per_symbol_from_flags(preliminary_header.flags)),
+            transmission_scheme_from_flags(preliminary_header.flags),
+            static_cast<unsigned>(physical_ports)};
     } catch (const std::exception&) {
         preliminary_header_ok = false;
     }
-    const auto& received_layout = cached_formal_frame_layout(
-        received_mode.rank, modulation_bits(received_mode.modulation));
+    const auto& received_layout = cached_formal_frame_layout(received_mode);
     if (preliminary_header.payload_blocks == 0u ||
         preliminary_header.payload_blocks > received_layout.ldpc_blocks ||
         preliminary_header.payload_len < 2u ||
@@ -902,58 +1117,151 @@ void prepare_dynamic_iq_frame_impl(
     resize_tracked(
         buffers.variances, received_layout.payload_layer_symbols,
         buffers.capacity_growths);
-    resize_tracked(
-        buffers.adaptation_channels,
-        received_layout.payload_time_indices.size(), buffers.capacity_growths);
-    resize_tracked(
-        buffers.adaptation_mse,
-        received_layout.payload_time_indices.size(), buffers.capacity_growths);
-    std::size_t adaptation_index = 0u;
-    for (std::size_t payload_index = 0u;
-         payload_index < received_layout.payload_time_indices.size();
-         ++payload_index) {
-        const std::size_t time = received_layout.payload_time_indices[payload_index];
-        const std::size_t data = received_layout.payload_data_positions[payload_index];
-        const std::size_t fft = received_layout.data_fft_indices[data];
-        const std::array<std::complex<float>, 2> received{{
-            buffers.rx_grid[(time * fft_size + fft) * antennas],
-            buffers.rx_grid[(time * fft_size + fft) * antennas + 1u]}};
-        const auto& channel = channels[time * fft_size + fft];
-        const auto rank2_probe = detect_2x2(
-            received, channel, noise_variance, LinearDetector::mmse);
-        buffers.adaptation_channels[adaptation_index] = channel;
-        buffers.adaptation_mse[adaptation_index] = rank2_probe.predicted_mse;
-        ++adaptation_index;
-        if (received_mode.rank == 1u) {
-            float variance = 0.0f;
-            buffers.equalized[payload_index] = mrc_detect_tx0(
-                received, channel, variance, noise_variance);
-            buffers.variances[payload_index] = variance;
-        } else {
-            for (std::size_t layer = 0u; layer < 2u; ++layer) {
-                const std::size_t index = payload_index * 2u + layer;
-                buffers.equalized[index] = rank2_probe.symbols[layer];
-                buffers.variances[index] = rank2_probe.predicted_mse[layer];
+    LinkDecision recommendation;
+    if (received_mode.scheme == TransmissionScheme::alamouti_stbc) {
+        const std::size_t pairs =
+            received_layout.payload_time_indices.size() / 2u;
+        if (pairs * 2u != received_layout.payload_time_indices.size()) {
+            throw std::runtime_error("received STBC layout is not time-paired");
+        }
+        double variance_sum = 0.0;
+        for (std::size_t pair = 0u; pair < pairs; ++pair) {
+            const std::size_t second = pair + pairs;
+            if (received_layout.payload_time_indices[pair] != 0u ||
+                received_layout.payload_time_indices[second] != 1u ||
+                received_layout.payload_data_positions[pair] !=
+                    received_layout.payload_data_positions[second]) {
+                throw std::runtime_error("received STBC resource pairs are inconsistent");
+            }
+            const std::size_t data =
+                received_layout.payload_data_positions[pair];
+            const std::size_t fft = received_layout.data_fft_indices[data];
+            const std::array<std::complex<float>, 2> received_first{{
+                buffers.rx_grid[fft * physical_ports],
+                buffers.rx_grid[fft * physical_ports + 1u]}};
+            const std::array<std::complex<float>, 2> received_second{{
+                buffers.rx_grid[(fft_size + fft) * physical_ports],
+                buffers.rx_grid[(fft_size + fft) * physical_ports + 1u]}};
+            const auto& first_channel = channels[fft];
+            const auto& second_channel = channels[fft_size + fft];
+            const Channel2x2 average_channel{
+                0.5f * (first_channel.h00 + second_channel.h00),
+                0.5f * (first_channel.h01 + second_channel.h01),
+                0.5f * (first_channel.h10 + second_channel.h10),
+                0.5f * (first_channel.h11 + second_channel.h11)};
+            const auto detected = detect_alamouti_2x2(
+                received_first, received_second, average_channel,
+                noise_variance);
+            buffers.equalized[pair] = detected.symbols[0];
+            buffers.equalized[second] = detected.symbols[1];
+            buffers.variances[pair] = detected.equivalent_variance;
+            buffers.variances[second] = detected.equivalent_variance;
+            variance_sum += 2.0 * detected.equivalent_variance;
+        }
+        recommendation.desired = received_mode;
+        recommendation.configured_mcs_supported = true;
+        const double mean_variance = variance_sum /
+            static_cast<double>(std::max<std::size_t>(1u, pairs * 2u));
+        recommendation.rank1_sinr_db = static_cast<float>(
+            10.0 * std::log10(1.0 / std::max(mean_variance, 1.0e-15)));
+    } else if (physical_ports == 1u) {
+        double variance_sum = 0.0;
+        for (std::size_t payload_index = 0u;
+             payload_index < received_layout.payload_time_indices.size();
+             ++payload_index) {
+            const std::size_t time =
+                received_layout.payload_time_indices[payload_index];
+            const std::size_t data =
+                received_layout.payload_data_positions[payload_index];
+            const std::size_t fft = received_layout.data_fft_indices[data];
+            const auto received =
+                buffers.rx_grid[time * fft_size + fft];
+            const auto channel = channels[time * fft_size + fft].h00;
+            const float power = std::max(std::norm(channel), 1.0e-12f);
+            buffers.equalized[payload_index] =
+                std::conj(channel) * received / power;
+            buffers.variances[payload_index] = noise_variance / power;
+            variance_sum += buffers.variances[payload_index];
+        }
+        recommendation.desired = received_mode;
+        recommendation.configured_mcs_supported = true;
+        const double mean_variance = variance_sum /
+            static_cast<double>(std::max<std::size_t>(
+                1u, received_layout.payload_time_indices.size()));
+        recommendation.rank1_sinr_db = static_cast<float>(
+            10.0 * std::log10(1.0 / std::max(mean_variance, 1.0e-15)));
+    } else {
+        resize_tracked(
+            buffers.adaptation_channels,
+            received_layout.payload_time_indices.size(), buffers.capacity_growths);
+        resize_tracked(
+            buffers.adaptation_mse,
+            received_layout.payload_time_indices.size(), buffers.capacity_growths);
+        std::size_t adaptation_index = 0u;
+        for (std::size_t payload_index = 0u;
+             payload_index < received_layout.payload_time_indices.size();
+             ++payload_index) {
+            const std::size_t time =
+                received_layout.payload_time_indices[payload_index];
+            const std::size_t data =
+                received_layout.payload_data_positions[payload_index];
+            const std::size_t fft = received_layout.data_fft_indices[data];
+            const std::array<std::complex<float>, 2> received{{
+                buffers.rx_grid[(time * fft_size + fft) * physical_ports],
+                buffers.rx_grid[
+                    (time * fft_size + fft) * physical_ports + 1u]}};
+            const auto& channel = channels[time * fft_size + fft];
+            const auto rank2_probe = detect_2x2(
+                received, channel, noise_variance, LinearDetector::mmse);
+            buffers.adaptation_channels[adaptation_index] = channel;
+            buffers.adaptation_mse[adaptation_index] = rank2_probe.predicted_mse;
+            ++adaptation_index;
+            if (received_mode.rank == 1u) {
+                float variance = 0.0f;
+                buffers.equalized[payload_index] = mrc_detect_tx0(
+                    received, channel, variance, noise_variance);
+                buffers.variances[payload_index] = variance;
+            } else {
+                for (std::size_t layer = 0u; layer < 2u; ++layer) {
+                    const std::size_t index = payload_index * 2u + layer;
+                    buffers.equalized[index] = rank2_probe.symbols[layer];
+                    buffers.variances[index] = rank2_probe.predicted_mse[layer];
+                }
             }
         }
+        recommendation = recommend_rank_mcs(
+            buffers.adaptation_channels, buffers.adaptation_mse, noise_variance,
+            LinearDetector::mmse, received_mode.modulation,
+            0.01f, 4.0f, 2.0f);
     }
-    const auto recommendation = recommend_rank_mcs(
-        buffers.adaptation_channels, buffers.adaptation_mse, noise_variance,
-        LinearDetector::mmse, received_mode.modulation,
-        0.01f, 4.0f, 2.0f);
     const auto detection_done = Clock::now();
 
     const auto evm_diagnostics_start = Clock::now();
     double error_power = 0.0;
     double reference_power = 0.0;
-    const bool evm_truth_available =
+    bool evm_available =
         truth_impulse.has_value() &&
         truth->truth_payload_symbols.size() == buffers.equalized.size();
-    if (evm_truth_available) {
+    if (evm_available) {
         for (std::size_t index = 0u; index < buffers.equalized.size(); ++index) {
             error_power += std::norm(
                 buffers.equalized[index] - truth->truth_payload_symbols[index]);
             reference_power += std::norm(truth->truth_payload_symbols[index]);
+        }
+    } else if (!has_truth && preliminary_header_ok &&
+               !buffers.equalized.empty()) {
+        // Hardware captures have no transmitted truth grid. Report the
+        // conventional decision-directed EVM against the nearest decoded QAM
+        // point so gain scans can identify compression and poor equalization.
+        const unsigned bits = modulation_bits(received_mode.modulation);
+        if (SquareQAM::supported(bits)) {
+            evm_available = true;
+            for (const auto sample : buffers.equalized) {
+                const auto reference = SquareQAM::modulate(
+                    SquareQAM::demodulate(sample, bits), bits);
+                error_power += std::norm(sample - reference);
+                reference_power += std::norm(reference);
+            }
         }
     }
 
@@ -985,7 +1293,7 @@ void prepare_dynamic_iq_frame_impl(
         ? static_cast<float>(10.0 * std::log10(
               std::max(channel_error / channel_reference, 1.0e-30)))
         : 0.0f;
-    result.evm_percent = evm_truth_available
+    result.evm_percent = evm_available
         ? static_cast<float>(100.0 * std::sqrt(
               error_power / std::max(reference_power, 1.0e-30)))
         : 0.0f;
@@ -1005,7 +1313,8 @@ void prepare_dynamic_iq_frame_impl(
         }
         prepare_dynamic_frame_payload_llrs(
             preliminary_header, preliminary_marker_metric,
-            buffers.equalized, buffers.variances, buffers.frame_decode);
+            received_mode, buffers.equalized, buffers.variances,
+            buffers.frame_decode);
         result.header_ok = true;
         result.decoded_mode = buffers.frame_decode.mode;
         result.user_payload_bytes =

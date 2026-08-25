@@ -1,0 +1,13 @@
+/build/
+/out/
+/.vs/
+/.vscode/
+/CMakeUserPresets.json
+/import/
+
+# Vendor SDK binaries are machine-specific and may have redistribution limits.
+/third_party/libyunsdr/bin/
+/third_party/libyunsdr/lib/
+*.dll
+*.lib
+*.pdb

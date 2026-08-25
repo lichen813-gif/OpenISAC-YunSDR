@@ -20,3 +20,5 @@ site/node_modules/
 site/.astro/
 site/dist/
 .omx/
+/import/
+/vlc-log.txt

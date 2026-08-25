@@ -6,7 +6,7 @@
 
 - FFT 1024，CP 128；每帧 1 个 ZC 前导和 2 个数据 OFDM 符号；
 - Rank 1/2 使用 672 个数据子载波、216 个梳状导频和 8 个相位参考；Rank 4 使用 448 个数据子载波、440 个四端口FDM导频和 8 个相位参考；
-- 128 个控制 RE；控制头Rank字段为 `00=Rank-1`、`01=Rank-2`、`10=Rank-4`、`11=保留`；
+- 128 个控制 RE；控制头模式字段为 `00=Rank-1`、`01=Rank-2`、`10=Rank-4`、`11=STBC`；物理端口数为收发机带外配置；
 - Rank 1/2 保持两个物理发射端口，Rank 4 使用四个物理发射端口；三种Rank均支持QPSK、16/64/256-QAM；
 - LDPC(1008,504)，每帧容量随Rank/MCS变化；Rank 2、64-QAM基准为14块、880字节用户数据，Rank 4、64-QAM为18块、1132字节用户数据，均另加2字节CRC；
 - 发射链顺序为 CRC、LDPC 编码、扰码、21×48 分块交织、QAM 映射。
@@ -27,7 +27,7 @@
 - 无第三方依赖的 LDPC(1008,504) 编码和归一化 Min-Sum 译码，支持 syndrome 早停；
 - 基于实际 LS CSI、MMSE 后处理 MSE、CRC/失步状态的 Rank/MCS 推荐与迟滞控制；
 - 控制头驱动的动态 Rank 1/2、QPSK/16/64/256-QAM 发射网格、软解调、LDPC/CRC 接收和跨帧控制闭环；
-- 动态帧已经接入完整三径时域链：ZC 定时、CP-CFO、20 ppm SFO、FDM 导频 LS-CSI、Rank-1 MRC、Rank-2 MMSE 和控制反馈；
+- 动态帧已经接入完整三径时域链：ZC 定时、CP-CFO、20 ppm SFO、FDM 导频 LS-CSI、SISO单抽头均衡、双端口Rank-1 MRC、Rank-2 MMSE 和控制反馈；
 - 动态接收机支持跨帧 LS-CSI 指数平滑；默认验证系数 `alpha=0.25`，同步或控制头失败时立即清空历史 CSI，避免失锁后沿用旧信道；
 - `DynamicLinkWorkspace` 复用时域流、FFT、信道、LLR、均衡和链路自适应顶层缓冲区；OFDM、SFO、ZC 定时和 LS-CSI 均提供复用输出接口，最大 Rank/MCS 预热后连续帧不再发生这些缓冲区的容量增长；
 - 完整动态链路输出同步、FFT+CSI、检测+自适应、控制头+LDPC/CRC、仿真诊断和总耗时；真值 NMSE/EVM 诊断明确排除在接收算法耗时之外；
@@ -320,7 +320,7 @@ cpp_phy\run_cpp_sensing_plot.cmd 50
 5. 增加双接收通道联合与角度估计，再评估4×4/8×8感知资源网格。
 ## Windows VLC 视频信道仿真
 
-`openisac_phy_video_bridge` 接收本机 UDP 50000 的 MPEG-TS 数据报，将其分片后逐片通过当前完整的 Rank-1/2/4、QPSK/16/64/256-QAM、空间相关TDL/AWGN/CFO/SFO、MRC/MMSE、LDPC/CRC 链路，并把完整恢复的数据报发送到 UDP 50001。任一分片 CRC 失败时丢弃整个输入数据报。Rank-1/2走原2x2动态流水，Rank-4走4x4两槽位时域流水，默认仍为Rank-2，因此旧命令向下兼容。视频桥支持`--pilot-mode fdm|nr-dmrs`；默认`fdm`为原3符号/225 us帧，`nr-dmrs`为ZC+2个兼容Rank-1/2/4的前置DM-RS+2个数据符号，共5符号/375 us。视频桥默认发射/接收相关系数均为0.2，可用 `--tx-correlation`、`--rx-correlation` 和 `--spatial-seed` 手动设置。
+`openisac_phy_video_bridge` 接收本机 UDP 50000 的 MPEG-TS 数据报，将其分片后逐片通过当前完整的1Tx/1Rx SISO Rank-1、2Tx/2Rx Rank-2、4Tx/4Rx Rank-2/4空间复用或2Tx/2Rx Alamouti STBC，以及QPSK/16/64/256-QAM、TDL/AWGN/CFO/SFO、SISO均衡/MMSE/STBC合并、LDPC/CRC链路。4端口Rank-2保持固定半酉4×2 DFT预编码，完整估计4×4物理信道后按`H_eff=H×W`进行4Rx两层MMSE。`--tx-ports`和`--rx-ports`用于选择1/2/4物理端口；省略时空间Rank-1自动选1/1、Rank-4自动选4/4，其余模式默认2/2。视频桥同时支持`--mimo-mode spatial|stbc`和`--pilot-mode fdm|nr-dmrs`。2Tx/2Rx空间Rank-1不再作为视频模式开放，底层MRC仍供双端口控制头和内部算法使用。
 
 不依赖 VLC 的逐字节回环测试：
 
@@ -340,17 +340,39 @@ cpp_phy\start_vlc_video_demo.cmd "D:\video\sample.mp4" 1500 45
 cpp_phy\manual_video_phy_test.cmd
 ```
 
-实时监视器由C++低频输出快照、Python/Tkinter+NumPy绘图。Rank-1/2显示两层星座和四路2x2信道响应；Rank-4显示四层星座、4条对角信道响应，并用完整16链路生成距离–速度热力图和CFAR目标。Rank-2/4均显示信道条件数中位/P90和病态子载波比例。两种路径都显示导频模式/帧长、一帧时域波形、EVM、频偏/SFO/定时估计和FER。星座遥测按当前帧实际LDPC块数截断，不显示固定标签0的帧尾填充RE。视频TDL支持 `delay:gain_db:phase_deg[:doppler_hz]`，Rank-4按所选225或375 us仿真帧时间推进多普勒相位。默认每两秒额外处理一个128帧感知批次；其余时间不运行感知FFT。脚本自动使用项目Python环境；Rank-4自动使用12个LDPC线程并把VLC转码到默认1000 kbit/s。
+64-QAM STBC完整位置参数示例：
 
-统一DM-RS显式回归在Rank-1/2/4、64-QAM、45 dB、300 Hz CFO、20 ppm SFO、相关系数0.02下各运行30个UDP包，全部逐字节恢复且FER为0。Rank-4相同固定种子100帧中，FDM与DM-RS的EVM为6.562%/7.082%，预FEC BER为0.005047/0.004446，均100/100 CRC通过；DM-RS接收均值986.250 us，高于FDM的838.996 us。DM-RS五符号帧的理论净空口吞吐是三符号FDM帧的60%。
+```bat
+cpp_phy\manual_video_phy_test.cmd "C:\path\to\video.mp4" 1 64QAM 45 300 20 20 "0:0:0:0+3:-14:45:0+9:-8:-80:69.444444" 2 128 0.2 0.2 1000 fdm stbc
+```
+
+1Tx/1Rx SISO示例：
+
+```bat
+cpp_phy\manual_video_phy_test.cmd "C:\path\to\video.mp4" 1 64QAM 45 300 20 20 "0:0:0:0+3:-14:45:0+9:-8:-80:69.444444" 2 128 0 0 1000 fdm spatial 1 1
+```
+
+4Tx/4Rx Rank-2示例：
+
+```bat
+cpp_phy\manual_video_phy_test.cmd "C:\path\to\video.mp4" 2 64QAM 45 300 20 20 "0:0:0:0+3:-14:45:0+9:-8:-80:69.444444" 2 128 0.2 0.2 1000 nr-dmrs spatial 4 4
+```
+
+实时监视器由C++低频输出快照、Python/Tkinter+NumPy绘图。SISO显示单流星座和H00信道，2端口Rank-2显示两层星座和四路2×2信道，STBC显示单流星座；4端口Rank-2显示两层星座、Rank-4显示四层星座，两者都保留完整16链路信道与感知数据。4端口Rank-2的条件数按预编码后的4×2等效信道统计。所有路径都显示导频模式/帧长、一帧时域波形、EVM、频偏/SFO/定时估计和FER。
+
+SISO自动回归覆盖FDM和NR-DMRS，两者在64-QAM、45 dB、300 Hz CFO、20 ppm SFO及动态三径下均逐字节恢复、FER 0。固定种子首帧对比中，FDM为225 us、EVM 1.846%、CSI NMSE -25.179 dB；NR-DMRS为375 us、EVM 3.828%、CSI NMSE -25.191 dB。两者每帧载荷相同，DM-RS净空口吞吐为FDM的60%；低速条件下前置CSI时间老化使其不保证改善EVM。
+
+4Tx/4Rx Rank-2在64-QAM、45 dB、300 Hz CFO、20 ppm SFO、相关系数0.2和动态三径下，FDM/NR-DMRS各20个UDP包、68个PHY帧均FER 0并逐字节恢复；128帧NR-DMRS感知测试的EVM为4.802%，等效条件数中位/P90为2.764/3.143，峰值87.830 m、1.615 m/s，CFAR目标1个。
+
+统一DM-RS显式回归在空间Rank-2/4、64-QAM、45 dB、300 Hz CFO、20 ppm SFO、相关系数0.02下各运行30个UDP包，全部逐字节恢复且FER为0。Rank-4相同固定种子100帧中，FDM与DM-RS的EVM为6.562%/7.082%，预FEC BER为0.005047/0.004446，均100/100 CRC通过；DM-RS接收均值986.250 us，高于FDM的838.996 us。DM-RS五符号帧的理论净空口吞吐是三符号FDM帧的60%。
 
 Rank-4视频感知综合回归使用64-QAM、45 dB、300 Hz CFO、20 ppm SFO和含69.444 Hz运动路径的空间相关三径：80个UDP包、160个PHY帧全部恢复，FER 0；128帧16链路合并得到87.830 m、69.444 Hz、1.795 m/s，CFAR显示目标1个。四层星座各756点、3508点时域波形、完整16链路CSV和Python `--check` 均通过。
 
-Rank-4/64-QAM默认信道条件下的30包回归得到60个PHY帧、FER 0、30/30逐字节恢复，平均完整仿真处理约3.892 ms/帧；这证明离线视频字节闭环正确，不代表满足225 us实时空口周期。Rank-2和Rank-1旧路径同时完成兼容回归且FER为0。
+Rank-4/64-QAM默认信道条件下的30包回归得到60个PHY帧、FER 0、30/30逐字节恢复，平均完整仿真处理约3.892 ms/帧；这证明离线视频字节闭环正确，不代表满足225 us实时空口周期。Rank-2路径同时完成兼容回归且FER为0。
 
 Rank-4默认启用两个相位对齐数据符号的CSI帧内平均，并采用0.5倍导频残余MMSE加载。45 dB、300 Hz CFO、20 ppm SFO、相关系数0.02的500帧固定种子对照中，EVM由6.938%降至6.605%，预FEC BER由0.005709降至0.005088，500/500帧CRC通过；接收均值增加约13.6 us。`openisac_phy_4x4_time_diagnostics.exe` 可用 `--mmse-scale` 和 `--intra-frame-average` 复现实验。
 
-STBC在架构上可兼容，但应独立于Rank空间复用字段：当前Python模型已有2Tx Alamouti STBC/SFBC，C++正式视频链路尚未实现STBC。后续将采用独立的MIMO模式选择，STBC固定单数据流和两时隙合并，避免把Rank-2空间复用误当成STBC；4Tx正交STBC因码率/复杂度折衷暂不作为首选。
+C++正式视频链路现已实现独立的2Tx/2Rx Alamouti STBC：单数据流跨两个连续数据OFDM符号编码，接收端按控制头自动进入两时隙、双接收通道合并；它不是Rank-2空间复用。帧头两位模式字段使用`00/01/10/11 = Rank-1/Rank-2/Rank-4/STBC`，四种调制以及FDM/NR-DMRS均兼容。45 dB、300 Hz CFO、20 ppm SFO、相关系数0.2、动态三径回归中，两种导频各20个UDP包、100个PHY帧均FER 0并逐字节恢复。4Tx正交STBC因码率与复杂度折衷暂未实现。
 
 `manual_video_phy_test.cmd` 会等待视频发送完成；发送端正常结束后先等待物理层遥测静默至少3秒以排空入口队列和VLC缓存，再自动关闭本次测试启动的发送/接收VLC、Python监视器和物理层桥接器。接收VLC被关闭、桥接器退出或用户按 `Ctrl+C` 时直接清理。清理按进程ID执行，不影响测试前已经运行的其他VLC实例。
 

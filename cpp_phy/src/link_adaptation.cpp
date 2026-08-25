@@ -52,7 +52,7 @@ LinkMode confirmed_step(LinkMode current, LinkMode desired) {
         Modulation next = Modulation::qam16;
         if (current.modulation == Modulation::qam16) next = Modulation::qam64;
         if (current.modulation == Modulation::qam64) next = Modulation::qam256;
-        return {current.rank, next};
+        return {current.rank, next, current.scheme, current.transmit_ports};
     }
     return desired;
 }
@@ -79,8 +79,26 @@ const char* modulation_name(Modulation modulation) noexcept {
     return "unknown";
 }
 
+const char* transmission_scheme_name(TransmissionScheme scheme) noexcept {
+    switch (scheme) {
+        case TransmissionScheme::spatial_multiplexing: return "spatial";
+        case TransmissionScheme::alamouti_stbc: return "stbc";
+    }
+    return "unknown";
+}
+
+unsigned physical_transmit_ports(const LinkMode& mode) noexcept {
+    if (mode.transmit_ports != 0u) {
+        return mode.transmit_ports;
+    }
+    return mode.rank == 4u ? 4u : 2u;
+}
+
 bool operator==(const LinkMode& left, const LinkMode& right) noexcept {
-    return left.rank == right.rank && left.modulation == right.modulation;
+    return left.rank == right.rank &&
+           left.modulation == right.modulation &&
+           left.scheme == right.scheme &&
+           physical_transmit_ports(left) == physical_transmit_ports(right);
 }
 
 bool operator!=(const LinkMode& left, const LinkMode& right) noexcept {

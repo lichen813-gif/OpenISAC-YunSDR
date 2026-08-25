@@ -12,7 +12,10 @@ param(
     [Parameter(Position = 10)][ValidateRange(-0.95, 0.95)][double]$TxCorrelation = 0.2,
     [Parameter(Position = 11)][ValidateRange(-0.95, 0.95)][double]$RxCorrelation = 0.2,
     [Parameter(Position = 12)][ValidateRange(250, 5000)][int]$VideoBitrateKbps = 1000,
-    [Parameter(Position = 13)][ValidateSet('fdm', 'nr-dmrs')][string]$PilotMode = 'fdm'
+    [Parameter(Position = 13)][ValidateSet('fdm', 'nr-dmrs')][string]$PilotMode = 'fdm',
+    [Parameter(Position = 14)][ValidateSet('spatial', 'stbc')][string]$MimoMode = 'spatial',
+    [Parameter(Position = 15)][ValidateSet(0, 1, 2, 4)][int]$TxPorts = 0,
+    [Parameter(Position = 16)][ValidateSet(0, 1, 2, 4)][int]$RxPorts = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,7 +54,7 @@ if ($interactive) {
     Write-Host 'Press Enter to keep each default value.'
     Write-Host ''
     $VideoFile = Read-DefaultValue 'Video file' $VideoFile
-    $Rank = [int](Read-DefaultValue 'Spatial Rank, 1, 2 or 4' ([string]$Rank))
+    $Rank = [int](Read-DefaultValue 'Rank: SISO/STBC 1, MIMO 2/4' ([string]$Rank))
     $Modulation = Read-DefaultValue 'Modulation QPSK/16QAM/64QAM/256QAM' $Modulation
     $SnrDb = [double](Read-DefaultValue 'SNR dB' ([string]$SnrDb))
     $CfoHz = [double](Read-DefaultValue 'Carrier frequency offset Hz' ([string]$CfoHz))
@@ -62,8 +65,11 @@ if ($interactive) {
     $SensingCoherentFrames = [int](Read-DefaultValue 'Sensing coherent frames, 0/16/32/64/128/256/512' ([string]$SensingCoherentFrames))
     $TxCorrelation = [double](Read-DefaultValue 'Transmit spatial correlation, -0.95 to 0.95' ([string]$TxCorrelation))
     $RxCorrelation = [double](Read-DefaultValue 'Receive spatial correlation, -0.95 to 0.95' ([string]$RxCorrelation))
-    $VideoBitrateKbps = [int](Read-DefaultValue 'Rank-4 VLC transcoding bitrate kbit/s' ([string]$VideoBitrateKbps))
+    $VideoBitrateKbps = [int](Read-DefaultValue 'Four-port VLC transcoding bitrate kbit/s' ([string]$VideoBitrateKbps))
     $PilotMode = Read-DefaultValue 'Pilot mode fdm/nr-dmrs' $PilotMode
+    $MimoMode = Read-DefaultValue 'MIMO mode spatial/stbc' $MimoMode
+    $TxPorts = [int](Read-DefaultValue 'Physical Tx ports, 0=auto/1/2/4' ([string]$TxPorts))
+    $RxPorts = [int](Read-DefaultValue 'Physical Rx ports, 0=auto/1/2/4' ([string]$RxPorts))
 }
 
 $allowedModulations = @('QPSK', '16QAM', '64QAM', '256QAM')
@@ -75,6 +81,28 @@ if ($PilotMode.ToLowerInvariant() -notin @('fdm', 'nr-dmrs')) {
     throw 'Pilot mode must be fdm or nr-dmrs.'
 }
 $PilotMode = $PilotMode.ToLowerInvariant()
+if ($MimoMode.ToLowerInvariant() -notin @('spatial', 'stbc')) {
+    throw 'MIMO mode must be spatial or stbc.'
+}
+$MimoMode = $MimoMode.ToLowerInvariant()
+if ($TxPorts -eq 0) {
+    $TxPorts = $(if ($Rank -eq 4) { 4 } elseif ($Rank -eq 1 -and $MimoMode -eq 'spatial') { 1 } else { 2 })
+}
+if ($RxPorts -eq 0) { $RxPorts = $TxPorts }
+if ($TxPorts -notin @(1, 2, 4) -or $RxPorts -ne $TxPorts) {
+    throw 'Tx/Rx ports must be equal and set to 1, 2 or 4.'
+}
+if ($MimoMode -eq 'stbc' -and ($Rank -ne 1 -or $TxPorts -ne 2)) {
+    throw 'STBC uses one data stream over 2Tx/2Rx; set Rank=1 and ports=2/2.'
+}
+if ($MimoMode -eq 'spatial') {
+    $validSpatial = ($TxPorts -eq 1 -and $Rank -eq 1) -or
+        ($TxPorts -eq 2 -and $Rank -eq 2) -or
+        ($TxPorts -eq 4 -and $Rank -in @(2, 4))
+    if (-not $validSpatial) {
+        throw 'Spatial profiles are 1x1 Rank-1, 2x2 Rank-2 or 4x4 Rank-2/4. Use STBC for 2x2 Rank-1.'
+    }
+}
 if ($TimingSamples -lt 0 -or $TimingSamples -gt 128) {
     throw 'Timing offset must be between 0 and 128 samples.'
 }
@@ -117,6 +145,9 @@ $telemetry = Join-Path $repositoryRoot 'measurement\live_phy_monitor'
 New-Item -ItemType Directory -Force -Path $telemetry | Out-Null
 $bridgeArguments = @(
     '--rank', [string]$Rank,
+    '--tx-ports', [string]$TxPorts,
+    '--rx-ports', [string]$RxPorts,
+    '--mimo-mode', $MimoMode,
     '--modulation', $Modulation,
     '--pilot-mode', $PilotMode,
     '--fft', '1024',
@@ -128,7 +159,7 @@ $bridgeArguments = @(
     '--timing', [string]$TimingSamples,
     '--tdl', $Tdl,
     '--queue-packets', '8192',
-    '--workers', $(if ($Rank -eq 4) { '12' } else { '8' }),
+    '--workers', $(if ($TxPorts -eq 4) { '12' } else { '8' }),
     '--tx-correlation', [string]$TxCorrelation,
     '--rx-correlation', [string]$RxCorrelation,
     '--mmse-scale', '0.5',
@@ -143,13 +174,22 @@ $bridgeArguments += @(
 )
 
 Write-Host ''
-Write-Host "Starting Rank-$Rank / $Modulation, SNR $SnrDb dB, CFO $CfoHz Hz, SFO $SfoPpm ppm" -ForegroundColor Cyan
+Write-Host "Starting $MimoMode / ${TxPorts}Tx/${RxPorts}Rx / Rank-$Rank / $Modulation, SNR $SnrDb dB, CFO $CfoHz Hz, SFO $SfoPpm ppm" -ForegroundColor Cyan
 Write-Host 'Formal frame: FFT 1024, CP 128, 15 kHz spacing, LDPC + CRC16'
 Write-Host "Pilot mode: $PilotMode; frame symbols: $(if ($PilotMode -eq 'nr-dmrs') { 5 } else { 3 })"
-if ($Rank -le 2) {
+if ($MimoMode -eq 'stbc') {
+    Write-Host "Alamouti STBC: 1 stream, 2 transmit ports, 2 receive ports, 2-slot combining." -ForegroundColor Cyan
+    Write-Host "Dynamic sensing: $SensingCoherentFrames coherent frames; TDL fourth field is Doppler Hz"
+} elseif ($TxPorts -eq 1) {
+    Write-Host 'SISO: 1 transmit port, 1 receive port, single-tap equalization.' -ForegroundColor Cyan
+    Write-Host "Single-link sensing: $SensingCoherentFrames coherent frames; TDL fourth field is Doppler Hz"
+} elseif ($TxPorts -eq 2) {
     Write-Host "Dynamic sensing: $SensingCoherentFrames coherent frames; TDL fourth field is Doppler Hz"
 } else {
-    Write-Host "Rank-4 sensing: 16-link power combining, $SensingCoherentFrames coherent frames." -ForegroundColor Cyan
+    Write-Host "Four-port sensing: 16-link power combining, $SensingCoherentFrames coherent frames." -ForegroundColor Cyan
+    if ($Rank -eq 2) {
+        Write-Host 'Rank-2 uses the fixed semi-unitary 4x2 DFT precoder.' -ForegroundColor Cyan
+    }
     Write-Host "VLC input will be transcoded to H.264 at $VideoBitrateKbps kbit/s."
 }
 Write-Host "MIMO spatial correlation: Tx=$TxCorrelation, Rx=$RxCorrelation, seed=49239"
@@ -234,7 +274,7 @@ try {
     ) -PassThru
     Start-Sleep -Seconds 1
     $streamOutput = '#standard{access=udp,mux=ts,dst=127.0.0.1:50000}'
-    if ($Rank -eq 4) {
+    if ($TxPorts -eq 4) {
         $streamOutput = "#transcode{vcodec=h264,vb=$VideoBitrateKbps,acodec=mpga,ab=96,channels=2}:standard{access=udp,mux=ts,dst=127.0.0.1:50000}"
     }
     $senderProcess = Start-Process -FilePath $vlc -WindowStyle Hidden -ArgumentList @(

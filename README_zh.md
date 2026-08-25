@@ -4,7 +4,7 @@
 
 本仓库当前版本包含完整的 C++/Python 程序源码、配置文件和中英文设计说明，不包含视频文件。
 
-> 当前后端状态：本版本仅支持软件信道仿真。原 UHD/USRP 实现、编译依赖和硬件配置已全部移除。仓库保留厂商无关的 `RadioBackend` 边界，供后续接入 `libyunsdr`；只有在真实后端实现并验证后，才会更新具体接口名称和配置，当前不预设或虚构 `libyunsdr` API。
+> 当前后端状态：Linux 主程序 `BS`/`UE` 仍以软件信道仿真为主，原 UHD/USRP 实现继续保持移除。新增独立的 Windows 子项目 [`libyunsdr-isac/`](libyunsdr-isac/README.md)，已经通过厂商无关的 `RadioBackend` 边界接入 YunSDR Y240 `pcies:0.0`。厂商 SDK 二进制、驱动、固件和视频不在本仓库中再分发。
 
 ## 组成
 
@@ -15,6 +15,7 @@
 | 终端 | `UE` | 下行同步解调、可选上行发送、双站感知 |
 | 前端工具 | `scripts/` | 感知绘图、诊断、配置与控制工具 |
 | 正式 PHY | `cpp_phy/`、`python_phy/` | 跨语言帧结构、MIMO、调制、LDPC 和回归验证 |
+| YunSDR 硬件 | `libyunsdr-isac/` | Y240 适配器、时间戳收发、射频环回、VLC/UDP 桥、诊断与硬件测试 |
 
 ## 环境依赖
 
@@ -37,6 +38,15 @@ sudo apt install -y build-essential cmake pkg-config \
 - Python黄金模型：[模型与验证说明](python_phy/README.md)
 - 设计路线：[Python MIMO到C++](Python_MIMO到C++实施路线.md)、[4×4/DM-RS验证](4x4_MIMO设计与第一阶段验证.md)
 
+## YunSDR 硬件接入
+
+Windows 硬件适配器说明见 [`libyunsdr-isac/README.md`](libyunsdr-isac/README.md)。源码包括 Y240 `pcies:0.0` 后端、正式 PHY 编解码桥、带时间戳的 SISO/2×2 收发、射频环回和 VLC/UDP 工具。已验证的厂商 SDK 需要在本机单独放置，Git 仓库不会上传或再分发该 SDK。
+
+```powershell
+cd libyunsdr-isac
+.\build_vs2019.cmd
+```
+
 ## 编译
 
 ```bash
@@ -57,6 +67,7 @@ AFF3CT 位于系统标准路径时可省略 `-DAFF3CT_ROOT`。主要产物为 `b
 | `scripts/` | Python 前端、网页配置控制台、Linux 性能调优脚本 |
 | `python_phy/` | 跨Windows/Linux的纯Python算法模型、配置、实验和单元测试 |
 | `cpp_phy/` | 独立于UHD的C++17 PHY核心、VS2019脚本、基准、视频桥和实时监视器 |
+| `libyunsdr-isac/` | YunSDR Y240 硬件适配器、配置、验证工具和硬件说明 |
 | `capture/` | 离线感知结果绘图工具 |
 | `docs/` | 项目静态站点，以及架构/信号处理说明页 |
 

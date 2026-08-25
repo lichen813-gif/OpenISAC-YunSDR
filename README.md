@@ -4,7 +4,7 @@
 
 This repository contains the complete C++/Python source, configurations, and design documents for the current release. Video files are intentionally excluded.
 
-> Current backend status: this revision is simulation-only. The previous UHD/USRP implementation, build dependency, and hardware presets have been removed. `RadioBackend` remains as a vendor-neutral boundary for future `libyunsdr` integration; concrete `libyunsdr` API names and configuration will be documented only after that backend is implemented and tested.
+> Current backend status: the main Linux `BS`/`UE` runtime remains simulation-only, and the former UHD/USRP implementation stays removed. The separate [`libyunsdr-isac/`](libyunsdr-isac/README.md) Windows subproject now implements the vendor-neutral `RadioBackend` contract for a verified YunSDR Y240 `pcies:0.0` path. Vendor SDK binaries, drivers, firmware, and videos are not redistributed in this repository.
 
 ## Components
 
@@ -15,6 +15,7 @@ This repository contains the complete C++/Python source, configurations, and des
 | User equipment | `UE` | Downlink synchronization/demodulation, optional uplink transmitter, bistatic sensing |
 | Runtime tools | `scripts/` | Sensing plots, diagnostics, configuration and control tools |
 | Formal PHY | `cpp_phy/`, `python_phy/` | Cross-language frame, MIMO, modulation, LDPC, and regression validation |
+| YunSDR hardware | `libyunsdr-isac/` | Y240 adapter, timestamped streams, RF loopback, VLC/UDP bridge, diagnostics, and hardware tests |
 
 ## Requirements
 
@@ -37,6 +38,15 @@ Install AFF3CT 3.0.2 or newer separately and remember its installation prefix. N
 - Python golden model: [model and validation guide](python_phy/README.md)
 - Design route: [Python MIMO to C++](Python_MIMO到C++实施路线.md) and [4x4/DM-RS validation](4x4_MIMO设计与第一阶段验证.md)
 
+## YunSDR hardware integration
+
+The Windows hardware adapter is documented in [`libyunsdr-isac/README.md`](libyunsdr-isac/README.md). Its source includes the Y240 `pcies:0.0` backend, formal-PHY codec bridge, timestamped SISO/2x2 streams, RF loopback and VLC/UDP tools. The verified vendor SDK must be staged locally and is intentionally excluded from Git.
+
+```powershell
+cd libyunsdr-isac
+.\build_vs2019.cmd
+```
+
 ## Build
 
 ```bash
@@ -57,6 +67,7 @@ If AFF3CT is installed in a standard prefix, omit `-DAFF3CT_ROOT`. The primary o
 | `scripts/` | Python frontends, web config console, and Linux performance helpers |
 | `python_phy/` | Cross-platform Python PHY models, configurations, experiments, and tests |
 | `cpp_phy/` | UHD-independent C++17 PHY core, VS2019 scripts, benchmarks, video bridge, and live monitor |
+| `libyunsdr-isac/` | YunSDR Y240 hardware adapter, configuration, validation tools, and hardware documentation |
 | `capture/` | Offline plotting helpers for saved sensing results |
 | `docs/` | Static project site and architecture/signal-processing pages |
 

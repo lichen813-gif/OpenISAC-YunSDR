@@ -1,0 +1,31 @@
+# Initial engineering preset. The loader will be implemented with the real
+# backend; this file currently documents the intended configuration surface.
+device:
+  # Initial Y240 target. The vendor example uses pcies:0.0; confirm the exact
+  # sub-device syntax during the first probe with the matching Windows SDK.
+  uri: "pcies:0"
+  reference_clock: internal
+  duplex: fdd
+
+rf:
+  sample_rate_hz: 15360000
+  center_frequency_hz: 2450000000
+  bandwidth_hz: 15360000
+  tx_channels: [0]
+  rx_channels: [0]
+  tx_gain_db: 0
+  rx_gain_db: 0
+
+phy:
+  mode: siso
+  rank: 1
+  modulation: 64QAM
+  fft_size: 1024
+  cp_length: 128
+  pilot_mode: fdm
+
+streaming:
+  rx_start_before_tx: true
+  timed_start: true
+  capture_overflow_events: true
+  capture_underflow_events: true

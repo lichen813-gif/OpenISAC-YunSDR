@@ -27,7 +27,10 @@ enum class Rank4SynchronizationMode : std::uint8_t {
 struct Rank4TimeSimulationConfig {
     PilotMode pilot_mode = PilotMode::fdm;
     Modulation modulation = Modulation::qam64;
-    // Zero selects the Rank-4/MCS maximum payload.
+    // Two enables 4Tx/4Rx Rank-2 with the fixed 4x2 DFT precoder. Four keeps
+    // the established four-layer spatial-multiplexing mode.
+    unsigned spatial_rank = 4u;
+    // Zero selects the configured Rank/MCS maximum payload.
     std::size_t payload_bytes = 0u;
     float snr_db = 50.0f;
     std::size_t timing_offset_samples = 20u;
@@ -110,6 +113,7 @@ struct Rank4TimeWorkspace {
 
 struct Rank4TimeSimulationResult {
     PilotMode pilot_mode = PilotMode::fdm;
+    unsigned spatial_rank = 4u;
     std::size_t frame_symbols = formal_frame_symbols(PilotMode::fdm);
     std::uint16_t sequence = 0u;
     std::size_t payload_bytes = 0u;
@@ -149,7 +153,7 @@ struct Rank4TimeSimulationResult {
     std::size_t workspace_growths_this_frame = 0u;
     std::vector<std::complex<float>> transmitted_symbols;
     std::vector<std::complex<float>> equalized_symbols;
-    // Optional Rank-4 telemetry. Channel layout is
+    // Optional four-port telemetry. Channel layout is
     // [link = rx*4+tx][fft], averaged over the two data symbols.
     std::vector<std::complex<float>> sensing_channel_frequency_response;
     std::vector<std::uint8_t> sensing_active_subcarrier_mask;

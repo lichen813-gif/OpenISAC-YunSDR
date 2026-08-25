@@ -96,7 +96,11 @@ struct Options {
     std::size_t ingress_queue_packets = 8192u;
     std::size_t maximum_datagram_bytes = maximum_udp_payload;
     unsigned transmit_rank = 2u;
+    unsigned transmit_ports = 0u;
+    unsigned receive_ports = 0u;
     openisac::Modulation modulation = openisac::Modulation::qam64;
+    openisac::TransmissionScheme transmission_scheme =
+        openisac::TransmissionScheme::spatial_multiplexing;
     openisac::PilotMode pilot_mode = openisac::PilotMode::fdm;
     std::size_t fft_size = 1024u;
     std::size_t cp_length = 128u;
@@ -174,6 +178,18 @@ openisac::PilotMode parse_pilot_mode(const std::string& text) {
     throw std::invalid_argument("pilot mode must be fdm or nr-dmrs");
 }
 
+openisac::TransmissionScheme parse_transmission_scheme(const std::string& text) {
+    if (text == "spatial" || text == "SPATIAL" ||
+        text == "sm" || text == "SM") {
+        return openisac::TransmissionScheme::spatial_multiplexing;
+    }
+    if (text == "stbc" || text == "STBC" ||
+        text == "alamouti" || text == "ALAMOUTI") {
+        return openisac::TransmissionScheme::alamouti_stbc;
+    }
+    throw std::invalid_argument("MIMO mode must be spatial or stbc");
+}
+
 std::vector<openisac::TdlTap> parse_tdl(const std::string& text) {
     std::vector<openisac::TdlTap> taps;
     std::stringstream paths(text);
@@ -223,7 +239,10 @@ void print_usage() {
         << "  --sfo PPM               sample-rate offset (20)\n"
         << "  --timing SAMPLES        frame timing offset (20)\n"
         << "  --tdl SPEC              delay:power_db:phase_deg[:doppler_hz]+...\n"
-        << "  --rank N                spatial rank: 1, 2 or 4 (2)\n"
+        << "  --rank N                rank: 1 for SISO/STBC, 2/4 for MIMO (2)\n"
+        << "  --tx-ports N            physical transmit ports: 1, 2 or 4 (auto)\n"
+        << "  --rx-ports N            physical receive ports: 1, 2 or 4 (auto)\n"
+        << "  --mimo-mode NAME        spatial or stbc (spatial); STBC requires rank 1\n"
         << "  --modulation NAME       QPSK, 16QAM, 64QAM or 256QAM (64QAM)\n"
         << "  --pilot-mode NAME       fdm or nr-dmrs (fdm)\n"
         << "  --fft N                 formal FFT size; currently 1024\n"
@@ -279,6 +298,15 @@ Options parse_options(int argc, char** argv) {
             result.taps = parse_tdl(value("--tdl"));
         } else if (option == "--rank") {
             result.transmit_rank = parse_unsigned(value("--rank"), "rank");
+        } else if (option == "--tx-ports") {
+            result.transmit_ports =
+                parse_unsigned(value("--tx-ports"), "Tx ports");
+        } else if (option == "--rx-ports") {
+            result.receive_ports =
+                parse_unsigned(value("--rx-ports"), "Rx ports");
+        } else if (option == "--mimo-mode") {
+            result.transmission_scheme =
+                parse_transmission_scheme(value("--mimo-mode"));
         } else if (option == "--modulation") {
             result.modulation = parse_modulation(value("--modulation"));
         } else if (option == "--pilot-mode") {
@@ -335,10 +363,36 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("unknown option: " + option);
         }
     }
+    if (result.transmit_ports == 0u) {
+        result.transmit_ports =
+            result.transmit_rank == 4u ? 4u :
+            (result.transmit_rank == 1u &&
+             result.transmission_scheme ==
+                 openisac::TransmissionScheme::spatial_multiplexing
+                ? 1u : 2u);
+    }
+    if (result.receive_ports == 0u) {
+        result.receive_ports = result.transmit_ports;
+    }
     if (result.fft_size != 1024u || result.cp_length != 128u ||
         std::abs(result.subcarrier_spacing_hz - 15000.0f) > 0.1f) {
         throw std::invalid_argument(
             "formal video PHY currently requires FFT=1024, CP=128 and spacing=15000 Hz");
+    }
+    if (result.transmission_scheme ==
+            openisac::TransmissionScheme::alamouti_stbc &&
+        (result.transmit_rank != 1u || result.transmit_ports != 2u)) {
+        throw std::invalid_argument("STBC requires 2Tx/2Rx and rank 1");
+    }
+    if (result.transmission_scheme ==
+            openisac::TransmissionScheme::spatial_multiplexing &&
+        !((result.transmit_ports == 1u && result.transmit_rank == 1u) ||
+          (result.transmit_ports == 2u && result.transmit_rank == 2u) ||
+          (result.transmit_ports == 4u &&
+           (result.transmit_rank == 2u || result.transmit_rank == 4u)))) {
+        throw std::invalid_argument(
+            "spatial profiles are 1Tx/1Rx rank 1, 2Tx/2Rx rank 2 or "
+            "4Tx/4Rx rank 2/4; use STBC for 2Tx/2Rx rank 1");
     }
     if (result.listen_port == 0u || result.listen_port > 65535u ||
         result.output_port == 0u || result.output_port > 65535u ||
@@ -347,6 +401,9 @@ Options parse_options(int argc, char** argv) {
         result.timing_offset > 128u || result.self_test_packets == 0u ||
         (result.transmit_rank != 1u && result.transmit_rank != 2u &&
          result.transmit_rank != 4u) ||
+        (result.transmit_ports != 1u && result.transmit_ports != 2u &&
+         result.transmit_ports != 4u) ||
+        result.receive_ports != result.transmit_ports ||
         result.center_frequency_hz <= 0.0f ||
         std::abs(result.transmit_spatial_correlation) >= 1.0f ||
         std::abs(result.receive_spatial_correlation) >= 1.0f ||
@@ -409,8 +466,8 @@ struct BridgeCounters {
 openisac::DynamicSensingConfig make_sensing_config(const Options& options) {
     openisac::DynamicSensingConfig config;
     config.fft_size = options.fft_size;
-    config.transmit_ports = options.transmit_rank == 4u ? 4u : 2u;
-    config.receive_ports = options.transmit_rank == 4u ? 4u : 2u;
+    config.transmit_ports = options.transmit_ports;
+    config.receive_ports = options.receive_ports;
     config.coherent_frames = options.sensing_coherent_frames;
     config.range_fft_size = options.fft_size;
     config.doppler_fft_size = options.sensing_coherent_frames;
@@ -458,11 +515,13 @@ class VideoPhyChannel {
 public:
     VideoPhyChannel(const Options& options, const openisac::Ldpc5041008& codec)
         : options_(options), codec_(codec),
-          mode_{options.transmit_rank, options.modulation} {
+          mode_{options.transmit_rank, options.modulation,
+                options.transmission_scheme, options.transmit_ports} {
         openisac::FormalFrameProfile profile;
         profile.transmit_rank = mode_.rank;
         profile.bits_per_symbol = openisac::modulation_bits(mode_.modulation);
-        if (mode_.rank == 4u) {
+        profile.scheme = mode_.scheme;
+        if (options_.transmit_ports == 4u) {
             profile.pilot_spacing = 2u;
             rank4_pipeline_ = std::make_unique<openisac::Rank4TimePipeline>(
                 codec_, options_.ldpc_workers);
@@ -509,13 +568,13 @@ public:
         };
         auto receive_frame = [&]() {
             CompletedPhyFrame completed;
-            if (mode_.rank == 4u) {
+            if (options_.transmit_ports == 4u) {
                 auto result = rank4_pipeline_->receive();
                 if (!result.link.sensing_channel_frequency_response.empty()) {
                     try {
                         process_rank4_telemetry(result);
                     } catch (const std::exception& error) {
-                        std::cerr << "WARNING: Rank-4 live telemetry snapshot failed: "
+                        std::cerr << "WARNING: four-port live telemetry snapshot failed: "
                                   << error.what() << '\n';
                         if (sensing_ != nullptr) {
                             sensing_->reset();
@@ -535,7 +594,7 @@ public:
             }
             return completed;
         };
-        const std::size_t pipeline_slots = mode_.rank == 4u
+        const std::size_t pipeline_slots = options_.transmit_ports == 4u
             ? rank4_pipeline_->slot_count()
             : dynamic_pipeline_->slot_count();
         std::size_t in_flight = 0u;
@@ -569,10 +628,11 @@ public:
                 [](const openisac::TdlTap& tap) {
                     return std::abs(tap.doppler_hz) > 1.0e-6f;
                 });
-            if (mode_.rank == 4u) {
+            if (options_.transmit_ports == 4u) {
                 openisac::Rank4TimeSimulationConfig config;
                 config.pilot_mode = options_.pilot_mode;
                 config.modulation = mode_.modulation;
+                config.spatial_rank = mode_.rank;
                 config.snr_db = options_.snr_db;
                 config.timing_offset_samples = options_.timing_offset;
                 config.cfo_hz = options_.cfo_hz;
@@ -599,7 +659,7 @@ public:
                     rank4_sensing_batch_in_flight_ = true;
                     rank4_sensing_capture_remaining_ =
                         options_.sensing_coherent_frames;
-                    std::cout << "Rank-4 sensing capture started: "
+                    std::cout << "Four-port sensing capture started: "
                               << rank4_sensing_capture_remaining_
                               << " coherent frames\n";
                 }
@@ -768,7 +828,7 @@ private:
             if (!ready) {
                 return;
             }
-            std::cout << "Rank-4 sensing capture complete: frame "
+            std::cout << "Four-port sensing capture complete: frame "
                       << pipeline_result.frame_id << '\n';
             rank4_sensing_batch_in_flight_ = false;
             sensing_result = &sensing_->last_result();
@@ -809,7 +869,7 @@ private:
         for (std::size_t index = 0u; index < symbols; ++index) {
             const auto ideal = diagnostic.transmitted_symbols[index];
             const auto equalized = diagnostic.equalized_symbols[index];
-            constellation << index << ',' << index % 4u << ','
+            constellation << index << ',' << index % mode_.rank << ','
                           << ideal.real() << ',' << ideal.imag() << ','
                           << equalized.real() << ',' << equalized.imag() << '\n';
         }
@@ -836,7 +896,7 @@ private:
         channel.close();
         if (!waveform || !constellation || !channel) {
             throw std::runtime_error(
-                "cannot write Rank-4 telemetry waveform/channel data");
+                "cannot write four-port telemetry waveform/channel data");
         }
 
         std::size_t reported_sensing_detections = 0u;
@@ -905,7 +965,7 @@ private:
             detections.close();
             if (!range_doppler || !detections) {
                 throw std::runtime_error(
-                    "cannot write Rank-4 sensing telemetry data");
+                    "cannot write four-port sensing telemetry data");
             }
         }
 
@@ -919,19 +979,23 @@ private:
                 if (diagnostic.sensing_active_subcarrier_mask[fft] == 0u) {
                     continue;
                 }
-                openisac::ChannelNxN channel;
-                channel.streams = 4u;
+                openisac::ChannelNxN physical_channel;
+                physical_channel.streams = 4u;
+                physical_channel.receive_ports = 4u;
                 for (std::size_t rx = 0u; rx < 4u; ++rx) {
                     for (std::size_t tx = 0u; tx < 4u; ++tx) {
                         const std::size_t link = rx * 4u + tx;
-                        channel.values[
+                        physical_channel.values[
                             rx * openisac::maximum_spatial_streams + tx] =
                             diagnostic.sensing_channel_frequency_response[
                                 link * options_.fft_size + fft];
                     }
                 }
+                const auto effective = mode_.rank == 2u
+                    ? openisac::apply_fixed_dft_precoder_4x2(physical_channel)
+                    : physical_channel;
                 condition_numbers.push_back(
-                    openisac::condition_number_nxn(channel));
+                    openisac::condition_number_nxn(effective));
             }
         }
         std::sort(condition_numbers.begin(), condition_numbers.end());
@@ -959,7 +1023,10 @@ private:
         status << "metric,value\n" << std::setprecision(12)
                << "snapshot_epoch_ms," << epoch_ms << '\n'
                << "frame_id," << capture_frame_id << '\n'
-               << "rank,4\n"
+               << "rank," << mode_.rank << '\n'
+               << "mimo_mode,spatial\n"
+               << "tx_ports," << options_.transmit_ports << '\n'
+               << "rx_ports," << options_.receive_ports << '\n'
                << "modulation," << openisac::modulation_name(mode_.modulation) << '\n'
                << "pilot_mode," << openisac::pilot_mode_name(options_.pilot_mode) << '\n'
                << "frame_symbols," << openisac::formal_frame_symbols(options_.pilot_mode) << '\n'
@@ -1036,7 +1103,7 @@ private:
         }
         status.close();
         if (!status) {
-            throw std::runtime_error("cannot write Rank-4 telemetry status data");
+            throw std::runtime_error("cannot write four-port telemetry status data");
         }
         last_telemetry_ = std::chrono::steady_clock::now();
     }
@@ -1128,6 +1195,10 @@ private:
         std::vector<float> condition_numbers;
         condition_numbers.reserve(data_fft_indices_.size());
         for (const auto fft : data_fft_indices_) {
+            if (options_.transmit_ports == 1u) {
+                condition_numbers.push_back(1.0f);
+                continue;
+            }
             const auto& first = channel_view[fft];
             const auto& second = channel_view[options_.fft_size + fft];
             condition_numbers.push_back(condition_number_2x2({
@@ -1234,6 +1305,10 @@ private:
                << "snapshot_epoch_ms," << epoch_ms << '\n'
                << "frame_id," << frame_id_ << '\n'
                << "rank," << mode_.rank << '\n'
+               << "mimo_mode,"
+               << openisac::transmission_scheme_name(mode_.scheme) << '\n'
+               << "tx_ports," << options_.transmit_ports << '\n'
+               << "rx_ports," << options_.receive_ports << '\n'
                << "modulation," << openisac::modulation_name(mode_.modulation) << '\n'
                << "pilot_mode," << openisac::pilot_mode_name(options_.pilot_mode) << '\n'
                << "frame_symbols," << openisac::formal_frame_symbols(options_.pilot_mode) << '\n'
@@ -1391,7 +1466,11 @@ int run_self_test(const Options& options, VideoPhyChannel& channel) {
         std::chrono::steady_clock::now() - start).count();
     print_statistics(channel.counters(), seconds);
     std::cout << "PASS: all " << options.self_test_packets
-              << " UDP datagrams survived fragmentation, Rank-"
+              << " UDP datagrams survived fragmentation, "
+              << openisac::transmission_scheme_name(
+                     options.transmission_scheme)
+              << ' ' << options.transmit_ports << "Tx/"
+              << options.receive_ports << "Rx Rank-"
               << options.transmit_rank << '/'
               << openisac::modulation_name(options.modulation) << " PHY, "
                   "TDL/AWGN/CFO/SFO, LDPC/CRC and reassembly byte-for-byte.\n";
@@ -1424,7 +1503,10 @@ int run_live(const Options& options, VideoPhyChannel& channel) {
     std::cout << "Listening for VLC MPEG-TS/UDP on " << options.listen_address << ':'
               << options.listen_port << "; forwarding decoded packets to "
               << options.output_address << ':' << options.output_port << "\n"
-              << "PHY: " << (options.transmit_rank == 4u ? "4x4" : "2x2")
+              << "PHY: " << options.transmit_ports << "Tx/"
+              << options.receive_ports << "Rx"
+              << ' ' << openisac::transmission_scheme_name(
+                     options.transmission_scheme)
               << " Rank-" << options.transmit_rank << '/'
               << openisac::modulation_name(options.modulation) << ", pilots "
               << openisac::pilot_mode_name(options.pilot_mode)

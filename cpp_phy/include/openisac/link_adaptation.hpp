@@ -11,13 +11,25 @@ namespace openisac {
 
 enum class Modulation { qpsk, qam16, qam64, qam256 };
 
+enum class TransmissionScheme {
+    spatial_multiplexing,
+    alamouti_stbc,
+};
+
 unsigned modulation_bits(Modulation modulation) noexcept;
 const char* modulation_name(Modulation modulation) noexcept;
+const char* transmission_scheme_name(TransmissionScheme scheme) noexcept;
 
 struct LinkMode {
     unsigned rank = 1u;
     Modulation modulation = Modulation::qpsk;
+    TransmissionScheme scheme = TransmissionScheme::spatial_multiplexing;
+    // Zero selects the legacy default: four ports for Rank-4, otherwise two.
+    // Explicit four enables the 4Tx/4Rx Rank-2 precoded profile.
+    unsigned transmit_ports = 0u;
 };
+
+unsigned physical_transmit_ports(const LinkMode& mode) noexcept;
 
 bool operator==(const LinkMode& left, const LinkMode& right) noexcept;
 bool operator!=(const LinkMode& left, const LinkMode& right) noexcept;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "openisac/link_adaptation.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -39,6 +41,7 @@ struct FormalFrameProfile {
     std::size_t control_re_count = 128u;
     unsigned bits_per_symbol = 6u;
     unsigned transmit_rank = 2u;
+    TransmissionScheme scheme = TransmissionScheme::spatial_multiplexing;
 };
 
 struct FormalFrameLayout {
@@ -70,7 +73,9 @@ FormalFrameLayout build_formal_frame_layout(const FormalFrameProfile& profile);
 std::uint8_t modulation_flag(unsigned bits_per_symbol);
 unsigned bits_per_symbol_from_flags(std::uint8_t flags);
 std::uint8_t transmit_rank_flag(unsigned transmit_rank);
+std::uint8_t transmission_mode_flag(const LinkMode& mode);
 unsigned transmit_rank_from_flags(std::uint8_t flags) noexcept;
+TransmissionScheme transmission_scheme_from_flags(std::uint8_t flags) noexcept;
 std::uint64_t pack_mini_header(const MiniHeader& header);
 MiniHeader unpack_mini_header(std::uint64_t word);
 std::vector<std::uint8_t> marker_qpsk_labels();

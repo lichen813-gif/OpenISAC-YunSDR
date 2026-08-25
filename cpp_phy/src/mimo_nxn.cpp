@@ -78,8 +78,14 @@ DetectionNxN detect_nxn(
     float noise_variance,
     LinearDetector detector) {
     const std::size_t streams = channel.streams;
+    const std::size_t receive_ports = channel.receive_ports == 0u
+        ? streams : channel.receive_ports;
     if (streams < 1u || streams > maximum_spatial_streams) {
         throw std::invalid_argument("MIMO stream count must be in [1,8]");
+    }
+    if (receive_ports < streams || receive_ports > maximum_spatial_streams) {
+        throw std::invalid_argument(
+            "MIMO receive-port count must be in [streams,8]");
     }
     if (!std::isfinite(noise_variance) || noise_variance < 0.0f) {
         throw std::invalid_argument("noise variance must be finite and non-negative");
@@ -88,7 +94,7 @@ DetectionNxN detect_nxn(
     Matrix gram{};
     Vector matched{};
     for (std::size_t column = 0u; column < streams; ++column) {
-        for (std::size_t row = 0u; row < streams; ++row) {
+        for (std::size_t row = 0u; row < receive_ports; ++row) {
             const Complex h = channel.values[row * nmax + column] * scale;
             matched[column] += std::conj(h) * received[row];
             for (std::size_t other = 0u; other < streams; ++other) {
@@ -123,8 +129,14 @@ DetectionNxN detect_nxn(
 
 float condition_number_nxn(const ChannelNxN& channel) {
     const std::size_t streams = channel.streams;
+    const std::size_t receive_ports = channel.receive_ports == 0u
+        ? streams : channel.receive_ports;
     if (streams < 1u || streams > maximum_spatial_streams) {
         throw std::invalid_argument("MIMO condition stream count must be in [1,8]");
+    }
+    if (receive_ports < streams || receive_ports > maximum_spatial_streams) {
+        throw std::invalid_argument(
+            "MIMO condition receive-port count must be in [streams,8]");
     }
     constexpr std::size_t real_dimension = 2u * maximum_spatial_streams;
     std::array<double, real_dimension * real_dimension> matrix{};
@@ -134,7 +146,7 @@ float condition_number_nxn(const ChannelNxN& channel) {
     for (std::size_t left = 0u; left < streams; ++left) {
         for (std::size_t right = 0u; right < streams; ++right) {
             std::complex<double> gram{};
-            for (std::size_t rx = 0u; rx < streams; ++rx) {
+            for (std::size_t rx = 0u; rx < receive_ports; ++rx) {
                 gram += std::conj(static_cast<std::complex<double>>(
                             channel.values[rx * nmax + left])) *
                         static_cast<std::complex<double>>(
@@ -208,6 +220,46 @@ float condition_number_nxn(const ChannelNxN& channel) {
         return std::numeric_limits<float>::infinity();
     }
     return static_cast<float>(std::sqrt(maximum / minimum));
+}
+
+std::complex<float> fixed_dft_precoder_4x2(
+    std::size_t transmit_port,
+    std::size_t layer) {
+    if (transmit_port >= 4u || layer >= 2u) {
+        throw std::invalid_argument("4x2 precoder index is out of range");
+    }
+    constexpr float half = 0.5f;
+    static const std::array<std::complex<float>, 8> coefficients{{
+        {half, 0.0f}, {half, 0.0f},
+        {half, 0.0f}, {0.0f, half},
+        {half, 0.0f}, {-half, 0.0f},
+        {half, 0.0f}, {0.0f, -half},
+    }};
+    return coefficients[transmit_port * 2u + layer];
+}
+
+ChannelNxN apply_fixed_dft_precoder_4x2(
+    const ChannelNxN& physical_channel) {
+    const std::size_t physical_receive_ports =
+        physical_channel.receive_ports == 0u
+        ? physical_channel.streams : physical_channel.receive_ports;
+    if (physical_channel.streams != 4u || physical_receive_ports != 4u) {
+        throw std::invalid_argument("4x2 precoding requires a 4x4 physical channel");
+    }
+    ChannelNxN effective;
+    effective.streams = 2u;
+    effective.receive_ports = 4u;
+    for (std::size_t rx = 0u; rx < 4u; ++rx) {
+        for (std::size_t layer = 0u; layer < 2u; ++layer) {
+            for (std::size_t tx = 0u; tx < 4u; ++tx) {
+                effective.values[rx * maximum_spatial_streams + layer] +=
+                    physical_channel.values[
+                        rx * maximum_spatial_streams + tx] *
+                    fixed_dft_precoder_4x2(tx, layer);
+            }
+        }
+    }
+    return effective;
 }
 
 }  // namespace openisac

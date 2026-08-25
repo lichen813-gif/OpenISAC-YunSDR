@@ -61,7 +61,8 @@ std::size_t maximum_delay(const std::vector<TdlTap>& taps) {
 }
 
 void validate(const Rank4TimeSimulationConfig& config) {
-    if (!std::isfinite(config.snr_db) || !std::isfinite(config.cfo_hz) ||
+    if ((config.spatial_rank != 2u && config.spatial_rank != 4u) ||
+        !std::isfinite(config.snr_db) || !std::isfinite(config.cfo_hz) ||
         !std::isfinite(config.sfo_ppm) || std::abs(config.sfo_ppm) >= 10000.0f ||
         !std::isfinite(config.transmit_correlation) ||
         !std::isfinite(config.receive_correlation) ||
@@ -225,7 +226,7 @@ void prepare_rank4_time_frame(
     Rank4TimeReceiverState* receiver_state,
     Rank4TimeWorkspace& workspace) {
     FormalFrameProfile profile;
-    profile.transmit_rank = ports;
+    profile.transmit_rank = config.spatial_rank;
     profile.bits_per_symbol = modulation_bits(config.modulation);
     profile.pilot_spacing = 2u;
     const auto layout = build_formal_frame_layout(profile);
@@ -256,9 +257,11 @@ void prepare_rank4_time_payload_frame(
     prepared.ready = false;
     const std::size_t capacity_before = workspace_capacity(buffers);
     const auto simulation_start = Clock::now();
-    const LinkMode mode{4u, config.modulation};
+    const LinkMode mode{
+        config.spatial_rank, config.modulation,
+        TransmissionScheme::spatial_multiplexing, ports};
     FormalFrameProfile profile;
-    profile.transmit_rank = ports;
+    profile.transmit_rank = config.spatial_rank;
     profile.bits_per_symbol = modulation_bits(config.modulation);
     profile.pilot_spacing = 2u;
     const auto capacity = build_formal_frame_layout(profile);
@@ -378,6 +381,7 @@ void prepare_rank4_time_payload_frame(
     const auto receiver_start = Clock::now();
     Rank4TimeSimulationResult result;
     result.pilot_mode = config.pilot_mode;
+    result.spatial_rank = config.spatial_rank;
     result.frame_symbols = frame_symbol_count;
     result.sequence = sequence;
     result.payload_bytes = payload.size();
@@ -657,7 +661,8 @@ void prepare_rank4_time_payload_frame(
         decoded_header = decode_control_qpsk_llrs(
             buffers.control_llrs, &marker_metric);
         result.header_ok =
-            transmit_rank_from_flags(decoded_header.flags) == ports &&
+            transmit_rank_from_flags(decoded_header.flags) ==
+                config.spatial_rank &&
             bits_per_symbol_from_flags(decoded_header.flags) ==
                 encoded.profile.bits_per_symbol &&
             decoded_header.sequence == sequence &&
@@ -681,12 +686,17 @@ void prepare_rank4_time_payload_frame(
             samples[rx] = buffers.rx_grid[
                 (time * fft_size + fft) * ports + rx];
         }
+        const auto& physical_channel = used_channels[time * fft_size + fft];
+        const ChannelNxN effective_channel = config.spatial_rank == 2u
+            ? apply_fixed_dft_precoder_4x2(physical_channel)
+            : physical_channel;
         const auto detected = detect_nxn(
-            samples, used_channels[time * fft_size + fft],
+            samples, effective_channel,
             result.noise_variance * config.mmse_regularization_scale,
             LinearDetector::mmse);
-        for (std::size_t layer = 0u; layer < ports; ++layer) {
-            const std::size_t index = payload_index * ports + layer;
+        for (std::size_t layer = 0u; layer < config.spatial_rank; ++layer) {
+            const std::size_t index =
+                payload_index * config.spatial_rank + layer;
             buffers.equalized[index] = detected.symbols[layer];
             buffers.variances[index] = std::max(
                 detected.predicted_mse[layer], 1.0e-12f);
@@ -696,7 +706,7 @@ void prepare_rank4_time_payload_frame(
     if (result.header_ok) {
         try {
             prepare_dynamic_frame_payload_llrs(
-                decoded_header, marker_metric, buffers.equalized,
+                decoded_header, marker_metric, mode, buffers.equalized,
                 buffers.variances, buffers.frame_decode);
         } catch (const std::exception&) {
             result.header_ok = false;

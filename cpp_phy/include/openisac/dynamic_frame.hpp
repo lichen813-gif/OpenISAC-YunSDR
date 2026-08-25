@@ -34,7 +34,7 @@ struct EncodedDynamicFrame {
     std::vector<std::complex<float>> payload_symbols;
     std::size_t physical_ports = 2u;
     // [two OFDM data symbols][1024 subcarriers][physical Tx ports]. Legacy
-    // Rank-1/2 frames retain two ports; Rank-4 frames use four.
+    // SISO uses one port, STBC/Rank-2 use two, and four-port modes use four.
     std::vector<std::complex<float>> tx_grid;
 };
 
@@ -84,6 +84,16 @@ void prepare_dynamic_frame_llrs(
 void prepare_dynamic_frame_payload_llrs(
     const MiniHeader& decoded_header,
     float marker_metric,
+    const std::vector<std::complex<float>>& equalized_payload_symbols,
+    const std::vector<float>& effective_noise_variances,
+    PreparedDynamicFrame& prepared);
+
+// Four-port Rank-2 uses the same over-air Rank/MCS header bits as ordinary
+// Rank-2; the configured physical-port profile supplies the resource layout.
+void prepare_dynamic_frame_payload_llrs(
+    const MiniHeader& decoded_header,
+    float marker_metric,
+    const LinkMode& configured_mode,
     const std::vector<std::complex<float>>& equalized_payload_symbols,
     const std::vector<float>& effective_noise_variances,
     PreparedDynamicFrame& prepared);

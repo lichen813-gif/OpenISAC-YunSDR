@@ -112,9 +112,10 @@ void estimate_dynamic_sensing_channel_2x2(
     const DynamicSensingConfig& config,
     DynamicSensingChannelEstimate& estimate) {
     validate_config(config);
-    if (config.transmit_ports != 2u || config.receive_ports != 2u) {
+    if (config.transmit_ports != config.receive_ports ||
+        (config.transmit_ports != 1u && config.transmit_ports != 2u)) {
         throw std::invalid_argument(
-            "known-waveform grid estimator currently requires 2x2 ports");
+            "known-waveform grid estimator requires 1x1 or 2x2 ports");
     }
     const std::size_t expected =
         config.data_symbols * config.fft_size * config.transmit_ports;
@@ -134,7 +135,8 @@ void estimate_dynamic_sensing_channel_2x2(
     estimate.ill_conditioned_subcarriers = 0u;
 
     const std::size_t selected = config.selected_transmit_port;
-    const std::size_t other = 1u - selected;
+    const bool siso = config.transmit_ports == 1u;
+    const std::size_t other = siso ? selected : 1u - selected;
     const float minimum_power = config.minimum_reference_power;
     for (std::size_t fft = 0u; fft < config.fft_size; ++fft) {
         float selected_power = 0.0f;
@@ -154,10 +156,14 @@ void estimate_dynamic_sensing_channel_2x2(
                 symbol, fft, config.selected_receive_port,
                 config.fft_size, config.receive_ports)];
             selected_power += std::norm(x_selected);
-            other_power += std::norm(x_other);
-            cross += std::conj(x_selected) * x_other;
+            if (!siso) {
+                other_power += std::norm(x_other);
+                cross += std::conj(x_selected) * x_other;
+            }
             selected_projection += std::conj(x_selected) * received;
-            other_projection += std::conj(x_other) * received;
+            if (!siso) {
+                other_projection += std::conj(x_other) * received;
+            }
         }
         if (selected_power + other_power <= minimum_power) {
             continue;
