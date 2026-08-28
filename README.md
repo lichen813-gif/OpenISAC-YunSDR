@@ -15,6 +15,7 @@ This repository contains the complete C++/Python source, configurations, and des
 | User equipment | `UE` | Downlink synchronization/demodulation, optional uplink transmitter, bistatic sensing |
 | Runtime tools | `scripts/` | Sensing plots, diagnostics, configuration and control tools |
 | Formal PHY | `cpp_phy/`, `python_phy/` | Cross-language frame, MIMO, modulation, LDPC, and regression validation |
+| CPU/CUDA acceleration | `cpp_phy/cuda/`, `results/benchmarks/` | Windows CPU and DGX Spark ARM64 CPU/CUDA backends, tests, benchmarks, and published results |
 | YunSDR hardware | `libyunsdr-isac/` | Y240 adapter, timestamped streams, RF loopback, VLC/UDP bridge, diagnostics, and hardware tests |
 
 ## Requirements
@@ -47,6 +48,18 @@ cd libyunsdr-isac
 .\build_vs2019.cmd
 ```
 
+## Windows and DGX Spark CPU/CUDA
+
+The reusable C++ PHY now supports Windows x64 CPU and DGX Spark ARM64 CPU/CUDA
+builds. CUDA remains optional and is selected with `--backend cpu|cuda|auto`;
+the CPU path is always retained as the numerical reference and fallback.
+
+- [English stage summary](DGX_WINDOWS_CPU_GPU_RESULTS.md)
+- [Chinese port status](DGX_PHY_PORT_STATUS.md)
+- [Chinese Windows/DGX performance comparison](DGX_WINDOWS_PHY_PERFORMANCE.md)
+- [Chinese video and CUDA migration plan](DGX_Spark视频传输与CUDA移植方案.md)
+- [Published benchmark data](results/benchmarks/README.md)
+
 ## Build
 
 ```bash
@@ -67,6 +80,8 @@ If AFF3CT is installed in a standard prefix, omit `-DAFF3CT_ROOT`. The primary o
 | `scripts/` | Python frontends, web config console, and Linux performance helpers |
 | `python_phy/` | Cross-platform Python PHY models, configurations, experiments, and tests |
 | `cpp_phy/` | UHD-independent C++17 PHY core, VS2019 scripts, benchmarks, video bridge, and live monitor |
+| `cpp_phy/cuda/` | Optional CUDA/cuFFT OFDM and MIMO acceleration for DGX Spark |
+| `results/benchmarks/` | Published Windows CPU, DGX CPU, and DGX CUDA benchmark snapshots |
 | `libyunsdr-isac/` | YunSDR Y240 hardware adapter, configuration, validation tools, and hardware documentation |
 | `capture/` | Offline plotting helpers for saved sensing results |
 | `docs/` | Static project site and architecture/signal-processing pages |

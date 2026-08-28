@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openisac/channel_estimation.hpp"
+#include "openisac/compute_backend.hpp"
 #include "openisac/dynamic_frame.hpp"
 #include "openisac/link_adaptation.hpp"
 #include "openisac/preamble_sync.hpp"
@@ -51,6 +52,7 @@ struct DynamicLinkSimulationConfig {
         {3u, -4.0f, 45.0f},
         {9u, -8.0f, -80.0f},
     };
+    PhyComputeBackend* compute_backend = nullptr;
 };
 
 enum class NoiseVarianceMode : std::uint8_t {
@@ -78,6 +80,9 @@ struct DynamicLinkReceiverConfig {
     std::size_t tracking_half_window_samples = 2u;
     float tracking_min_metric = 0.05f;
     float tracking_metric_ratio = 0.5f;
+    // Optional accelerated implementation for frame-local OFDM/MIMO batches.
+    // A null pointer selects the portable CPU implementation.
+    PhyComputeBackend* compute_backend = nullptr;
 };
 
 DynamicLinkReceiverConfig make_dynamic_link_receiver_config(
@@ -135,6 +140,13 @@ struct DynamicLinkWorkspace {
     std::vector<std::complex<float>> pilot_reference_grid;
     std::vector<std::complex<float>> dmrs_reference_grid;
     std::vector<float> noise_power_samples;
+    std::vector<std::complex<float>> backend_time_batch;
+    std::vector<std::complex<float>> backend_frequency_batch;
+    std::vector<std::complex<float>> backend_received_batch;
+    std::vector<std::complex<float>> backend_channel_batch;
+    std::vector<std::complex<float>> backend_detected_batch;
+    std::vector<float> backend_mse_batch;
+    std::vector<float> backend_soft_bits;
     std::uint32_t pilot_reference_seed = 0u;
     bool pilot_reference_valid = false;
     std::uint32_t dmrs_reference_seed = 0u;

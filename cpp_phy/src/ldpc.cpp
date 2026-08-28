@@ -192,6 +192,11 @@ std::vector<std::uint8_t> Ldpc5041008::encode(
 std::size_t Ldpc5041008::syndrome_weight(
     const std::vector<std::uint8_t>& codeword_bits) const {
     validate_bits(codeword_bits, ldpc_encoded_bits);
+    return syndrome_weight_unchecked(codeword_bits);
+}
+
+std::size_t Ldpc5041008::syndrome_weight_unchecked(
+    const std::vector<std::uint8_t>& codeword_bits) const noexcept {
     std::size_t weight = 0u;
     for (const auto& check : check_rows_) {
         std::uint8_t parity = 0u;
@@ -220,13 +225,28 @@ void Ldpc5041008::decode_normalized_min_sum(
     float normalization,
     LdpcDecodeWorkspace& workspace,
     LdpcDecodeResult& result) const {
-    if (llrs.size() != ldpc_encoded_bits || maximum_iterations == 0u ||
+    decode_normalized_min_sum(
+        llrs.data(), llrs.size(), maximum_iterations, normalization,
+        workspace, result);
+}
+
+void Ldpc5041008::decode_normalized_min_sum(
+    const float* llrs,
+    std::size_t llr_count,
+    unsigned maximum_iterations,
+    float normalization,
+    LdpcDecodeWorkspace& workspace,
+    LdpcDecodeResult& result) const {
+    if (llrs == nullptr || llr_count != ldpc_encoded_bits ||
+        maximum_iterations == 0u ||
         !std::isfinite(normalization) || normalization <= 0.0f || normalization > 1.0f ||
-        std::any_of(llrs.begin(), llrs.end(), [](float value) { return !std::isfinite(value); })) {
+        std::any_of(
+            llrs, llrs + llr_count,
+            [](float value) { return !std::isfinite(value); })) {
         throw std::invalid_argument("invalid LDPC min-sum decoder parameters");
     }
-    resize_tracked(workspace.beliefs, llrs.size(), workspace.capacity_growths);
-    std::copy(llrs.begin(), llrs.end(), workspace.beliefs.begin());
+    resize_tracked(workspace.beliefs, llr_count, workspace.capacity_growths);
+    std::copy(llrs, llrs + llr_count, workspace.beliefs.begin());
     resize_tracked(
         workspace.messages, message_offsets_.back(), workspace.capacity_growths);
     std::fill(workspace.messages.begin(), workspace.messages.end(), 0.0f);
@@ -241,7 +261,9 @@ void Ldpc5041008::decode_normalized_min_sum(
             const auto& variables = check_rows_[check];
             float* const previous =
                 workspace.messages.data() + message_offsets_[check];
-            std::array<float, 16> extrinsic{};
+            // Every active element is assigned by the first edge loop. Avoid
+            // clearing the unused tail for every parity check and iteration.
+            std::array<float, 16> extrinsic;
             float minimum = std::numeric_limits<float>::infinity();
             float second_minimum = std::numeric_limits<float>::infinity();
             std::size_t minimum_index = 0u;
@@ -278,7 +300,9 @@ void Ldpc5041008::decode_normalized_min_sum(
                 workspace.beliefs[bit] < 0.0f ? 1u : 0u;
         }
         result.iterations = iteration;
-        result.syndrome_weight = syndrome_weight(result.codeword_bits);
+        // Hard decisions above are guaranteed to contain only 0/1 and have
+        // the fixed codeword length, so the public validation pass is redundant.
+        result.syndrome_weight = syndrome_weight_unchecked(result.codeword_bits);
         if (result.syndrome_weight == 0u) {
             break;
         }

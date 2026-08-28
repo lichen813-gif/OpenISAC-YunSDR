@@ -20,13 +20,15 @@ unsigned modulation_bits(const std::string& value) {
 
 void usage() {
     std::cout
-        << "OpenISAC algorithm-only Rank-4 OFDM diagnostic\n"
+        << "OpenISAC algorithm-only generic NxN OFDM diagnostic\n"
+        << "  --streams N            spatial streams/ports: 1, 2, 4 or 8 (4)\n"
         << "  --frames N             OFDM frames (10)\n"
         << "  --snr DB               receive SNR dB (45)\n"
         << "  --modulation NAME      QPSK/16QAM/64QAM/256QAM (64QAM)\n"
         << "  --pilot-spacing N      aggregate FDM pilot spacing (2)\n"
         << "  --tx-correlation RHO   exponential Tx correlation (0.2)\n"
         << "  --rx-correlation RHO   exponential Rx correlation (0.2)\n"
+        << "  --flat-channel         use a single zero-delay path for closure\n"
         << "  --seed N               spatial channel seed (311383)\n"
         << "  --output DIRECTORY     CSV output directory\n"
         << "  --check                fail unless uncoded BER<1% and EVM<8%\n";
@@ -39,6 +41,7 @@ int main(int argc, char** argv) {
         openisac::NxNOfdmSimulationConfig config;
         config.streams = 4u;
         std::filesystem::path output = "measurement/cpp_4x4_diagnostics";
+        bool output_explicit = false;
         bool check = false;
         for (int index = 1; index < argc; ++index) {
             const std::string option = argv[index];
@@ -48,7 +51,13 @@ int main(int argc, char** argv) {
                 }
                 return argv[index];
             };
-            if (option == "--frames") {
+            if (option == "--streams") {
+                config.streams = static_cast<std::size_t>(std::stoull(value()));
+                if (config.streams != 1u && config.streams != 2u &&
+                    config.streams != 4u && config.streams != 8u) {
+                    throw std::invalid_argument("streams must be 1, 2, 4 or 8");
+                }
+            } else if (option == "--frames") {
                 config.frames = static_cast<std::size_t>(std::stoull(value()));
             } else if (option == "--snr") {
                 config.snr_db = std::stof(value());
@@ -61,11 +70,14 @@ int main(int argc, char** argv) {
                 config.transmit_correlation = std::stof(value());
             } else if (option == "--rx-correlation") {
                 config.receive_correlation = std::stof(value());
+            } else if (option == "--flat-channel") {
+                config.taps = {{0u, 0.0f, 0.0f}};
             } else if (option == "--seed") {
                 config.channel_seed = static_cast<std::uint32_t>(
                     std::stoul(value()));
             } else if (option == "--output") {
                 output = value();
+                output_explicit = true;
             } else if (option == "--check") {
                 check = true;
             } else if (option == "--help" || option == "-h") {
@@ -75,12 +87,16 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("unknown option: " + option);
             }
         }
+        if (!output_explicit && config.streams != 4u) {
+            output = "measurement/cpp_" + std::to_string(config.streams) +
+                "x" + std::to_string(config.streams) + "_diagnostics";
+        }
 
         const auto result = openisac::simulate_nxn_ofdm_link(config);
         std::filesystem::create_directories(output);
         std::ofstream summary(output / "summary.csv");
         if (!summary) {
-            throw std::runtime_error("cannot create 4x4 summary CSV");
+            throw std::runtime_error("cannot create NxN summary CSV");
         }
         summary << std::setprecision(12)
                 << "metric,value\n"
@@ -93,6 +109,7 @@ int main(int argc, char** argv) {
                 << "snr_db," << config.snr_db << '\n'
                 << "tx_correlation," << config.transmit_correlation << '\n'
                 << "rx_correlation," << config.receive_correlation << '\n'
+                << "channel_taps," << config.taps.size() << '\n'
                 << "pilot_subcarriers," << result.pilot_subcarriers << '\n'
                 << "data_subcarriers," << result.data_subcarriers << '\n'
                 << "detected_symbols," << result.detected_symbols << '\n'
@@ -106,7 +123,7 @@ int main(int argc, char** argv) {
 
         std::ofstream constellation(output / "constellation.csv");
         if (!constellation) {
-            throw std::runtime_error("cannot create 4x4 constellation CSV");
+            throw std::runtime_error("cannot create NxN constellation CSV");
         }
         constellation << "symbol,layer,tx_i,tx_q,rx_i,rx_q\n";
         for (std::size_t index = 0u;
@@ -120,7 +137,8 @@ int main(int argc, char** argv) {
         }
 
         std::cout << std::fixed << std::setprecision(4)
-                  << "Rank-4 " << config.bits_per_symbol << "-bit QAM, "
+                  << config.streams << 'x' << config.streams << ' '
+                  << config.bits_per_symbol << "-bit QAM, "
                   << config.frames << " OFDM frames\n"
                   << "pilots/data=" << result.pilot_subcarriers << '/'
                   << result.data_subcarriers
@@ -132,15 +150,16 @@ int main(int argc, char** argv) {
                   << ", CSI NMSE=" << result.channel_nmse_db << " dB\n"
                   << "CSV: " << std::filesystem::absolute(output).string() << '\n';
         if (check && (result.ber >= 0.01f || result.evm_percent >= 8.0f)) {
-            std::cerr << "FAIL: Rank-4 diagnostic exceeds acceptance threshold\n";
+            std::cerr << "FAIL: NxN diagnostic exceeds acceptance threshold\n";
             return 2;
         }
         if (check) {
-            std::cout << "PASS: Rank-4 OFDM/pilot/TDL/MMSE algorithm closure\n";
+            std::cout << "PASS: " << config.streams << 'x' << config.streams
+                      << " OFDM/pilot/TDL/MMSE algorithm closure\n";
         }
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "4x4 diagnostic error: " << error.what() << '\n';
+        std::cerr << "NxN diagnostic error: " << error.what() << '\n';
         return 1;
     }
 }

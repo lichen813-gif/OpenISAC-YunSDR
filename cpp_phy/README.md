@@ -383,3 +383,70 @@ C++正式视频链路现已实现独立的2Tx/2Rx Alamouti STBC：单数据流�
 空间相关TDL回归使用Rank-2/64-QAM、45 dB和相同随机种子。平坦信道下收发相关系数0/0.2/0.6/0.9的EVM约为0.91%/0.92%/1.55%/6.29%，条件数中位值约2.57/2.58/4.65/19.64；动态三径、相关系数0.2的80包综合回归得到192个PHY帧FER 0、EVM 2.02%、条件数中位/P90为2.78/4.21，并保持87.830 m、1.795 m/s感知峰值。
 
 完整参数和分步操作见仓库根目录的 `Windows_VLC视频信道仿真使用说明.md`。
+
+## DGX Spark CPU/CUDA 后端
+
+Linux CUDA 构建：
+
+```bash
+cd /path/to/OpenISAC-YunSDR/cpp_phy
+bash build_linux_cuda.sh
+```
+
+`openisac_phy_video_bridge` 新增 `--backend cpu|cuda|auto`。`cpu` 保持原始实现；
+`cuda` 要求 CUDA 构建并在接收链中使用批量 1024 点 FFT/去 CP，空间复用模式
+同时使用批量 MMSE 检测；`auto` 在 CUDA 可用时使用 CUDA，初始化失败则回退 CPU。
+4 端口空间复用把 MMSE、QPSK/16/64/256-QAM max-log 软解调、21x48 逆交织
+和软解扰融合为一个 CUDA kernel。普通视频帧直接回传 LDPC 顺序 LLR；周期遥测/感知帧仍回传均衡星座和 MSE，
+因此现有星座图、EVM 和感知监视器保持可用。SISO 和 STBC 当前只把 FFT 放到
+GPU，STBC 的 Alamouti 合并仍在 CPU。
+
+普通 4Tx/4Rx FDM Rank-2/Rank-4 帧已经使用设备驻留前端：cuFFT 网格保留在 GPU，
+仅把 8 个稀疏相位参考回传给原有 SFO 回归；导频残差噪声估计、4×4 信道插值、
+帧内 CSI 平均、跨帧 CSI 平滑、Rank-2 的 4×2 DFT 等效信道、控制区 MRC 以及
+紧凑载荷准备均在 GPU 完成。CPU 解出控制头后，设备上的接收向量和信道矩阵
+直接进入融合 MMSE/QAM kernel，最后只回传 LDPC 顺序 LLR。NR-DMRS、周期遥测、
+感知和真值诊断仍走原有完整主机可观测路径；前导同步、信道仿真、SFO 稀疏回归及
+LDPC/CRC 仍在 CPU，因此当前属于 CPU+CUDA 混合整帧路径。连续帧的通用
+`ChannelNxN` 信道缓冲会保留容量并只覆盖有效端口元素，避免4端口模式每帧清零
+约1 MiB的8x8预留空间。视频桥未指定 `--workers` 时按实测选择 CPU=8、CUDA=1；
+仍可用 `--workers 1..19` 手动覆盖，基准CSV的 `ldpc_workers` 列记录实际值。
+DGX Spark 的单 worker 路径直接在调用线程译码，不创建/唤醒辅助线程；500包、
+3次重复扫描中，其4端口模式 LDPC 中位耗时为243.5到370.4 us/frame，
+而2/4/6/8 worker为约500到760 us/frame，短LDPC块不适合跨核唤醒。
+Windows仍保留8 worker：同样扫描中8 worker比直接路径快约55%到65%。
+
+视频桥的基准CSV还会输出4端口接收阶段耗时：`sync_us_per_frame`、
+`fft_sfo_us_per_frame`、`channel_estimation_us_per_frame`、
+`detection_us_per_frame`、`soft_demapping_us_per_frame`、
+`ldpc_crc_us_per_frame`、`receiver_front_us_per_frame` 和
+`fec_wall_us_per_frame`。添加 `--profile-backend` 后还会用CUDA event记录OFDM和
+MIMO各自的H2D、kernel、D2H时间；该开关默认关闭，避免正式视频传输承担测量
+开销。最新DGX测试中，信道缓冲复用使FDM/NR-DMRS信道估计分别降低约37%到
+39%/27%到29%；进一步把4x4插值改为按子载波连续写入全部矩阵元素后，FDM
+Rank-2/Rank-4信道估计又降低14.8%/12.3%，接收前端降低4.5%/2.5%。设备驻留
+专项复测使用50包预热、500包、5轮：FDM Rank-2/Rank-4接收前端中位数由
+234.61/283.07 us降至192.58/227.11 us，改善17.9%/19.8%，物理层延迟为
+1.396/1.749 ms/帧，全部FER=0；NR-DMRS对照组基本不变。16帧相干感知测试还
+验证了CPU诊断回退后恢复CUDA普通帧时的CSI状态切换。当前LDPC仍比接收前端慢，
+因此没有启用增加排队时延的多帧CUDA合批。
+
+DGX 全模式基准命令如下，最后一个参数选择后端：
+
+```bash
+bash cpp_phy/benchmark_linux_modes.sh \
+  /path/to/OpenISAC-YunSDR/build/cuda-release/openisac_phy_video_bridge \
+  /path/to/OpenISAC-YunSDR/out/platform-benchmark/dgx-cuda 200 20 5 cuda
+```
+
+Windows CPU 对照：
+
+```powershell
+cpp_phy\benchmark_windows_modes.ps1 -OutputDirectory out\platform-benchmark\windows-cpu -Packets 200 -Warmup 20 -Repeats 5
+```
+
+本轮 Windows CPU、DGX CPU、DGX CUDA 三方结果、测试边界和结论见根目录
+`DGX_WINDOWS_PHY_PERFORMANCE.md`。运行脚本默认写入 `out/platform-benchmark`，
+本阶段发布的全模式原始 CSV 位于 `results/benchmarks/platform-benchmark`；
+设备驻留FDM数据位于
+`results/benchmarks/cuda-boundary-optional-profile-20260828/device_resident_fdm.csv`。

@@ -191,7 +191,9 @@ std::size_t workspace_capacity(const Rank4TimeWorkspace& workspace) {
         workspace.noise_power_samples.capacity() +
         workspace.control_llrs.capacity() + workspace.equalized.capacity() +
         workspace.variances.capacity() + workspace.frame_decode.llrs.capacity() +
-        workspace.frame_decode.interleaved_block.capacity();
+        workspace.frame_decode.interleaved_block.capacity() +
+        workspace.backend_control_fft_indices.capacity() +
+        workspace.backend_payload_fft_indices.capacity();
     for (const auto& receive : workspace.channel_estimation.estimates) {
         for (const auto& transmit : receive) {
             total += transmit.capacity();
@@ -451,73 +453,6 @@ void prepare_rank4_time_payload_frame(
     apply_cfo_normalized_inplace(received, -normalized_cfo, fft_size);
     const auto synchronization_done = Clock::now();
 
-    buffers.rx_grid.resize(data_symbols * fft_size * ports);
-    if (config.pilot_mode == PilotMode::nr_dmrs) {
-        buffers.dmrs_rx_grid.resize(nr_dmrs_symbols * fft_size * ports);
-    } else {
-        buffers.dmrs_rx_grid.clear();
-    }
-    buffers.ofdm_samples.resize(symbol_samples);
-    buffers.frequency_scratch.resize(fft_size);
-    if (config.pilot_mode == PilotMode::nr_dmrs) {
-        for (std::size_t time = 0u; time < nr_dmrs_symbols; ++time) {
-            for (std::size_t rx = 0u; rx < ports; ++rx) {
-                const auto begin = received[rx].begin() +
-                    static_cast<std::ptrdiff_t>(
-                        timing.offset + (time + 1u) * symbol_samples);
-                std::copy(
-                    begin, begin + static_cast<std::ptrdiff_t>(symbol_samples),
-                    buffers.ofdm_samples.begin());
-                ofdm_demodulate(
-                    buffers.ofdm_samples, fft_size, cp_length,
-                    buffers.frequency_scratch);
-                for (std::size_t fft = 0u; fft < fft_size; ++fft) {
-                    buffers.dmrs_rx_grid[
-                        (time * fft_size + fft) * ports + rx] =
-                        buffers.frequency_scratch[fft];
-                }
-            }
-        }
-    }
-    for (std::size_t time = 0u; time < data_symbols; ++time) {
-        for (std::size_t rx = 0u; rx < ports; ++rx) {
-            const auto begin = received[rx].begin() +
-                static_cast<std::ptrdiff_t>(
-                    timing.offset +
-                    (time + data_symbol_offset) * symbol_samples);
-            std::copy(
-                begin, begin + static_cast<std::ptrdiff_t>(symbol_samples),
-                buffers.ofdm_samples.begin());
-            ofdm_demodulate(
-                buffers.ofdm_samples, fft_size, cp_length,
-                buffers.frequency_scratch);
-            for (std::size_t fft = 0u; fft < fft_size; ++fft) {
-                buffers.rx_grid[(time * fft_size + fft) * ports + rx] =
-                    buffers.frequency_scratch[fft];
-            }
-        }
-    }
-
-    const auto sfo = estimate_sfo_phase_slope(
-        buffers.rx_grid, encoded.layout.phase_reference_fft_indices,
-        fft_size, ports, symbol_samples);
-    result.estimated_sfo_ppm = sfo.sfo_ppm;
-    if (config.pilot_mode == PilotMode::nr_dmrs) {
-        correct_symbol_phase_inplace(
-            buffers.dmrs_rx_grid, sfo, fft_size, ports, 1u, 1.0f);
-        correct_symbol_phase_inplace(
-            buffers.rx_grid, sfo, fft_size, ports, 0u, 2.0f);
-        correct_symbol_phase_inplace(
-            buffers.rx_grid, sfo, fft_size, ports, 1u, 3.0f);
-    } else {
-        correct_second_symbol_phase_inplace(
-            buffers.rx_grid, sfo, fft_size, ports);
-    }
-    result.residual_sfo_ppm = estimate_sfo_phase_slope(
-        buffers.rx_grid, encoded.layout.phase_reference_fft_indices,
-        fft_size, ports, symbol_samples).sfo_ppm;
-    const auto fft_sfo_done = Clock::now();
-
     if (!buffers.pilot_reference_valid ||
         buffers.pilot_reference_seed != config.pilot_seed ||
         buffers.pilot_reference_modulation != config.modulation) {
@@ -527,6 +462,198 @@ void prepare_rank4_time_payload_frame(
         buffers.pilot_reference_modulation = config.modulation;
         buffers.pilot_reference_valid = true;
     }
+    FdmMimoFrameFrontend device_fdm_frontend;
+    bool device_fdm_prepared = false;
+
+    buffers.rx_grid.resize(data_symbols * fft_size * ports);
+    if (config.pilot_mode == PilotMode::nr_dmrs) {
+        buffers.dmrs_rx_grid.resize(nr_dmrs_symbols * fft_size * ports);
+    } else {
+        buffers.dmrs_rx_grid.clear();
+    }
+    buffers.ofdm_samples.resize(symbol_samples);
+    buffers.frequency_scratch.resize(fft_size);
+    if (config.compute_backend != nullptr) {
+        const std::size_t batch_symbols =
+            (data_symbols + (config.pilot_mode == PilotMode::nr_dmrs
+                ? nr_dmrs_symbols : 0u)) * ports;
+        buffers.backend_time_batch.resize(batch_symbols * symbol_samples);
+        std::size_t batch = 0u;
+        auto pack_symbol = [&](std::size_t frame_symbol, std::size_t rx) {
+            const auto begin = received[rx].begin() +
+                static_cast<std::ptrdiff_t>(
+                    timing.offset + frame_symbol * symbol_samples);
+            std::copy(
+                begin, begin + static_cast<std::ptrdiff_t>(symbol_samples),
+                buffers.backend_time_batch.begin() +
+                    static_cast<std::ptrdiff_t>(batch * symbol_samples));
+            ++batch;
+        };
+        if (config.pilot_mode == PilotMode::nr_dmrs) {
+            for (std::size_t time = 0u; time < nr_dmrs_symbols; ++time) {
+                for (std::size_t rx = 0u; rx < ports; ++rx) {
+                    pack_symbol(time + 1u, rx);
+                }
+            }
+        }
+        for (std::size_t time = 0u; time < data_symbols; ++time) {
+            for (std::size_t rx = 0u; rx < ports; ++rx) {
+                pack_symbol(time + data_symbol_offset, rx);
+            }
+        }
+        if (config.pilot_mode == PilotMode::fdm &&
+            !config.enable_truth_diagnostics &&
+            !config.enable_sensing_snapshot) {
+            buffers.backend_control_fft_indices.resize(
+                encoded.layout.control_data_positions.size());
+            for (std::size_t index = 0u;
+                 index < encoded.layout.control_data_positions.size(); ++index) {
+                buffers.backend_control_fft_indices[index] =
+                    encoded.layout.data_fft_indices[
+                        encoded.layout.control_data_positions[index]];
+            }
+            buffers.backend_payload_fft_indices.resize(
+                encoded.layout.payload_data_positions.size());
+            for (std::size_t index = 0u;
+                 index < encoded.layout.payload_data_positions.size(); ++index) {
+                buffers.backend_payload_fft_indices[index] =
+                    encoded.layout.data_fft_indices[
+                        encoded.layout.payload_data_positions[index]];
+            }
+            FdmMimoFrameRequest request;
+            request.fft_size = fft_size;
+            request.cp_length = cp_length;
+            request.samples_per_symbol = symbol_samples;
+            request.ports = ports;
+            request.spatial_rank = config.spatial_rank;
+            request.time_with_cp = &buffers.backend_time_batch;
+            request.phase_reference_fft_indices =
+                &encoded.layout.phase_reference_fft_indices;
+            request.pilot_fft_indices = &encoded.layout.pilot_fft_indices;
+            request.pilot_reference_grid = &buffers.pilot_reference_grid;
+            request.control_fft_indices =
+                &buffers.backend_control_fft_indices;
+            request.payload_time_indices =
+                &encoded.layout.payload_time_indices;
+            request.payload_fft_indices =
+                &buffers.backend_payload_fft_indices;
+            request.average_intra_frame_csi = config.average_intra_frame_csi;
+            request.reuse_csi_history = receiver_state != nullptr &&
+                receiver_state->csi_valid &&
+                receiver_state->filtered_channels.empty();
+            request.csi_smoothing_alpha = config.csi_smoothing_alpha;
+            device_fdm_prepared =
+                config.compute_backend->prepare_fdm_mimo_frame(
+                    request, device_fdm_frontend);
+        }
+        if (!device_fdm_prepared) {
+            config.compute_backend->ofdm_demodulate_batch(
+                fft_size, cp_length, batch_symbols,
+                buffers.backend_time_batch, buffers.backend_frequency_batch);
+        }
+        batch = 0u;
+        auto unpack_symbol = [&](
+            std::vector<std::complex<float>>& grid,
+            std::size_t time,
+            std::size_t rx) {
+            for (std::size_t fft = 0u; fft < fft_size; ++fft) {
+                grid[(time * fft_size + fft) * ports + rx] =
+                    buffers.backend_frequency_batch[batch * fft_size + fft];
+            }
+            ++batch;
+        };
+        if (!device_fdm_prepared && config.pilot_mode == PilotMode::nr_dmrs) {
+            for (std::size_t time = 0u; time < nr_dmrs_symbols; ++time) {
+                for (std::size_t rx = 0u; rx < ports; ++rx) {
+                    unpack_symbol(buffers.dmrs_rx_grid, time, rx);
+                }
+            }
+        }
+        if (!device_fdm_prepared) {
+            for (std::size_t time = 0u; time < data_symbols; ++time) {
+                for (std::size_t rx = 0u; rx < ports; ++rx) {
+                    unpack_symbol(buffers.rx_grid, time, rx);
+                }
+            }
+        }
+    } else {
+        if (config.pilot_mode == PilotMode::nr_dmrs) {
+            for (std::size_t time = 0u; time < nr_dmrs_symbols; ++time) {
+                for (std::size_t rx = 0u; rx < ports; ++rx) {
+                    const auto begin = received[rx].begin() +
+                        static_cast<std::ptrdiff_t>(
+                            timing.offset + (time + 1u) * symbol_samples);
+                    std::copy(
+                        begin, begin + static_cast<std::ptrdiff_t>(symbol_samples),
+                        buffers.ofdm_samples.begin());
+                    ofdm_demodulate(
+                        buffers.ofdm_samples, fft_size, cp_length,
+                        buffers.frequency_scratch);
+                    for (std::size_t fft = 0u; fft < fft_size; ++fft) {
+                        buffers.dmrs_rx_grid[
+                            (time * fft_size + fft) * ports + rx] =
+                            buffers.frequency_scratch[fft];
+                    }
+                }
+            }
+        }
+        for (std::size_t time = 0u; time < data_symbols; ++time) {
+            for (std::size_t rx = 0u; rx < ports; ++rx) {
+                const auto begin = received[rx].begin() +
+                    static_cast<std::ptrdiff_t>(
+                        timing.offset +
+                        (time + data_symbol_offset) * symbol_samples);
+                std::copy(
+                    begin, begin + static_cast<std::ptrdiff_t>(symbol_samples),
+                    buffers.ofdm_samples.begin());
+                ofdm_demodulate(
+                    buffers.ofdm_samples, fft_size, cp_length,
+                    buffers.frequency_scratch);
+                for (std::size_t fft = 0u; fft < fft_size; ++fft) {
+                    buffers.rx_grid[(time * fft_size + fft) * ports + rx] =
+                        buffers.frequency_scratch[fft];
+                }
+            }
+        }
+    }
+
+    if (device_fdm_prepared) {
+        result.estimated_sfo_ppm = device_fdm_frontend.estimated_sfo_ppm;
+        result.residual_sfo_ppm = device_fdm_frontend.residual_sfo_ppm;
+    } else {
+        const auto sfo = estimate_sfo_phase_slope(
+            buffers.rx_grid, encoded.layout.phase_reference_fft_indices,
+            fft_size, ports, symbol_samples);
+        result.estimated_sfo_ppm = sfo.sfo_ppm;
+        if (config.pilot_mode == PilotMode::nr_dmrs) {
+            correct_symbol_phase_inplace(
+                buffers.dmrs_rx_grid, sfo, fft_size, ports, 1u, 1.0f);
+            correct_symbol_phase_inplace(
+                buffers.rx_grid, sfo, fft_size, ports, 0u, 2.0f);
+            correct_symbol_phase_inplace(
+                buffers.rx_grid, sfo, fft_size, ports, 1u, 3.0f);
+        } else {
+            correct_second_symbol_phase_inplace(
+                buffers.rx_grid, sfo, fft_size, ports);
+        }
+        result.residual_sfo_ppm = estimate_sfo_phase_slope(
+            buffers.rx_grid, encoded.layout.phase_reference_fft_indices,
+            fft_size, ports, symbol_samples).sfo_ppm;
+    }
+    const auto fft_sfo_done = Clock::now();
+
+    auto channel_estimation_done = Clock::now();
+    const std::vector<ChannelNxN>* channel_view = &buffers.channels;
+    if (device_fdm_prepared) {
+        result.noise_variance = device_fdm_frontend.noise_variance;
+        buffers.control_llrs = std::move(device_fdm_frontend.control_llrs);
+        channel_estimation_done = Clock::now();
+        if (receiver_state != nullptr) {
+            receiver_state->csi_valid = true;
+            receiver_state->filtered_channels.clear();
+            ++receiver_state->csi_age_frames;
+        }
+    } else {
     if (config.pilot_mode == PilotMode::nr_dmrs &&
         (!buffers.dmrs_reference_valid ||
          buffers.dmrs_reference_seed != config.pilot_seed)) {
@@ -581,8 +708,7 @@ void prepare_rank4_time_payload_frame(
             }
         }
     }
-    const auto channel_estimation_done = Clock::now();
-    const std::vector<ChannelNxN>* channel_view = &buffers.channels;
+    channel_estimation_done = Clock::now();
     if (receiver_state != nullptr) {
         if (receiver_state->csi_valid &&
             receiver_state->filtered_channels.size() == buffers.channels.size()) {
@@ -655,6 +781,8 @@ void prepare_rank4_time_payload_frame(
         buffers.control_llrs.push_back(llrs[0]);
         buffers.control_llrs.push_back(llrs[1]);
     }
+    }
+    const auto& used_channels = *channel_view;
     MiniHeader decoded_header;
     float marker_metric = 0.0f;
     try {
@@ -671,43 +799,125 @@ void prepare_rank4_time_payload_frame(
         result.header_ok = false;
     }
 
-    buffers.equalized.resize(encoded.layout.payload_layer_symbols);
-    buffers.variances.resize(encoded.layout.payload_layer_symbols);
-    for (std::size_t payload_index = 0u;
-         payload_index < encoded.layout.payload_time_indices.size();
-         ++payload_index) {
-        const std::size_t time =
-            encoded.layout.payload_time_indices[payload_index];
-        const std::size_t data =
-            encoded.layout.payload_data_positions[payload_index];
-        const std::size_t fft = encoded.layout.data_fft_indices[data];
-        std::array<std::complex<float>, maximum_spatial_streams> samples{};
-        for (std::size_t rx = 0u; rx < ports; ++rx) {
-            samples[rx] = buffers.rx_grid[
-                (time * fft_size + fft) * ports + rx];
+    const bool retain_equalized = config.compute_backend == nullptr ||
+        config.enable_truth_diagnostics || config.enable_sensing_snapshot;
+    if (retain_equalized) {
+        buffers.equalized.resize(encoded.layout.payload_layer_symbols);
+        buffers.variances.resize(encoded.layout.payload_layer_symbols);
+    } else {
+        buffers.equalized.clear();
+        buffers.variances.clear();
+    }
+    const std::size_t payload_resources =
+        encoded.layout.payload_time_indices.size();
+    if (config.compute_backend != nullptr) {
+        if (device_fdm_prepared) {
+            config.compute_backend->detect_prepared_fdm_mimo(
+                encoded.profile.bits_per_symbol,
+                decoded_header.payload_blocks, result.noise_variance,
+                config.mmse_regularization_scale, retain_equalized,
+                buffers.backend_detected_batch, buffers.backend_mse_batch,
+                buffers.frame_decode.llrs);
+        } else {
+            buffers.backend_received_batch.resize(payload_resources * ports);
+            buffers.backend_channel_batch.resize(
+                payload_resources * ports * config.spatial_rank);
+            for (std::size_t payload_index = 0u;
+                 payload_index < payload_resources; ++payload_index) {
+                const std::size_t time =
+                    encoded.layout.payload_time_indices[payload_index];
+                const std::size_t data =
+                    encoded.layout.payload_data_positions[payload_index];
+                const std::size_t fft = encoded.layout.data_fft_indices[data];
+                for (std::size_t rx = 0u; rx < ports; ++rx) {
+                    buffers.backend_received_batch[payload_index * ports + rx] =
+                        buffers.rx_grid[(time * fft_size + fft) * ports + rx];
+                }
+                const auto& physical_channel =
+                    used_channels[time * fft_size + fft];
+                const ChannelNxN effective_channel = config.spatial_rank == 2u
+                    ? apply_fixed_dft_precoder_4x2(physical_channel)
+                    : physical_channel;
+                const std::size_t channel_offset =
+                    payload_index * ports * config.spatial_rank;
+                for (std::size_t rx = 0u; rx < ports; ++rx) {
+                    for (std::size_t layer = 0u;
+                         layer < config.spatial_rank; ++layer) {
+                        buffers.backend_channel_batch[
+                            channel_offset + rx * config.spatial_rank + layer] =
+                            effective_channel.values[
+                                rx * maximum_spatial_streams + layer];
+                    }
+                }
+            }
+            config.compute_backend->detect_mimo_batch(
+                config.spatial_rank, ports, payload_resources,
+                buffers.backend_received_batch, buffers.backend_channel_batch,
+                result.noise_variance * config.mmse_regularization_scale,
+                LinearDetector::mmse, encoded.profile.bits_per_symbol,
+                decoded_header.payload_blocks,
+                retain_equalized,
+                buffers.backend_detected_batch, buffers.backend_mse_batch,
+                buffers.frame_decode.llrs);
         }
-        const auto& physical_channel = used_channels[time * fft_size + fft];
-        const ChannelNxN effective_channel = config.spatial_rank == 2u
-            ? apply_fixed_dft_precoder_4x2(physical_channel)
-            : physical_channel;
-        const auto detected = detect_nxn(
-            samples, effective_channel,
-            result.noise_variance * config.mmse_regularization_scale,
-            LinearDetector::mmse);
-        for (std::size_t layer = 0u; layer < config.spatial_rank; ++layer) {
-            const std::size_t index =
-                payload_index * config.spatial_rank + layer;
-            buffers.equalized[index] = detected.symbols[layer];
-            buffers.variances[index] = std::max(
-                detected.predicted_mse[layer], 1.0e-12f);
+    }
+    for (std::size_t payload_index = 0u;
+         payload_index < payload_resources;
+         ++payload_index) {
+        if (config.compute_backend != nullptr) {
+            if (retain_equalized) {
+                for (std::size_t layer = 0u;
+                     layer < config.spatial_rank; ++layer) {
+                    const std::size_t index =
+                        payload_index * config.spatial_rank + layer;
+                    buffers.equalized[index] =
+                        buffers.backend_detected_batch[index];
+                    buffers.variances[index] = std::max(
+                        buffers.backend_mse_batch[index], 1.0e-12f);
+                }
+            }
+        } else {
+            const std::size_t time =
+                encoded.layout.payload_time_indices[payload_index];
+            const std::size_t data =
+                encoded.layout.payload_data_positions[payload_index];
+            const std::size_t fft = encoded.layout.data_fft_indices[data];
+            std::array<std::complex<float>, maximum_spatial_streams> samples{};
+            for (std::size_t rx = 0u; rx < ports; ++rx) {
+                samples[rx] = buffers.rx_grid[
+                    (time * fft_size + fft) * ports + rx];
+            }
+            const auto& physical_channel =
+                used_channels[time * fft_size + fft];
+            const ChannelNxN effective_channel = config.spatial_rank == 2u
+                ? apply_fixed_dft_precoder_4x2(physical_channel)
+                : physical_channel;
+            const auto detected = detect_nxn(
+                samples, effective_channel,
+                result.noise_variance * config.mmse_regularization_scale,
+                LinearDetector::mmse);
+            for (std::size_t layer = 0u;
+                 layer < config.spatial_rank; ++layer) {
+                const std::size_t index =
+                    payload_index * config.spatial_rank + layer;
+                buffers.equalized[index] = detected.symbols[layer];
+                buffers.variances[index] = std::max(
+                    detected.predicted_mse[layer], 1.0e-12f);
+            }
         }
     }
     const auto detection_done = Clock::now();
     if (result.header_ok) {
         try {
-            prepare_dynamic_frame_payload_llrs(
-                decoded_header, marker_metric, mode, buffers.equalized,
-                buffers.variances, buffers.frame_decode);
+            if (config.compute_backend != nullptr) {
+                prepare_dynamic_frame_decoder_llrs(
+                    decoded_header, marker_metric, mode,
+                    buffers.frame_decode);
+            } else {
+                prepare_dynamic_frame_payload_llrs(
+                    decoded_header, marker_metric, mode, buffers.equalized,
+                    buffers.variances, buffers.frame_decode);
+            }
         } catch (const std::exception&) {
             result.header_ok = false;
         }
@@ -743,41 +953,57 @@ void prepare_rank4_time_payload_frame(
         channel_estimation_done, detection_done);
     result.soft_demapping_us = elapsed_us(
         detection_done, soft_demapping_done);
+    if (config.compute_backend != nullptr) {
+        const auto backend_timing = config.compute_backend->timing();
+        result.backend_ofdm_h2d_us = backend_timing.ofdm.h2d_us;
+        result.backend_ofdm_kernel_us = backend_timing.ofdm.kernel_us;
+        result.backend_ofdm_d2h_us = backend_timing.ofdm.d2h_us;
+        result.backend_mimo_h2d_us = backend_timing.mimo.h2d_us;
+        result.backend_mimo_kernel_us = backend_timing.mimo.kernel_us;
+        result.backend_mimo_d2h_us = backend_timing.mimo.d2h_us;
+    }
     result.ldpc_crc_us = 0.0;
     result.receiver_us = elapsed_us(receiver_start, soft_demapping_done);
     ++buffers.frames_processed;
     result.workspace_growths_this_frame =
         workspace_capacity(buffers) > capacity_before ? 1u : 0u;
 
-    // Simulator truth metrics are deliberately outside receiver_us.
-    result.transmitted_symbols = encoded.payload_symbols;
-    result.equalized_symbols = buffers.equalized;
-    double error_power = 0.0;
-    double reference_power = 0.0;
-    for (std::size_t index = 0u; index < buffers.equalized.size(); ++index) {
-        error_power += std::norm(
-            buffers.equalized[index] - encoded.payload_symbols[index]);
-        reference_power += std::norm(encoded.payload_symbols[index]);
+    // Simulator truth metrics are deliberately outside receiver_us. Ordinary
+    // GPU video frames omit them so only decoded LLRs cross the PCIe boundary.
+    const bool diagnostics_enabled = config.enable_truth_diagnostics ||
+        config.enable_sensing_snapshot;
+    if (diagnostics_enabled) {
+        result.transmitted_symbols = encoded.payload_symbols;
+        result.equalized_symbols = buffers.equalized;
+        double error_power = 0.0;
+        double reference_power = 0.0;
+        for (std::size_t index = 0u; index < buffers.equalized.size(); ++index) {
+            error_power += std::norm(
+                buffers.equalized[index] - encoded.payload_symbols[index]);
+            reference_power += std::norm(encoded.payload_symbols[index]);
+        }
+        const unsigned payload_bits = encoded.profile.bits_per_symbol;
+        const std::size_t coded_symbols =
+            encoded.transmitted_bits.size() / payload_bits;
+        for (std::size_t symbol = 0u; symbol < coded_symbols; ++symbol) {
+            const unsigned recovered = SquareQAM::demodulate(
+                buffers.equalized[symbol], payload_bits);
+            result.pre_fec_bit_errors += count_bit_errors(
+                encoded.payload_labels[symbol], recovered, payload_bits);
+        }
+        result.pre_fec_compared_bits = encoded.transmitted_bits.size();
+        result.pre_fec_ber = result.pre_fec_compared_bits == 0u ? 0.0f :
+            static_cast<float>(result.pre_fec_bit_errors) /
+            static_cast<float>(result.pre_fec_compared_bits);
+        result.evm_percent = reference_power > 0.0
+            ? 100.0f * std::sqrt(
+                static_cast<float>(error_power / reference_power))
+            : 0.0f;
     }
-    const unsigned payload_bits = encoded.profile.bits_per_symbol;
-    const std::size_t coded_symbols =
-        encoded.transmitted_bits.size() / payload_bits;
-    for (std::size_t symbol = 0u; symbol < coded_symbols; ++symbol) {
-        const unsigned recovered = SquareQAM::demodulate(
-            buffers.equalized[symbol], payload_bits);
-        result.pre_fec_bit_errors += count_bit_errors(
-            encoded.payload_labels[symbol], recovered, payload_bits);
-    }
-    result.pre_fec_compared_bits = encoded.transmitted_bits.size();
-    result.pre_fec_ber = result.pre_fec_compared_bits == 0u ? 0.0f :
-        static_cast<float>(result.pre_fec_bit_errors) /
-        static_cast<float>(result.pre_fec_compared_bits);
-    result.evm_percent = 100.0f * std::sqrt(
-        static_cast<float>(error_power / reference_power));
 
     double channel_error = 0.0;
     double channel_reference = 0.0;
-    if (front_lock_ok) {
+    if (diagnostics_enabled && front_lock_ok) {
         for (std::size_t time = 0u; time < data_symbols; ++time) {
             for (const auto fft : encoded.layout.data_fft_indices) {
                 const auto truth = tdl_frequency_response_nxn(

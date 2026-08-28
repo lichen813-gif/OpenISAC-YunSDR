@@ -173,52 +173,120 @@ PhaseSlopeEstimate estimate_sfo_phase_slope(
     return estimate;
 }
 
-PhaseSlopeEstimate estimate_reference_residual_phase_slope_nxn(
-    const std::vector<std::complex<float>>& receive_grid,
-    const std::vector<std::complex<float>>& reference_grid,
-    const std::vector<std::uint16_t>& pilot_fft_indices,
-    const std::vector<ChannelNxN>& channels,
-    std::size_t symbol_index,
+PhaseSlopeEstimate estimate_sfo_phase_slope_sparse(
+    const std::vector<std::complex<float>>& sparse_grid,
+    const std::vector<std::uint16_t>& phase_reference_fft_indices,
     std::size_t fft_size,
-    std::size_t ports) {
-    if (fft_size == 0u || ports == 0u ||
-        ports > maximum_spatial_streams || pilot_fft_indices.size() < 2u ||
-        receive_grid.size() != reference_grid.size() ||
-        receive_grid.size() % (fft_size * ports) != 0u ||
-        channels.size() * ports != receive_grid.size() ||
-        symbol_index >= receive_grid.size() / (fft_size * ports)) {
-        throw std::invalid_argument(
-            "invalid reference residual phase-slope dimensions");
+    std::size_t receive_antennas,
+    std::size_t samples_per_symbol) {
+    const std::size_t references_count = phase_reference_fft_indices.size();
+    if (fft_size == 0u || receive_antennas == 0u || samples_per_symbol == 0u ||
+        references_count < 2u ||
+        sparse_grid.size() != 2u * references_count * receive_antennas) {
+        throw std::invalid_argument("invalid sparse phase-slope dimensions");
     }
     struct Reference {
         double subcarrier;
         std::complex<double> correlation;
     };
     std::vector<Reference> references;
-    references.reserve(pilot_fft_indices.size());
-    for (const auto fft : pilot_fft_indices) {
+    references.reserve(references_count);
+    for (std::size_t reference = 0u; reference < references_count; ++reference) {
+        const auto fft_index = phase_reference_fft_indices[reference];
+        if (fft_index >= fft_size) {
+            throw std::invalid_argument("phase reference lies outside the FFT");
+        }
+        std::complex<double> correlation{};
+        for (std::size_t rx = 0u; rx < receive_antennas; ++rx) {
+            const auto first = sparse_grid[reference * receive_antennas + rx];
+            const auto second = sparse_grid[
+                (references_count + reference) * receive_antennas + rx];
+            correlation += std::conj(static_cast<std::complex<double>>(first)) *
+                static_cast<std::complex<double>>(second);
+        }
+        const double centered = fft_index < fft_size / 2u
+            ? static_cast<double>(fft_index)
+            : static_cast<double>(fft_index) - static_cast<double>(fft_size);
+        references.push_back({centered, correlation});
+    }
+    std::sort(references.begin(), references.end(), [](const auto& left,
+                                                        const auto& right) {
+        return left.subcarrier < right.subcarrier;
+    });
+    constexpr double two_pi = 6.28318530717958647692;
+    std::vector<double> phases(references.size());
+    phases.front() = std::arg(references.front().correlation);
+    for (std::size_t index = 1u; index < references.size(); ++index) {
+        double phase = std::arg(references[index].correlation);
+        while (phase - phases[index - 1u] > 0.5 * two_pi) phase -= two_pi;
+        while (phase - phases[index - 1u] < -0.5 * two_pi) phase += two_pi;
+        phases[index] = phase;
+    }
+    double sum_w = 0.0;
+    double sum_x = 0.0;
+    double sum_y = 0.0;
+    double sum_xx = 0.0;
+    double sum_xy = 0.0;
+    for (std::size_t index = 0u; index < references.size(); ++index) {
+        const double weight = std::max(
+            std::abs(references[index].correlation), 1.0e-15);
+        const double x = references[index].subcarrier;
+        const double y = phases[index];
+        sum_w += weight;
+        sum_x += weight * x;
+        sum_y += weight * y;
+        sum_xx += weight * x * x;
+        sum_xy += weight * x * y;
+    }
+    const double denominator = sum_w * sum_xx - sum_x * sum_x;
+    if (std::abs(denominator) <= std::numeric_limits<double>::epsilon()) {
+        throw std::runtime_error("phase references cannot determine an SFO slope");
+    }
+    const double slope = (sum_w * sum_xy - sum_x * sum_y) / denominator;
+    const double intercept = (sum_y - slope * sum_x) / sum_w;
+    std::complex<double> aligned{};
+    double magnitude_sum = 0.0;
+    for (const auto& reference : references) {
+        const double fitted = intercept + slope * reference.subcarrier;
+        aligned += reference.correlation * std::polar(1.0, -fitted);
+        magnitude_sum += std::abs(reference.correlation);
+    }
+    PhaseSlopeEstimate estimate;
+    estimate.intercept_radians = static_cast<float>(intercept);
+    estimate.slope_radians_per_subcarrier = static_cast<float>(slope);
+    estimate.sfo_ppm = static_cast<float>(
+        -slope * static_cast<double>(fft_size) /
+        (two_pi * static_cast<double>(samples_per_symbol)) * 1.0e6);
+    estimate.coherence = static_cast<float>(
+        std::abs(aligned) / std::max(magnitude_sum, 1.0e-30));
+    return estimate;
+}
+
+PhaseSlopeEstimate estimate_phase_slope_from_correlations(
+    const std::vector<std::complex<double>>& correlations,
+    const std::vector<std::uint16_t>& reference_fft_indices,
+    std::size_t fft_size) {
+    if (fft_size == 0u || reference_fft_indices.size() < 2u ||
+        correlations.size() != reference_fft_indices.size()) {
+        throw std::invalid_argument(
+            "invalid correlation phase-slope dimensions");
+    }
+    struct Reference {
+        double subcarrier;
+        std::complex<double> correlation;
+    };
+    std::vector<Reference> references;
+    references.reserve(reference_fft_indices.size());
+    for (std::size_t index = 0u;
+         index < reference_fft_indices.size(); ++index) {
+        const auto fft = reference_fft_indices[index];
         if (fft >= fft_size) {
             throw std::invalid_argument("phase-tracking pilot lies outside FFT");
-        }
-        const auto& channel = channels[symbol_index * fft_size + fft];
-        std::complex<double> correlation{};
-        for (std::size_t rx = 0u; rx < ports; ++rx) {
-            std::complex<float> predicted{};
-            for (std::size_t tx = 0u; tx < ports; ++tx) {
-                predicted += channel.values[
-                    rx * maximum_spatial_streams + tx] * reference_grid[
-                    (symbol_index * fft_size + fft) * ports + tx];
-            }
-            const auto received = receive_grid[
-                (symbol_index * fft_size + fft) * ports + rx];
-            correlation += std::conj(
-                static_cast<std::complex<double>>(predicted)) *
-                static_cast<std::complex<double>>(received);
         }
         const double centered = fft < fft_size / 2u
             ? static_cast<double>(fft)
             : static_cast<double>(fft) - static_cast<double>(fft_size);
-        references.push_back({centered, correlation});
+        references.push_back({centered, correlations[index]});
     }
     std::sort(references.begin(), references.end(), [](const auto& left,
                                                         const auto& right) {
@@ -269,6 +337,50 @@ PhaseSlopeEstimate estimate_reference_residual_phase_slope_nxn(
     estimate.coherence = static_cast<float>(
         std::abs(aligned) / std::max(magnitude_sum, 1.0e-30));
     return estimate;
+}
+
+PhaseSlopeEstimate estimate_reference_residual_phase_slope_nxn(
+    const std::vector<std::complex<float>>& receive_grid,
+    const std::vector<std::complex<float>>& reference_grid,
+    const std::vector<std::uint16_t>& pilot_fft_indices,
+    const std::vector<ChannelNxN>& channels,
+    std::size_t symbol_index,
+    std::size_t fft_size,
+    std::size_t ports) {
+    if (fft_size == 0u || ports == 0u ||
+        ports > maximum_spatial_streams || pilot_fft_indices.size() < 2u ||
+        receive_grid.size() != reference_grid.size() ||
+        receive_grid.size() % (fft_size * ports) != 0u ||
+        channels.size() * ports != receive_grid.size() ||
+        symbol_index >= receive_grid.size() / (fft_size * ports)) {
+        throw std::invalid_argument(
+            "invalid reference residual phase-slope dimensions");
+    }
+    std::vector<std::complex<double>> correlations;
+    correlations.reserve(pilot_fft_indices.size());
+    for (const auto fft : pilot_fft_indices) {
+        if (fft >= fft_size) {
+            throw std::invalid_argument("phase-tracking pilot lies outside FFT");
+        }
+        const auto& channel = channels[symbol_index * fft_size + fft];
+        std::complex<double> correlation{};
+        for (std::size_t rx = 0u; rx < ports; ++rx) {
+            std::complex<float> predicted{};
+            for (std::size_t tx = 0u; tx < ports; ++tx) {
+                predicted += channel.values[
+                    rx * maximum_spatial_streams + tx] * reference_grid[
+                    (symbol_index * fft_size + fft) * ports + tx];
+            }
+            const auto received = receive_grid[
+                (symbol_index * fft_size + fft) * ports + rx];
+            correlation += std::conj(
+                static_cast<std::complex<double>>(predicted)) *
+                static_cast<std::complex<double>>(received);
+        }
+        correlations.push_back(correlation);
+    }
+    return estimate_phase_slope_from_correlations(
+        correlations, pilot_fft_indices, fft_size);
 }
 
 void correct_second_symbol_phase_inplace(

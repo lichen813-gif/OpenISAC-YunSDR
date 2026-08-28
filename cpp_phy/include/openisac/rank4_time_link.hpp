@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openisac/channel_estimation.hpp"
+#include "openisac/compute_backend.hpp"
 #include "openisac/dynamic_frame.hpp"
 #include "openisac/link_adaptation.hpp"
 #include "openisac/ldpc.hpp"
@@ -63,6 +64,11 @@ struct Rank4TimeSimulationConfig {
         {0u, 0.0f, 0.0f, 0.0f},
         {3u, -14.0f, 45.0f, 0.0f},
         {9u, -8.0f, -80.0f, 0.0f}};
+    // Simulator-only BER/EVM/NMSE truth metrics require retaining the
+    // equalized constellation on the host. Disable this on ordinary real-time
+    // frames; telemetry/sensing frames still retain their diagnostics.
+    bool enable_truth_diagnostics = true;
+    PhyComputeBackend* compute_backend = nullptr;
 };
 
 struct Rank4TimeReceiverState {
@@ -105,6 +111,14 @@ struct Rank4TimeWorkspace {
     std::vector<float> control_llrs;
     std::vector<std::complex<float>> equalized;
     std::vector<float> variances;
+    std::vector<std::complex<float>> backend_time_batch;
+    std::vector<std::complex<float>> backend_frequency_batch;
+    std::vector<std::uint16_t> backend_control_fft_indices;
+    std::vector<std::uint16_t> backend_payload_fft_indices;
+    std::vector<std::complex<float>> backend_received_batch;
+    std::vector<std::complex<float>> backend_channel_batch;
+    std::vector<std::complex<float>> backend_detected_batch;
+    std::vector<float> backend_mse_batch;
     DynamicFrameDecodeWorkspace frame_decode;
     std::size_t frames_processed = 0u;
 
@@ -145,6 +159,12 @@ struct Rank4TimeSimulationResult {
     double detection_us = 0.0;
     double soft_demapping_us = 0.0;
     double ldpc_crc_us = 0.0;
+    double backend_ofdm_h2d_us = 0.0;
+    double backend_ofdm_kernel_us = 0.0;
+    double backend_ofdm_d2h_us = 0.0;
+    double backend_mimo_h2d_us = 0.0;
+    double backend_mimo_kernel_us = 0.0;
+    double backend_mimo_d2h_us = 0.0;
     double receiver_us = 0.0;
     double simulation_us = 0.0;
     std::size_t ldpc_worker_threads = 1u;

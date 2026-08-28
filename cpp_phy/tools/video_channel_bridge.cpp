@@ -6,6 +6,9 @@
 #include "openisac/rank4_time_link.hpp"
 #include "openisac/rank4_time_pipeline.hpp"
 #include "openisac/sensing.hpp"
+#ifdef OPENISAC_HAS_CUDA
+#include "openisac/cuda_backend.hpp"
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -13,7 +16,13 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
-#error The VLC video channel bridge currently targets Windows Winsock.
+#include <arpa/inet.h>
+#include <cerrno>
+#include <csignal>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -25,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -50,6 +60,7 @@ constexpr std::size_t maximum_udp_payload = 65507u;
 
 std::atomic<bool> stop_requested{false};
 
+#ifdef _WIN32
 BOOL WINAPI console_handler(DWORD event) {
     if (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT ||
         event == CTRL_CLOSE_EVENT) {
@@ -58,8 +69,60 @@ BOOL WINAPI console_handler(DWORD event) {
     }
     return FALSE;
 }
+#else
+void console_handler(int) {
+    stop_requested.store(true);
+}
+#endif
+
+#ifdef _WIN32
+using NativeSocket = SOCKET;
+constexpr NativeSocket invalid_socket = INVALID_SOCKET;
+constexpr int socket_error = SOCKET_ERROR;
+#else
+using NativeSocket = int;
+constexpr NativeSocket invalid_socket = -1;
+constexpr int socket_error = -1;
+#endif
+
+int last_socket_error() {
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+std::string socket_error_message() {
+#ifdef _WIN32
+    return "socket error " + std::to_string(last_socket_error());
+#else
+    const int error = last_socket_error();
+    return "socket error " + std::to_string(error) + " (" +
+        std::strerror(error) + ")";
+#endif
+}
+
+void close_native_socket(NativeSocket value) {
+#ifdef _WIN32
+    closesocket(value);
+#else
+    close(value);
+#endif
+}
+
+int select_readable_socket(
+    NativeSocket value, fd_set* read_set, timeval* timeout) {
+#ifdef _WIN32
+    (void)value;
+    return select(0, read_set, nullptr, nullptr, timeout);
+#else
+    return select(value + 1, read_set, nullptr, nullptr, timeout);
+#endif
+}
 
 struct SocketRuntime {
+#ifdef _WIN32
     SocketRuntime() {
         WSADATA data{};
         if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
@@ -67,13 +130,16 @@ struct SocketRuntime {
         }
     }
     ~SocketRuntime() { WSACleanup(); }
+#else
+    SocketRuntime() = default;
+#endif
 };
 
 struct SocketHandle {
-    SOCKET value = INVALID_SOCKET;
+    NativeSocket value = invalid_socket;
     ~SocketHandle() {
-        if (value != INVALID_SOCKET) {
-            closesocket(value);
+        if (value != invalid_socket) {
+            close_native_socket(value);
         }
     }
     SocketHandle() = default;
@@ -91,7 +157,9 @@ struct Options {
     float sfo_ppm = 20.0f;
     std::size_t timing_offset = 20u;
     unsigned random_seed = 0xC057u;
-    std::size_t ldpc_workers = 8u;
+    // Zero selects the measured backend default (CPU=8, CUDA=1).
+    std::size_t ldpc_workers = 0u;
+    bool profile_backend = false;
     std::size_t socket_buffer_bytes = 4u * 1024u * 1024u;
     std::size_t ingress_queue_packets = 8192u;
     std::size_t maximum_datagram_bytes = maximum_udp_payload;
@@ -122,6 +190,10 @@ struct Options {
     };
     bool self_test = false;
     std::size_t self_test_packets = 12u;
+    std::size_t benchmark_warmup_packets = 0u;
+    std::string benchmark_label;
+    std::string metrics_csv;
+    std::string compute_backend = "cpu";
 };
 
 unsigned parse_unsigned(const std::string& text, const char* name) {
@@ -226,7 +298,7 @@ std::vector<openisac::TdlTap> parse_tdl(const std::string& text) {
 
 void print_usage() {
     std::cout
-        << "OpenISAC Windows VLC/UDP channel simulator\n\n"
+        << "OpenISAC cross-platform VLC/UDP channel simulator\n\n"
         << "Usage:\n"
         << "  openisac_phy_video_bridge.exe [options]\n\n"
         << "Options:\n"
@@ -253,7 +325,7 @@ void print_usage() {
         << "  --rx-correlation RHO    receive spatial correlation, |rho|<1 (0.2)\n"
         << "  --mmse-scale VALUE      Rank-4 MMSE loading scale (0.5)\n"
         << "  --spatial-seed N        repeatable MIMO spatial channel seed\n"
-        << "  --workers N             LDPC worker threads (8)\n"
+        << "  --workers N             LDPC workers (auto: CPU=8, CUDA=1)\n"
         << "  --queue-packets N       UDP ingress queue capacity (8192)\n"
         << "  --seed N                deterministic channel base seed\n"
         << "  --telemetry-dir PATH    write live plot snapshots to PATH\n"
@@ -262,6 +334,11 @@ void print_usage() {
         << "  --sensing-coherent N    coherent frames; 0 disables sensing (128)\n"
         << "  --sensing-range-bins N  exported non-negative range bins (128)\n"
         << "  --self-test [N]         run N packet PHY loopback test (12)\n"
+        << "  --benchmark-warmup N    untimed warm-up packets before self-test (0)\n"
+        << "  --benchmark-label NAME  label stored in the benchmark CSV\n"
+        << "  --metrics-csv PATH      append one self-test result row to CSV\n"
+        << "  --backend NAME          cpu, cuda or auto (cpu)\n"
+        << "  --profile-backend       record CUDA H2D/kernel/D2H event timing\n"
         << "  --help                  show this message\n";
 }
 
@@ -359,6 +436,17 @@ Options parse_options(int argc, char** argv) {
             if (index + 1 < argc && argv[index + 1][0] != '-') {
                 result.self_test_packets = parse_size(argv[++index], "self-test packets");
             }
+        } else if (option == "--benchmark-warmup") {
+            result.benchmark_warmup_packets =
+                parse_size(value("--benchmark-warmup"), "benchmark warmup");
+        } else if (option == "--benchmark-label") {
+            result.benchmark_label = value("--benchmark-label");
+        } else if (option == "--metrics-csv") {
+            result.metrics_csv = value("--metrics-csv");
+        } else if (option == "--backend") {
+            result.compute_backend = value("--backend");
+        } else if (option == "--profile-backend") {
+            result.profile_backend = true;
         } else {
             throw std::invalid_argument("unknown option: " + option);
         }
@@ -370,6 +458,11 @@ Options parse_options(int argc, char** argv) {
              result.transmission_scheme ==
                  openisac::TransmissionScheme::spatial_multiplexing
                 ? 1u : 2u);
+    }
+    if (result.compute_backend != "cpu" &&
+        result.compute_backend != "cuda" &&
+        result.compute_backend != "auto") {
+        throw std::invalid_argument("backend must be cpu, cuda or auto");
     }
     if (result.receive_ports == 0u) {
         result.receive_ports = result.transmit_ports;
@@ -396,7 +489,7 @@ Options parse_options(int argc, char** argv) {
     }
     if (result.listen_port == 0u || result.listen_port > 65535u ||
         result.output_port == 0u || result.output_port > 65535u ||
-        result.ldpc_workers == 0u || result.ldpc_workers > 19u ||
+        result.ldpc_workers > 19u ||
         result.ingress_queue_packets == 0u || result.ingress_queue_packets > 65536u ||
         result.timing_offset > 128u || result.self_test_packets == 0u ||
         (result.transmit_rank != 1u && result.transmit_rank != 2u &&
@@ -461,6 +554,20 @@ struct BridgeCounters {
     std::uint64_t udp_bytes_out = 0u;
     std::uint64_t dropped_packets = 0u;
     double phy_latency_us = 0.0;
+    double synchronization_us = 0.0;
+    double fft_sfo_us = 0.0;
+    double channel_estimation_us = 0.0;
+    double detection_us = 0.0;
+    double soft_demapping_us = 0.0;
+    double ldpc_crc_us = 0.0;
+    double backend_ofdm_h2d_us = 0.0;
+    double backend_ofdm_kernel_us = 0.0;
+    double backend_ofdm_d2h_us = 0.0;
+    double backend_mimo_h2d_us = 0.0;
+    double backend_mimo_kernel_us = 0.0;
+    double backend_mimo_d2h_us = 0.0;
+    double receiver_front_us = 0.0;
+    double fec_wall_us = 0.0;
 };
 
 openisac::DynamicSensingConfig make_sensing_config(const Options& options) {
@@ -517,17 +624,39 @@ public:
         : options_(options), codec_(codec),
           mode_{options.transmit_rank, options.modulation,
                 options.transmission_scheme, options.transmit_ports} {
+#ifdef OPENISAC_HAS_CUDA
+        if (options_.compute_backend == "cuda" ||
+            options_.compute_backend == "auto") {
+            try {
+                compute_backend_ = openisac::make_cuda_compute_backend();
+                compute_backend_->set_timing_enabled(options_.profile_backend);
+                active_backend_ = "cuda";
+            } catch (...) {
+                if (options_.compute_backend == "cuda") {
+                    throw;
+                }
+            }
+        }
+#else
+        if (options_.compute_backend == "cuda") {
+            throw std::runtime_error(
+                "this executable was built without CUDA support");
+        }
+#endif
         openisac::FormalFrameProfile profile;
         profile.transmit_rank = mode_.rank;
         profile.bits_per_symbol = openisac::modulation_bits(mode_.modulation);
         profile.scheme = mode_.scheme;
+        effective_ldpc_workers_ = options_.ldpc_workers != 0u
+            ? options_.ldpc_workers
+            : (active_backend_ == "cuda" ? 1u : 8u);
         if (options_.transmit_ports == 4u) {
             profile.pilot_spacing = 2u;
             rank4_pipeline_ = std::make_unique<openisac::Rank4TimePipeline>(
-                codec_, options_.ldpc_workers);
+                codec_, effective_ldpc_workers_);
         } else {
             dynamic_pipeline_ = std::make_unique<openisac::DynamicLinkPipeline>(
-                codec_, options_.ldpc_workers);
+                codec_, effective_ldpc_workers_);
         }
         const auto layout = openisac::build_formal_frame_layout(profile);
         phy_payload_capacity_ = layout.user_payload_bytes;
@@ -565,6 +694,20 @@ public:
             bool crc_ok = false;
             std::vector<std::uint8_t> payload;
             double latency_us = 0.0;
+            double synchronization_us = 0.0;
+            double fft_sfo_us = 0.0;
+            double channel_estimation_us = 0.0;
+            double detection_us = 0.0;
+            double soft_demapping_us = 0.0;
+            double ldpc_crc_us = 0.0;
+            double backend_ofdm_h2d_us = 0.0;
+            double backend_ofdm_kernel_us = 0.0;
+            double backend_ofdm_d2h_us = 0.0;
+            double backend_mimo_h2d_us = 0.0;
+            double backend_mimo_kernel_us = 0.0;
+            double backend_mimo_d2h_us = 0.0;
+            double receiver_front_us = 0.0;
+            double fec_wall_us = 0.0;
         };
         auto receive_frame = [&]() {
             CompletedPhyFrame completed;
@@ -586,6 +729,27 @@ public:
                 completed.crc_ok = result.link.crc_ok;
                 completed.payload = std::move(result.link.user_payload);
                 completed.latency_us = result.timing.latency_us;
+                completed.synchronization_us = result.link.synchronization_us;
+                completed.fft_sfo_us = result.link.fft_sfo_us;
+                completed.channel_estimation_us =
+                    result.link.channel_estimation_us;
+                completed.detection_us = result.link.detection_us;
+                completed.soft_demapping_us = result.link.soft_demapping_us;
+                completed.ldpc_crc_us = result.link.ldpc_crc_us;
+                completed.backend_ofdm_h2d_us =
+                    result.link.backend_ofdm_h2d_us;
+                completed.backend_ofdm_kernel_us =
+                    result.link.backend_ofdm_kernel_us;
+                completed.backend_ofdm_d2h_us =
+                    result.link.backend_ofdm_d2h_us;
+                completed.backend_mimo_h2d_us =
+                    result.link.backend_mimo_h2d_us;
+                completed.backend_mimo_kernel_us =
+                    result.link.backend_mimo_kernel_us;
+                completed.backend_mimo_d2h_us =
+                    result.link.backend_mimo_d2h_us;
+                completed.receiver_front_us = result.timing.receiver_front_us;
+                completed.fec_wall_us = result.timing.fec_wall_us;
             } else {
                 auto result = dynamic_pipeline_->receive();
                 completed.crc_ok = result.link.crc_ok;
@@ -631,6 +795,7 @@ public:
             if (options_.transmit_ports == 4u) {
                 openisac::Rank4TimeSimulationConfig config;
                 config.pilot_mode = options_.pilot_mode;
+                config.compute_backend = compute_backend_.get();
                 config.modulation = mode_.modulation;
                 config.spatial_rank = mode_.rank;
                 config.snr_db = options_.snr_db;
@@ -669,6 +834,7 @@ public:
                 if (telemetry_capture && sensing_ != nullptr) {
                     --rank4_sensing_capture_remaining_;
                 }
+                config.enable_truth_diagnostics = telemetry_capture;
                 config.enable_sensing_snapshot = telemetry_capture;
                 config.diagnostic_waveform_points =
                     options_.telemetry_waveform_points;
@@ -678,6 +844,7 @@ public:
             } else {
                 openisac::DynamicLinkSimulationConfig config;
                 config.pilot_mode = options_.pilot_mode;
+                config.compute_backend = compute_backend_.get();
                 config.snr_db = options_.snr_db;
                 config.timing_offset_samples = options_.timing_offset;
                 config.cfo_hz = options_.cfo_hz;
@@ -747,6 +914,20 @@ public:
         bool valid = true;
         for (const auto& result : results) {
             counters_.phy_latency_us += result.latency_us;
+            counters_.synchronization_us += result.synchronization_us;
+            counters_.fft_sfo_us += result.fft_sfo_us;
+            counters_.channel_estimation_us += result.channel_estimation_us;
+            counters_.detection_us += result.detection_us;
+            counters_.soft_demapping_us += result.soft_demapping_us;
+            counters_.ldpc_crc_us += result.ldpc_crc_us;
+            counters_.backend_ofdm_h2d_us += result.backend_ofdm_h2d_us;
+            counters_.backend_ofdm_kernel_us += result.backend_ofdm_kernel_us;
+            counters_.backend_ofdm_d2h_us += result.backend_ofdm_d2h_us;
+            counters_.backend_mimo_h2d_us += result.backend_mimo_h2d_us;
+            counters_.backend_mimo_kernel_us += result.backend_mimo_kernel_us;
+            counters_.backend_mimo_d2h_us += result.backend_mimo_d2h_us;
+            counters_.receiver_front_us += result.receiver_front_us;
+            counters_.fec_wall_us += result.fec_wall_us;
             if (!result.crc_ok) {
                 ++counters_.phy_crc_failures;
                 valid = false;
@@ -796,6 +977,11 @@ public:
         return fragment_payload_capacity_;
     }
     const BridgeCounters& counters() const noexcept { return counters_; }
+    void reset_counters() noexcept { counters_ = BridgeCounters{}; }
+    const std::string& active_backend() const noexcept { return active_backend_; }
+    std::size_t effective_ldpc_workers() const noexcept {
+        return effective_ldpc_workers_;
+    }
     void update_ingress_statistics(
         std::uint64_t socket_packets,
         std::uint64_t queue_drops,
@@ -1392,6 +1578,8 @@ private:
     const Options& options_;
     const openisac::Ldpc5041008& codec_;
     const openisac::LinkMode mode_;
+    std::unique_ptr<openisac::PhyComputeBackend> compute_backend_;
+    std::string active_backend_ = "cpu";
     openisac::DynamicLinkWorkspace generation_workspace_;
     openisac::DynamicLinkWorkspace telemetry_workspace_;
     openisac::DynamicLinkReceiverState telemetry_receiver_state_;
@@ -1400,6 +1588,7 @@ private:
     std::unique_ptr<openisac::Rank4TimePipeline> rank4_pipeline_;
     std::size_t phy_payload_capacity_ = 0u;
     std::size_t fragment_payload_capacity_ = 0u;
+    std::size_t effective_ldpc_workers_ = 0u;
     std::vector<std::uint16_t> data_fft_indices_;
     std::uint64_t frame_id_ = 0u;
     std::size_t rank4_sensing_capture_remaining_ = 0u;
@@ -1411,7 +1600,7 @@ private:
 sockaddr_in make_address(const std::string& address, unsigned port) {
     sockaddr_in result{};
     result.sin_family = AF_INET;
-    result.sin_port = htons(static_cast<u_short>(port));
+    result.sin_port = htons(static_cast<std::uint16_t>(port));
     if (inet_pton(AF_INET, address.c_str(), &result.sin_addr) != 1) {
         throw std::invalid_argument("invalid IPv4 address: " + address);
     }
@@ -1444,27 +1633,148 @@ void print_statistics(const BridgeCounters& value, double seconds) {
               << "; PHY frames " << value.phy_frames
               << "; FER " << crc_percent << "%"
               << "; PHY latency " << latency_ms << " ms/frame\n";
+    if (value.phy_frames > 0u && value.receiver_front_us > 0.0) {
+        const double frames = static_cast<double>(value.phy_frames);
+        std::cout << "Rank4 stage us/frame sync/fft+sfo/channel/detect/demap/ldpc "
+                  << value.synchronization_us / frames << '/'
+                  << value.fft_sfo_us / frames << '/'
+                  << value.channel_estimation_us / frames << '/'
+                  << value.detection_us / frames << '/'
+                  << value.soft_demapping_us / frames << '/'
+                  << value.ldpc_crc_us / frames
+                  << "; pipeline front/fec "
+                  << value.receiver_front_us / frames << '/'
+                  << value.fec_wall_us / frames << " us/frame\n";
+        if (value.backend_ofdm_kernel_us > 0.0) {
+            std::cout << "CUDA stage us/frame OFDM(h2d/kernel/d2h) "
+                      << value.backend_ofdm_h2d_us / frames << '/'
+                      << value.backend_ofdm_kernel_us / frames << '/'
+                      << value.backend_ofdm_d2h_us / frames
+                      << "; MIMO(h2d/kernel/d2h) "
+                      << value.backend_mimo_h2d_us / frames << '/'
+                      << value.backend_mimo_kernel_us / frames << '/'
+                      << value.backend_mimo_d2h_us / frames << '\n';
+        }
+    }
+}
+
+void append_benchmark_metrics(
+    const Options& options,
+    const BridgeCounters& counters,
+    double seconds,
+    const std::string& active_backend,
+    std::size_t effective_ldpc_workers) {
+    if (options.metrics_csv.empty()) {
+        return;
+    }
+    const std::filesystem::path path(options.metrics_csv);
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    const bool write_header = !std::filesystem::exists(path) ||
+        std::filesystem::file_size(path) == 0u;
+    std::ofstream output(path, std::ios::app);
+    if (!output) {
+        throw std::runtime_error("cannot open benchmark metrics CSV");
+    }
+    if (write_header) {
+        output << "label,backend,tx_ports,rx_ports,rank,scheme,modulation,pilot,"
+                  "packets,udp_bytes,phy_frames,seconds,throughput_mbps,"
+                  "phy_latency_ms,fer_percent,sync_us_per_frame,"
+                  "fft_sfo_us_per_frame,channel_estimation_us_per_frame,"
+                  "detection_us_per_frame,soft_demapping_us_per_frame,"
+                  "ldpc_crc_us_per_frame,receiver_front_us_per_frame,"
+                  "fec_wall_us_per_frame,ldpc_workers,"
+                  "backend_ofdm_h2d_us_per_frame,"
+                  "backend_ofdm_kernel_us_per_frame,"
+                  "backend_ofdm_d2h_us_per_frame,"
+                  "backend_mimo_h2d_us_per_frame,"
+                  "backend_mimo_kernel_us_per_frame,"
+                  "backend_mimo_d2h_us_per_frame\n";
+    }
+    const double throughput_mbps = seconds > 0.0
+        ? static_cast<double>(counters.udp_bytes_out) * 8.0 / seconds / 1.0e6
+        : 0.0;
+    const double latency_ms = counters.phy_frames > 0u
+        ? counters.phy_latency_us /
+              static_cast<double>(counters.phy_frames) / 1000.0
+        : 0.0;
+    const double fer_percent = counters.phy_frames > 0u
+        ? 100.0 * static_cast<double>(counters.phy_crc_failures) /
+              static_cast<double>(counters.phy_frames)
+        : 0.0;
+    const double frames = counters.phy_frames > 0u
+        ? static_cast<double>(counters.phy_frames)
+        : 1.0;
+    output << options.benchmark_label << ',' << active_backend << ','
+           << options.transmit_ports << ',' << options.receive_ports << ','
+           << options.transmit_rank << ','
+           << openisac::transmission_scheme_name(options.transmission_scheme) << ','
+           << openisac::modulation_name(options.modulation) << ','
+           << openisac::pilot_mode_name(options.pilot_mode) << ','
+           << counters.udp_packets_out << ',' << counters.udp_bytes_out << ','
+           << counters.phy_frames << ',' << std::setprecision(12) << seconds << ','
+           << throughput_mbps << ',' << latency_ms << ',' << fer_percent << ','
+           << counters.synchronization_us / frames << ','
+           << counters.fft_sfo_us / frames << ','
+           << counters.channel_estimation_us / frames << ','
+           << counters.detection_us / frames << ','
+           << counters.soft_demapping_us / frames << ','
+           << counters.ldpc_crc_us / frames << ','
+           << counters.receiver_front_us / frames << ','
+           << counters.fec_wall_us / frames << ','
+           << effective_ldpc_workers << ','
+           << counters.backend_ofdm_h2d_us / frames << ','
+           << counters.backend_ofdm_kernel_us / frames << ','
+           << counters.backend_ofdm_d2h_us / frames << ','
+           << counters.backend_mimo_h2d_us / frames << ','
+           << counters.backend_mimo_kernel_us / frames << ','
+           << counters.backend_mimo_d2h_us / frames << '\n';
+    if (!output) {
+        throw std::runtime_error("cannot write benchmark metrics CSV");
+    }
+}
+
+std::vector<std::uint8_t> make_self_test_packet(std::size_t packet) {
+    const std::size_t sizes[] = {188u, 376u, 1316u, 2000u, 4096u};
+    const std::size_t size = sizes[packet % (sizeof(sizes) / sizeof(sizes[0]))];
+    std::vector<std::uint8_t> input(size);
+    for (std::size_t index = 0u; index < size; ++index) {
+        input[index] = static_cast<std::uint8_t>(
+            (packet * 73u + index * 37u + 11u) & 0xFFu);
+    }
+    return input;
+}
+
+void run_self_test_packet(
+    VideoPhyChannel& channel,
+    std::size_t packet) {
+    const auto input = make_self_test_packet(packet);
+    const auto output = channel.process(
+        input, static_cast<std::uint32_t>(packet & 0xFFFFFFFFu));
+    if (!output.has_value() || *output != input) {
+        throw std::runtime_error(
+            "self-test packet " + std::to_string(packet) + " did not round-trip");
+    }
 }
 
 int run_self_test(const Options& options, VideoPhyChannel& channel) {
+    for (std::size_t packet = 0u;
+         packet < options.benchmark_warmup_packets; ++packet) {
+        run_self_test_packet(channel, packet);
+    }
+    channel.reset_counters();
     const auto start = std::chrono::steady_clock::now();
     for (std::size_t packet = 0u; packet < options.self_test_packets; ++packet) {
-        const std::size_t sizes[] = {188u, 376u, 1316u, 2000u, 4096u};
-        const std::size_t size = sizes[packet % (sizeof(sizes) / sizeof(sizes[0]))];
-        std::vector<std::uint8_t> input(size);
-        for (std::size_t index = 0u; index < size; ++index) {
-            input[index] = static_cast<std::uint8_t>(
-                (packet * 73u + index * 37u + 11u) & 0xFFu);
-        }
-        const auto output = channel.process(input, static_cast<std::uint32_t>(packet));
-        if (!output.has_value() || *output != input) {
-            throw std::runtime_error(
-                "self-test packet " + std::to_string(packet) + " did not round-trip");
-        }
+        run_self_test_packet(
+            channel, options.benchmark_warmup_packets + packet);
     }
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
     print_statistics(channel.counters(), seconds);
+    append_benchmark_metrics(
+        options, channel.counters(), seconds, channel.active_backend(),
+        channel.effective_ldpc_workers());
     std::cout << "PASS: all " << options.self_test_packets
               << " UDP datagrams survived fragmentation, "
               << openisac::transmission_scheme_name(
@@ -1472,18 +1782,20 @@ int run_self_test(const Options& options, VideoPhyChannel& channel) {
               << ' ' << options.transmit_ports << "Tx/"
               << options.receive_ports << "Rx Rank-"
               << options.transmit_rank << '/'
-              << openisac::modulation_name(options.modulation) << " PHY, "
+              << openisac::modulation_name(options.modulation) << " PHY, backend="
+              << channel.active_backend() << ", LDPC workers="
+              << channel.effective_ldpc_workers() << ", "
                   "TDL/AWGN/CFO/SFO, LDPC/CRC and reassembly byte-for-byte.\n";
     return 0;
 }
 
 int run_live(const Options& options, VideoPhyChannel& channel) {
-    SocketRuntime sockets;
+    [[maybe_unused]] SocketRuntime sockets;
     SocketHandle input;
     SocketHandle output;
     input.value = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     output.value = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (input.value == INVALID_SOCKET || output.value == INVALID_SOCKET) {
+    if (input.value == invalid_socket || output.value == invalid_socket) {
         throw std::runtime_error("cannot create UDP socket");
     }
     const int receive_buffer = static_cast<int>(std::min<std::size_t>(
@@ -1492,13 +1804,18 @@ int run_live(const Options& options, VideoPhyChannel& channel) {
                reinterpret_cast<const char*>(&receive_buffer), sizeof(receive_buffer));
     const auto listen = make_address(options.listen_address, options.listen_port);
     if (bind(input.value, reinterpret_cast<const sockaddr*>(&listen), sizeof(listen)) ==
-        SOCKET_ERROR) {
+        socket_error) {
         throw std::runtime_error(
-            "cannot bind UDP input; Winsock error " + std::to_string(WSAGetLastError()));
+            "cannot bind UDP input; " + socket_error_message());
     }
     const auto destination = make_address(options.output_address, options.output_port);
     stop_requested.store(false);
+#ifdef _WIN32
     SetConsoleCtrlHandler(console_handler, TRUE);
+#else
+    std::signal(SIGINT, console_handler);
+    std::signal(SIGTERM, console_handler);
+#endif
 
     std::cout << "Listening for VLC MPEG-TS/UDP on " << options.listen_address << ':'
               << options.listen_port << "; forwarding decoded packets to "
@@ -1515,7 +1832,9 @@ int run_live(const Options& options, VideoPhyChannel& channel) {
               << " symbols, FFT/CP "
               << options.fft_size << '/' << options.cp_length << ", payload "
               << channel.phy_payload_capacity() << " bytes, fragment data "
-              << channel.fragment_payload_capacity() << " bytes, SNR "
+              << channel.fragment_payload_capacity() << " bytes, backend "
+              << channel.active_backend() << ", LDPC workers "
+              << channel.effective_ldpc_workers() << ", SNR "
               << options.snr_db << " dB, CFO " << options.cfo_hz << " Hz, SFO "
               << options.sfo_ppm << " ppm. Press Ctrl+C to stop.\n";
 
@@ -1541,29 +1860,29 @@ int run_live(const Options& options, VideoPhyChannel& channel) {
                 timeval timeout{};
                 timeout.tv_sec = 0;
                 timeout.tv_usec = 100000;
-                const int ready = select(0, &read_set, nullptr, nullptr, &timeout);
-                if (ready == SOCKET_ERROR) {
+                const int ready =
+                    select_readable_socket(input.value, &read_set, &timeout);
+                if (ready == socket_error) {
                     throw std::runtime_error(
-                        "UDP select failed; Winsock error " +
-                        std::to_string(WSAGetLastError()));
+                        "UDP select failed; " + socket_error_message());
                 }
                 if (ready == 0) {
                     continue;
                 }
-                const int received = recvfrom(
+                const auto received = recvfrom(
                     input.value,
                     reinterpret_cast<char*>(receive_buffer_bytes.data()),
                     static_cast<int>(receive_buffer_bytes.size()), 0, nullptr, nullptr);
-                if (received == SOCKET_ERROR) {
+                if (received == socket_error) {
                     throw std::runtime_error(
-                        "UDP receive failed; Winsock error " +
-                        std::to_string(WSAGetLastError()));
+                        "UDP receive failed; " + socket_error_message());
                 }
                 QueuedDatagram datagram;
                 datagram.sequence = packet_sequence++;
                 datagram.bytes.assign(
                     receive_buffer_bytes.begin(),
-                    receive_buffer_bytes.begin() + received);
+                    receive_buffer_bytes.begin() +
+                        static_cast<std::ptrdiff_t>(received));
                 {
                     std::lock_guard<std::mutex> lock(ingress_mutex);
                     ++ingress_socket_packets;
@@ -1619,15 +1938,14 @@ int run_live(const Options& options, VideoPhyChannel& channel) {
             if (has_datagram) {
                 const auto decoded = channel.process(datagram.bytes, datagram.sequence);
                 if (decoded.has_value()) {
-                    const int sent = sendto(
+                    const auto sent = sendto(
                         output.value, reinterpret_cast<const char*>(decoded->data()),
                         static_cast<int>(decoded->size()), 0,
                         reinterpret_cast<const sockaddr*>(&destination),
                         sizeof(destination));
-                    if (sent != static_cast<int>(decoded->size())) {
+                    if (sent < 0 || static_cast<std::size_t>(sent) != decoded->size()) {
                         throw std::runtime_error(
-                            "UDP output failed; Winsock error " +
-                            std::to_string(WSAGetLastError()));
+                            "UDP output failed; " + socket_error_message());
                     }
                 }
             }

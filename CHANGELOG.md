@@ -2,6 +2,31 @@
 
 本文件记录 OpenISAC 的重要更新。
 
+## 2026-08-28 - Windows 与 DGX Spark CPU/CUDA 阶段成果
+
+### Summary
+
+完成独立 C++ PHY 从 Windows x64 到 DGX Spark ARM64 的 CPU 移植，并加入
+可选 CUDA/cuFFT 后端、跨平台测试与可复现的 Windows/DGX 性能基准。
+
+### Changes
+
+- 视频桥扩展为 Windows/POSIX 双平台 socket，保留同一帧结构与 CPU 数值基准。
+- 新增 `--backend cpu|cuda|auto` 计算后端选择，以及批量 1024 点 OFDM、
+  1/2/4/8 流 MIMO 检测和四端口设备驻留 FDM 接收路径。
+- 优化信道估计缓冲复用、LDPC 单 worker 直译路径、软判决处理及平台默认 worker 数。
+- 增加 Windows PowerShell、Linux/DGX Shell 构建与基准脚本，CUDA OFDM/MIMO
+  等价测试，以及 Windows/DGX CPU/GPU 对比工具。
+- 发布中英文阶段说明和 35 份基准 CSV/汇总 Markdown；不包含视频、构建产物、
+  可执行文件、Nsight 缓存或厂商 SDK。
+
+### Validation
+
+- Windows CPU CTest 10/10 通过；DGX Spark CPU CTest 10/10、CUDA CTest 12/12 通过。
+- 三个平台各 50 轮、共 150 轮模式基准均逐字节恢复，FER 和 UDP 丢包为 0。
+- 本次 GitHub 发布整理重新执行了 Windows CPU CTest 10/10 和 Python 测试
+  119/119；DGX 结果采用阶段结束时保存的测试记录与原始 CSV，未重复运行。
+
 ## 2026-08-25 - YunSDR Y240 硬件接入
 
 ### Summary

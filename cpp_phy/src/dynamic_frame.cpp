@@ -312,6 +312,7 @@ void prepare_dynamic_frame_impl(
     const MiniHeader& header,
     float marker_metric,
     const LinkMode* configured_mode,
+    const std::vector<float>* precomputed_soft_bits,
     const std::vector<std::complex<float>>& equalized_payload_symbols,
     const std::vector<float>& effective_noise_variances,
     PreparedDynamicFrame& prepared) {
@@ -338,9 +339,26 @@ void prepare_dynamic_frame_impl(
         prepared.header.payload_blocks > layout.ldpc_blocks) {
         throw std::runtime_error("control header exceeds Rank/MCS frame capacity");
     }
-    if (equalized_payload_symbols.size() != layout.payload_layer_symbols ||
-        effective_noise_variances.size() != layout.payload_layer_symbols) {
-        throw std::invalid_argument("equalized payload shape does not match decoded Rank/MCS");
+    const bool full_equalized_payload =
+        equalized_payload_symbols.size() == layout.payload_layer_symbols &&
+        effective_noise_variances.size() == layout.payload_layer_symbols;
+    if (precomputed_soft_bits == nullptr) {
+        if (!full_equalized_payload) {
+            throw std::invalid_argument(
+                "equalized payload shape does not match decoded Rank/MCS");
+        }
+    } else {
+        const bool soft_only_payload = equalized_payload_symbols.empty() &&
+            effective_noise_variances.empty();
+        if (!full_equalized_payload && !soft_only_payload) {
+            throw std::invalid_argument(
+                "equalized payload must be complete or omitted with precomputed soft bits");
+        }
+        if (precomputed_soft_bits->size() !=
+            layout.payload_layer_symbols * bits) {
+            throw std::invalid_argument(
+                "precomputed payload soft-bit shape does not match Rank/MCS");
+        }
     }
     using Clock = std::chrono::steady_clock;
     const auto demapping_start = Clock::now();
@@ -356,11 +374,18 @@ void prepare_dynamic_frame_impl(
         for (std::size_t local_symbol = 0u;
              local_symbol < symbols_per_block; ++local_symbol) {
             const std::size_t symbol = block * symbols_per_block + local_symbol;
-            const auto values = SquareQAM::max_log_llrs(
-                equalized_payload_symbols[symbol],
-                effective_noise_variances[symbol], bits);
-            for (unsigned bit = 0u; bit < bits; ++bit) {
-                interleaved_block[local_symbol * bits + bit] = values[bit];
+            if (precomputed_soft_bits != nullptr) {
+                for (unsigned bit = 0u; bit < bits; ++bit) {
+                    interleaved_block[local_symbol * bits + bit] =
+                        (*precomputed_soft_bits)[symbol * bits + bit];
+                }
+            } else {
+                const auto values = SquareQAM::max_log_llrs(
+                    equalized_payload_symbols[symbol],
+                    effective_noise_variances[symbol], bits);
+                for (unsigned bit = 0u; bit < bits; ++bit) {
+                    interleaved_block[local_symbol * bits + bit] = values[bit];
+                }
             }
         }
         float* const output = llrs.data() + block * ldpc_codeword_bits;
@@ -445,7 +470,7 @@ void prepare_dynamic_frame_llrs(
     float marker_metric = 0.0f;
     const auto header = decode_control_qpsk_llrs(control_llrs, &marker_metric);
     prepare_dynamic_frame_impl(
-        header, marker_metric, nullptr, equalized_payload_symbols,
+        header, marker_metric, nullptr, nullptr, equalized_payload_symbols,
         effective_noise_variances, prepared);
 }
 
@@ -456,7 +481,8 @@ void prepare_dynamic_frame_payload_llrs(
     const std::vector<float>& effective_noise_variances,
     PreparedDynamicFrame& prepared) {
     prepare_dynamic_frame_impl(
-        decoded_header, marker_metric, nullptr, equalized_payload_symbols,
+        decoded_header, marker_metric, nullptr, nullptr,
+        equalized_payload_symbols,
         effective_noise_variances, prepared);
 }
 
@@ -468,8 +494,56 @@ void prepare_dynamic_frame_payload_llrs(
     const std::vector<float>& effective_noise_variances,
     PreparedDynamicFrame& prepared) {
     prepare_dynamic_frame_impl(
-        decoded_header, marker_metric, &configured_mode,
+        decoded_header, marker_metric, &configured_mode, nullptr,
         equalized_payload_symbols, effective_noise_variances, prepared);
+}
+
+void prepare_dynamic_frame_payload_soft_bits(
+    const MiniHeader& decoded_header,
+    float marker_metric,
+    const LinkMode& configured_mode,
+    const std::vector<std::complex<float>>& equalized_payload_symbols,
+    const std::vector<float>& effective_noise_variances,
+    const std::vector<float>& soft_bits,
+    PreparedDynamicFrame& prepared) {
+    prepare_dynamic_frame_impl(
+        decoded_header, marker_metric, &configured_mode, &soft_bits,
+        equalized_payload_symbols, effective_noise_variances, prepared);
+}
+
+void prepare_dynamic_frame_decoder_llrs(
+    const MiniHeader& decoded_header,
+    float marker_metric,
+    const LinkMode& configured_mode,
+    PreparedDynamicFrame& prepared) {
+    const unsigned bits = bits_per_symbol_from_flags(decoded_header.flags);
+    const LinkMode header_mode{
+        transmit_rank_from_flags(decoded_header.flags),
+        modulation_from_bits(bits),
+        transmission_scheme_from_flags(decoded_header.flags)};
+    if (configured_mode.rank != header_mode.rank ||
+        configured_mode.modulation != header_mode.modulation ||
+        configured_mode.scheme != header_mode.scheme) {
+        throw std::runtime_error(
+            "configured physical-port profile disagrees with frame header");
+    }
+    const auto& layout = cached_layout_for_mode(configured_mode);
+    if (decoded_header.payload_blocks == 0u ||
+        decoded_header.payload_blocks > layout.ldpc_blocks) {
+        throw std::runtime_error(
+            "control header exceeds Rank/MCS frame capacity");
+    }
+    const std::size_t expected_llrs =
+        static_cast<std::size_t>(decoded_header.payload_blocks) *
+        ldpc_codeword_bits;
+    if (prepared.llrs.size() != expected_llrs) {
+        throw std::invalid_argument(
+            "decoder-order LLR shape does not match control header");
+    }
+    prepared.header = decoded_header;
+    prepared.marker_metric = marker_metric;
+    prepared.mode = configured_mode;
+    prepared.soft_demapping_us = 0.0;
 }
 
 DecodedDynamicFrame decode_prepared_dynamic_frame(
@@ -497,7 +571,7 @@ DecodedDynamicFrame decode_dynamic_frame(
     DynamicFrameDecodeWorkspace local_workspace;
     auto& prepared = workspace == nullptr ? local_workspace : *workspace;
     prepare_dynamic_frame_impl(
-        header, marker_metric, nullptr, equalized_payload_symbols,
+        header, marker_metric, nullptr, nullptr, equalized_payload_symbols,
         effective_noise_variances, prepared);
     return decode_prepared_dynamic_frame_impl(
         prepared, codec, maximum_ldpc_iterations,

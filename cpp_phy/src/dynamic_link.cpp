@@ -312,6 +312,7 @@ DynamicLinkReceiverConfig make_dynamic_link_receiver_config(
     const DynamicLinkSimulationConfig& simulation_config,
     NoiseVarianceMode noise_variance_mode) {
     DynamicLinkReceiverConfig receiver;
+    receiver.compute_backend = simulation_config.compute_backend;
     receiver.pilot_mode = simulation_config.pilot_mode;
     receiver.noise_variance_mode = noise_variance_mode;
     receiver.fixed_noise_variance =
@@ -806,11 +807,92 @@ void prepare_dynamic_iq_frame_impl(
         resize_tracked(
             buffers.dmrs_rx_grid, nr_dmrs_symbols * fft_size * physical_ports,
             buffers.capacity_growths);
-        for (std::size_t symbol = 0u; symbol < nr_dmrs_symbols; ++symbol) {
+    } else {
+        buffers.dmrs_rx_grid.clear();
+    }
+    if (config.compute_backend != nullptr) {
+        const std::size_t batch_symbols =
+            (data_symbols + (config.pilot_mode == PilotMode::nr_dmrs
+                ? nr_dmrs_symbols : 0u)) * physical_ports;
+        resize_tracked(
+            buffers.backend_time_batch, batch_symbols * symbol_samples,
+            buffers.capacity_growths);
+        std::size_t batch = 0u;
+        auto pack_symbol = [&](std::size_t frame_symbol, std::size_t rx) {
+            const auto begin = buffers.resampled_stream[rx].begin() +
+                static_cast<std::ptrdiff_t>(
+                    timing.offset + frame_symbol * symbol_samples);
+            std::copy(
+                begin, begin + static_cast<std::ptrdiff_t>(symbol_samples),
+                buffers.backend_time_batch.begin() +
+                    static_cast<std::ptrdiff_t>(batch * symbol_samples));
+            ++batch;
+        };
+        if (config.pilot_mode == PilotMode::nr_dmrs) {
+            for (std::size_t symbol = 0u; symbol < nr_dmrs_symbols; ++symbol) {
+                for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
+                    pack_symbol(symbol + 1u, rx);
+                }
+            }
+        }
+        for (std::size_t symbol = 0u; symbol < data_symbols; ++symbol) {
+            for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
+                pack_symbol(symbol + data_symbol_offset, rx);
+            }
+        }
+        config.compute_backend->ofdm_demodulate_batch(
+            fft_size, cp_length, batch_symbols,
+            buffers.backend_time_batch, buffers.backend_frequency_batch);
+        batch = 0u;
+        auto unpack_symbol = [&](
+            std::vector<std::complex<float>>& grid,
+            std::size_t symbol,
+            std::size_t rx) {
+            for (std::size_t fft = 0u; fft < fft_size; ++fft) {
+                grid[(symbol * fft_size + fft) * physical_ports + rx] =
+                    buffers.backend_frequency_batch[batch * fft_size + fft];
+            }
+            ++batch;
+        };
+        if (config.pilot_mode == PilotMode::nr_dmrs) {
+            for (std::size_t symbol = 0u; symbol < nr_dmrs_symbols; ++symbol) {
+                for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
+                    unpack_symbol(buffers.dmrs_rx_grid, symbol, rx);
+                }
+            }
+        }
+        for (std::size_t symbol = 0u; symbol < data_symbols; ++symbol) {
+            for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
+                unpack_symbol(buffers.rx_grid, symbol, rx);
+            }
+        }
+    } else {
+        if (config.pilot_mode == PilotMode::nr_dmrs) {
+            for (std::size_t symbol = 0u; symbol < nr_dmrs_symbols; ++symbol) {
+                for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
+                    const auto begin = buffers.resampled_stream[rx].begin() +
+                        static_cast<std::ptrdiff_t>(
+                            timing.offset + (symbol + 1u) * symbol_samples);
+                    std::copy(
+                        begin, begin + static_cast<std::ptrdiff_t>(symbol_samples),
+                        buffers.ofdm_samples.begin());
+                    ofdm_demodulate(
+                        buffers.ofdm_samples, fft_size, cp_length,
+                        buffers.frequency_scratch);
+                    for (std::size_t fft = 0u; fft < fft_size; ++fft) {
+                        buffers.dmrs_rx_grid[
+                            (symbol * fft_size + fft) * physical_ports + rx] =
+                            buffers.frequency_scratch[fft];
+                    }
+                }
+            }
+        }
+        for (std::size_t symbol = 0u; symbol < data_symbols; ++symbol) {
             for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
                 const auto begin = buffers.resampled_stream[rx].begin() +
                     static_cast<std::ptrdiff_t>(
-                        timing.offset + (symbol + 1u) * symbol_samples);
+                        timing.offset +
+                        (symbol + data_symbol_offset) * symbol_samples);
                 std::copy(
                     begin, begin + static_cast<std::ptrdiff_t>(symbol_samples),
                     buffers.ofdm_samples.begin());
@@ -818,31 +900,10 @@ void prepare_dynamic_iq_frame_impl(
                     buffers.ofdm_samples, fft_size, cp_length,
                     buffers.frequency_scratch);
                 for (std::size_t fft = 0u; fft < fft_size; ++fft) {
-                    buffers.dmrs_rx_grid[
+                    buffers.rx_grid[
                         (symbol * fft_size + fft) * physical_ports + rx] =
                         buffers.frequency_scratch[fft];
                 }
-            }
-        }
-    } else {
-        buffers.dmrs_rx_grid.clear();
-    }
-    for (std::size_t symbol = 0u; symbol < data_symbols; ++symbol) {
-        for (std::size_t rx = 0u; rx < physical_ports; ++rx) {
-            const auto begin = buffers.resampled_stream[rx].begin() +
-                static_cast<std::ptrdiff_t>(
-                    timing.offset +
-                    (symbol + data_symbol_offset) * symbol_samples);
-            std::copy(
-                begin, begin + static_cast<std::ptrdiff_t>(symbol_samples),
-                buffers.ofdm_samples.begin());
-            ofdm_demodulate(
-                buffers.ofdm_samples, fft_size, cp_length,
-                buffers.frequency_scratch);
-            for (std::size_t fft = 0u; fft < fft_size; ++fft) {
-                buffers.rx_grid[
-                    (symbol * fft_size + fft) * physical_ports + rx] =
-                    buffers.frequency_scratch[fft];
             }
         }
     }
@@ -1191,15 +1252,51 @@ void prepare_dynamic_iq_frame_impl(
         recommendation.rank1_sinr_db = static_cast<float>(
             10.0 * std::log10(1.0 / std::max(mean_variance, 1.0e-15)));
     } else {
+        const std::size_t payload_resources =
+            received_layout.payload_time_indices.size();
         resize_tracked(
             buffers.adaptation_channels,
-            received_layout.payload_time_indices.size(), buffers.capacity_growths);
+            payload_resources, buffers.capacity_growths);
         resize_tracked(
             buffers.adaptation_mse,
-            received_layout.payload_time_indices.size(), buffers.capacity_growths);
+            payload_resources, buffers.capacity_growths);
+        if (config.compute_backend != nullptr) {
+            resize_tracked(
+                buffers.backend_received_batch, payload_resources * 2u,
+                buffers.capacity_growths);
+            resize_tracked(
+                buffers.backend_channel_batch, payload_resources * 4u,
+                buffers.capacity_growths);
+            for (std::size_t payload_index = 0u;
+                 payload_index < payload_resources; ++payload_index) {
+                const std::size_t time =
+                    received_layout.payload_time_indices[payload_index];
+                const std::size_t data =
+                    received_layout.payload_data_positions[payload_index];
+                const std::size_t fft = received_layout.data_fft_indices[data];
+                const std::size_t grid_index = time * fft_size + fft;
+                buffers.backend_received_batch[payload_index * 2u] =
+                    buffers.rx_grid[grid_index * physical_ports];
+                buffers.backend_received_batch[payload_index * 2u + 1u] =
+                    buffers.rx_grid[grid_index * physical_ports + 1u];
+                const auto& channel = channels[grid_index];
+                const std::size_t channel_offset = payload_index * 4u;
+                buffers.backend_channel_batch[channel_offset] = channel.h00;
+                buffers.backend_channel_batch[channel_offset + 1u] = channel.h01;
+                buffers.backend_channel_batch[channel_offset + 2u] = channel.h10;
+                buffers.backend_channel_batch[channel_offset + 3u] = channel.h11;
+            }
+            config.compute_backend->detect_mimo_batch(
+                2u, 2u, payload_resources,
+                buffers.backend_received_batch, buffers.backend_channel_batch,
+                noise_variance, LinearDetector::mmse,
+                0u, 0u, true,
+                buffers.backend_detected_batch, buffers.backend_mse_batch,
+                buffers.backend_soft_bits);
+        }
         std::size_t adaptation_index = 0u;
         for (std::size_t payload_index = 0u;
-             payload_index < received_layout.payload_time_indices.size();
+             payload_index < payload_resources;
              ++payload_index) {
             const std::size_t time =
                 received_layout.payload_time_indices[payload_index];
@@ -1211,8 +1308,20 @@ void prepare_dynamic_iq_frame_impl(
                 buffers.rx_grid[
                     (time * fft_size + fft) * physical_ports + 1u]}};
             const auto& channel = channels[time * fft_size + fft];
-            const auto rank2_probe = detect_2x2(
-                received, channel, noise_variance, LinearDetector::mmse);
+            Detection2x2 rank2_probe;
+            if (config.compute_backend != nullptr) {
+                rank2_probe.symbols[0] =
+                    buffers.backend_detected_batch[payload_index * 2u];
+                rank2_probe.symbols[1] =
+                    buffers.backend_detected_batch[payload_index * 2u + 1u];
+                rank2_probe.predicted_mse[0] =
+                    buffers.backend_mse_batch[payload_index * 2u];
+                rank2_probe.predicted_mse[1] =
+                    buffers.backend_mse_batch[payload_index * 2u + 1u];
+            } else {
+                rank2_probe = detect_2x2(
+                    received, channel, noise_variance, LinearDetector::mmse);
+            }
             buffers.adaptation_channels[adaptation_index] = channel;
             buffers.adaptation_mse[adaptation_index] = rank2_probe.predicted_mse;
             ++adaptation_index;

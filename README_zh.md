@@ -15,6 +15,7 @@
 | 终端 | `UE` | 下行同步解调、可选上行发送、双站感知 |
 | 前端工具 | `scripts/` | 感知绘图、诊断、配置与控制工具 |
 | 正式 PHY | `cpp_phy/`、`python_phy/` | 跨语言帧结构、MIMO、调制、LDPC 和回归验证 |
+| CPU/CUDA 加速 | `cpp_phy/cuda/`、`results/benchmarks/` | Windows CPU 与 DGX Spark ARM64 CPU/CUDA 后端、测试、基准及发布结果 |
 | YunSDR 硬件 | `libyunsdr-isac/` | Y240 适配器、时间戳收发、射频环回、VLC/UDP 桥、诊断与硬件测试 |
 
 ## 环境依赖
@@ -47,6 +48,18 @@ cd libyunsdr-isac
 .\build_vs2019.cmd
 ```
 
+## Windows 与 DGX Spark CPU/CUDA
+
+独立 C++ PHY 现已支持 Windows x64 CPU，以及 DGX Spark ARM64 CPU/CUDA
+构建。CUDA 为可选后端，通过 `--backend cpu|cuda|auto` 选择；CPU 路径始终
+作为数值基准和不可用时的回退路径保留。
+
+- [DGX Spark 移植状态](DGX_PHY_PORT_STATUS.md)
+- [Windows CPU、DGX CPU 与 CUDA 性能对比](DGX_WINDOWS_PHY_PERFORMANCE.md)
+- [视频传输与 CUDA 移植方案](DGX_Spark视频传输与CUDA移植方案.md)
+- [英文阶段摘要](DGX_WINDOWS_CPU_GPU_RESULTS.md)
+- [发布的基准原始数据](results/benchmarks/README.md)
+
 ## 编译
 
 ```bash
@@ -67,6 +80,8 @@ AFF3CT 位于系统标准路径时可省略 `-DAFF3CT_ROOT`。主要产物为 `b
 | `scripts/` | Python 前端、网页配置控制台、Linux 性能调优脚本 |
 | `python_phy/` | 跨Windows/Linux的纯Python算法模型、配置、实验和单元测试 |
 | `cpp_phy/` | 独立于UHD的C++17 PHY核心、VS2019脚本、基准、视频桥和实时监视器 |
+| `cpp_phy/cuda/` | DGX Spark 可选 CUDA/cuFFT OFDM 与 MIMO 加速后端 |
+| `results/benchmarks/` | Windows CPU、DGX CPU 与 DGX CUDA 的发布基准快照 |
 | `libyunsdr-isac/` | YunSDR Y240 硬件适配器、配置、验证工具和硬件说明 |
 | `capture/` | 离线感知结果绘图工具 |
 | `docs/` | 项目静态站点，以及架构/信号处理说明页 |

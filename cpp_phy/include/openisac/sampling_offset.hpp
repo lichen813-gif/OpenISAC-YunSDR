@@ -34,6 +34,23 @@ PhaseSlopeEstimate estimate_sfo_phase_slope(
     std::size_t receive_antennas,
     std::size_t samples_per_symbol);
 
+// Sparse equivalent used by device-resident FFT paths. sparse_grid layout is
+// [two symbols][phase reference][receive antenna].
+PhaseSlopeEstimate estimate_sfo_phase_slope_sparse(
+    const std::vector<std::complex<float>>& sparse_grid,
+    const std::vector<std::uint16_t>& phase_reference_fft_indices,
+    std::size_t fft_size,
+    std::size_t receive_antennas,
+    std::size_t samples_per_symbol);
+
+// Fit a common and frequency-linear phase directly from one complex
+// correlation per reference tone. This compact form lets a device-resident
+// receiver return pilot correlations instead of complete OFDM grids.
+PhaseSlopeEstimate estimate_phase_slope_from_correlations(
+    const std::vector<std::complex<double>>& correlations,
+    const std::vector<std::uint16_t>& reference_fft_indices,
+    std::size_t fft_size);
+
 // Fit the residual common phase and frequency-linear phase between a known
 // sparse reference grid and a previously estimated NxN channel.  This is used
 // to track the age of front-loaded DM-RS without repeating a full CSI solve.

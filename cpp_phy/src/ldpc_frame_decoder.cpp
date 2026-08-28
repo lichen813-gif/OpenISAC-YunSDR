@@ -27,9 +27,16 @@ void resize_tracked(
 
 struct LdpcFrameDecoder::Impl {
     explicit Impl(const Ldpc5041008& codec_value, std::size_t count)
-        : codec(codec_value), workspaces(count), worker_results(count) {
+        : codec(codec_value), configured_workers(count), workspaces(count),
+          worker_results(count) {
         if (count == 0u || count > 19u) {
             throw std::invalid_argument("LDPC worker count must be in [1,19]");
+        }
+        // A single worker runs synchronously in the caller. Waking a helper
+        // thread for a handful of short, high-SNR blocks costs more than the
+        // normalized-min-sum work on some platforms (notably DGX/ARM).
+        if (count == 1u) {
+            return;
         }
         threads.reserve(count);
         try {
@@ -74,6 +81,23 @@ struct LdpcFrameDecoder::Impl {
         return total;
     }
 
+    void decode_block(std::size_t worker, std::size_t block) {
+        auto& workspace = workspaces[worker];
+        const float* const begin =
+            input->data() + block * ldpc_encoded_bits;
+        codec.decode_normalized_min_sum(
+            begin, ldpc_encoded_bits, maximum_iterations, normalization,
+            workspace, worker_results[worker]);
+        const auto& decoded = worker_results[worker];
+        std::copy(
+            decoded.information_bits.begin(),
+            decoded.information_bits.end(),
+            decoded_information.begin() + static_cast<std::ptrdiff_t>(
+                block * ldpc_information_bits));
+        block_syndrome_weights[block] = decoded.syndrome_weight;
+        block_iterations[block] = decoded.iterations;
+    }
+
     void worker_loop(std::size_t worker) noexcept {
         std::size_t observed_generation = 0u;
         for (;;) {
@@ -90,28 +114,9 @@ struct LdpcFrameDecoder::Impl {
             // Static round-robin assignment avoids a lock/atomic operation per
             // short LDPC block and gives repeatable per-worker buffer warm-up.
             for (std::size_t block = worker; block < block_count;
-                 block += threads.size()) {
+                 block += configured_workers) {
                 try {
-                    auto& workspace = workspaces[worker];
-                    resize_tracked(
-                        workspace.input_llrs, ldpc_encoded_bits,
-                        workspace.capacity_growths);
-                    const auto begin = input->begin() +
-                        static_cast<std::ptrdiff_t>(block * ldpc_encoded_bits);
-                    std::copy(
-                        begin, begin + static_cast<std::ptrdiff_t>(ldpc_encoded_bits),
-                        workspace.input_llrs.begin());
-                    codec.decode_normalized_min_sum(
-                        workspace.input_llrs, maximum_iterations, normalization,
-                        workspace, worker_results[worker]);
-                    const auto& decoded = worker_results[worker];
-                    std::copy(
-                        decoded.information_bits.begin(),
-                        decoded.information_bits.end(),
-                        decoded_information.begin() + static_cast<std::ptrdiff_t>(
-                            block * ldpc_information_bits));
-                    block_syndrome_weights[block] = decoded.syndrome_weight;
-                    block_iterations[block] = decoded.iterations;
+                    decode_block(worker, block);
                 } catch (...) {
                     std::lock_guard<std::mutex> lock(mutex);
                     if (failure == nullptr) {
@@ -130,6 +135,7 @@ struct LdpcFrameDecoder::Impl {
     }
 
     const Ldpc5041008& codec;
+    const std::size_t configured_workers;
     std::vector<LdpcDecodeWorkspace> workspaces;
     std::vector<LdpcDecodeResult> worker_results;
     std::vector<std::uint8_t> decoded_information;
@@ -159,7 +165,7 @@ LdpcFrameDecoder::LdpcFrameDecoder(
 LdpcFrameDecoder::~LdpcFrameDecoder() = default;
 
 std::size_t LdpcFrameDecoder::worker_count() const noexcept {
-    return impl_->threads.size();
+    return impl_->configured_workers;
 }
 
 void LdpcFrameDecoder::decode_blocks(
@@ -176,7 +182,24 @@ void LdpcFrameDecoder::decode_blocks(
     }
     std::lock_guard<std::mutex> call_lock(impl_->call_mutex);
     const std::size_t growths_before = impl_->total_growths();
-    {
+    if (impl_->configured_workers == 1u) {
+        resize_tracked(
+            impl_->decoded_information,
+            block_count * ldpc_information_bits, impl_->container_growths);
+        resize_tracked(
+            impl_->block_syndrome_weights,
+            block_count, impl_->container_growths);
+        resize_tracked(
+            impl_->block_iterations,
+            block_count, impl_->container_growths);
+        impl_->input = &concatenated_llrs;
+        impl_->block_count = block_count;
+        impl_->maximum_iterations = maximum_iterations;
+        impl_->normalization = normalization;
+        for (std::size_t block = 0u; block < block_count; ++block) {
+            impl_->decode_block(0u, block);
+        }
+    } else {
         std::unique_lock<std::mutex> lock(impl_->mutex);
         resize_tracked(
             impl_->decoded_information,

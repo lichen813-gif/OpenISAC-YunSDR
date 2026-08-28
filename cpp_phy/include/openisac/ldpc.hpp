@@ -48,11 +48,22 @@ public:
         LdpcDecodeWorkspace& workspace,
         LdpcDecodeResult& result) const;
 
+    void decode_normalized_min_sum(
+        const float* llrs,
+        std::size_t llr_count,
+        unsigned maximum_iterations,
+        float normalization,
+        LdpcDecodeWorkspace& workspace,
+        LdpcDecodeResult& result) const;
+
     const std::vector<std::uint16_t>& systematic_positions() const noexcept {
         return systematic_positions_;
     }
 
 private:
+    std::size_t syndrome_weight_unchecked(
+        const std::vector<std::uint8_t>& codeword_bits) const noexcept;
+
     std::vector<std::vector<std::uint16_t>> check_rows_;
     std::vector<std::vector<std::uint16_t>> generator_rows_;
     std::vector<std::uint16_t> systematic_positions_;

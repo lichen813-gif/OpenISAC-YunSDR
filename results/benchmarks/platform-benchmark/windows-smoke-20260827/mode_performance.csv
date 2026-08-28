@@ -1,0 +1,11 @@
+label,tx_ports,rx_ports,rank,scheme,modulation,pilot,packets,udp_bytes,phy_frames,seconds,throughput_mbps,phy_latency_ms,fer_percent
+siso_fdm,1,1,1,spatial,64qam,fdm,10,15952,42,0.0277163,4.60436638368,0.227966666667,0
+mimo2_fdm,2,2,2,spatial,64qam,fdm,10,15952,24,0.0235997,5.40752636686,0.337454166667,0
+stbc_fdm,2,2,1,stbc,64qam,fdm,10,15952,50,0.0394873,3.23182390288,0.253836,0
+rank2_4port_fdm,4,4,2,spatial,64qam,fdm,10,15952,34,0.1203851,1.06006474223,3.65487941176,0
+rank4_fdm,4,4,4,spatial,64qam,fdm,10,15952,20,0.0776258,1.64398949834,4.022115,0
+siso_nr-dmrs,1,1,1,spatial,64qam,nr-dmrs,10,15952,42,0.0376164,3.39256281835,0.254985714286,0
+mimo2_nr-dmrs,2,2,2,spatial,64qam,nr-dmrs,10,15952,24,0.0326628,3.90707471497,0.423566666667,0
+stbc_nr-dmrs,2,2,1,stbc,64qam,nr-dmrs,10,15952,50,0.0582147,2.19216108646,0.332304,0
+rank2_4port_nr-dmrs,4,4,2,spatial,64qam,nr-dmrs,10,15952,34,0.149145,0.855650541419,4.55184117647,0
+rank4_nr-dmrs,4,4,4,spatial,64qam,nr-dmrs,10,15952,20,0.096197,1.32661101698,4.96156,0

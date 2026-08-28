@@ -467,6 +467,68 @@ void test_sampling_offset() {
         grid, references, fft_size, antennas, symbol_samples);
     require_close(estimate.sfo_ppm, known_sfo, 0.01f, "phase-slope SFO estimate failed");
     require(estimate.coherence > 0.999f, "phase-slope coherence failed");
+
+    std::vector<std::complex<float>> sparse_grid(
+        2u * references.size() * antennas);
+    for (std::size_t symbol = 0u; symbol < 2u; ++symbol) {
+        for (std::size_t reference = 0u; reference < references.size(); ++reference) {
+            for (std::size_t rx = 0u; rx < antennas; ++rx) {
+                sparse_grid[(symbol * references.size() + reference) * antennas + rx] =
+                    grid[(symbol * fft_size + references[reference]) * antennas + rx];
+            }
+        }
+    }
+    const auto sparse_estimate = openisac::estimate_sfo_phase_slope_sparse(
+        sparse_grid, references, fft_size, antennas, symbol_samples);
+    require_close(
+        sparse_estimate.intercept_radians,
+        estimate.intercept_radians,
+        1.0e-6f,
+        "sparse phase-slope intercept differs from full-grid estimate");
+    require_close(
+        sparse_estimate.slope_radians_per_subcarrier,
+        estimate.slope_radians_per_subcarrier,
+        1.0e-7f,
+        "sparse phase-slope differs from full-grid estimate");
+    require_close(
+        sparse_estimate.sfo_ppm,
+        estimate.sfo_ppm,
+        1.0e-5f,
+        "sparse phase-slope SFO differs from full-grid estimate");
+    require_close(
+        sparse_estimate.coherence,
+        estimate.coherence,
+        1.0e-6f,
+        "sparse phase-slope coherence differs from full-grid estimate");
+    std::vector<std::complex<double>> compact_correlations;
+    compact_correlations.reserve(references.size());
+    for (const auto fft : references) {
+        std::complex<double> correlation{};
+        for (std::size_t rx = 0u; rx < antennas; ++rx) {
+            correlation += std::conj(static_cast<std::complex<double>>(
+                grid[fft * antennas + rx])) *
+                static_cast<std::complex<double>>(
+                    grid[(fft_size + fft) * antennas + rx]);
+        }
+        compact_correlations.push_back(correlation);
+    }
+    const auto compact_estimate = openisac::estimate_phase_slope_from_correlations(
+        compact_correlations, references, fft_size);
+    require_close(
+        compact_estimate.intercept_radians,
+        estimate.intercept_radians,
+        1.0e-6f,
+        "compact correlation phase intercept differs from full-grid estimate");
+    require_close(
+        compact_estimate.slope_radians_per_subcarrier,
+        estimate.slope_radians_per_subcarrier,
+        1.0e-7f,
+        "compact correlation phase slope differs from full-grid estimate");
+    require_close(
+        compact_estimate.coherence,
+        estimate.coherence,
+        1.0e-6f,
+        "compact correlation coherence differs from full-grid estimate");
     openisac::correct_second_symbol_phase_inplace(grid, estimate, fft_size, antennas);
     const auto residual = openisac::estimate_sfo_phase_slope(
         grid, references, fft_size, antennas, symbol_samples);
@@ -787,6 +849,20 @@ void test_ldpc_reusable_and_parallel_decoder() {
     decoder.decode_blocks(frame_llrs, blocks, 6u, 0.8f, parallel);
     require(parallel.capacity_growths_this_frame == 0u,
             "parallel LDPC worker buffers grew after warm-up");
+
+    openisac::LdpcFrameDecoder direct_decoder(codec, 1u);
+    openisac::LdpcFrameDecodeResult direct;
+    direct_decoder.decode_blocks(frame_llrs, blocks, 6u, 0.8f, direct);
+    require(direct_decoder.worker_count() == 1u &&
+                direct.syndrome_failures == 0u &&
+                direct.information_bits == expected_information &&
+                direct.maximum_iterations == parallel.maximum_iterations,
+            "direct LDPC decoder disagrees with parallel decoder");
+    require(direct.capacity_growths_this_frame > 0u,
+            "direct LDPC decoder did not report first-use state");
+    direct_decoder.decode_blocks(frame_llrs, blocks, 6u, 0.8f, direct);
+    require(direct.capacity_growths_this_frame == 0u,
+            "direct LDPC buffers grew after warm-up");
 
     bool rejected_nan = false;
     try {
@@ -1403,10 +1479,20 @@ void test_dynamic_rank_mcs_frames() {
         const std::vector<float> variances(encoded.payload_symbols.size(), 1.0e-3f);
         openisac::DecodedDynamicFrame decoded;
         if (physical_ports == 4u && mode.rank == 2u) {
+            const unsigned bits = openisac::modulation_bits(mode.modulation);
+            std::vector<float> soft_bits(
+                encoded.payload_symbols.size() * bits);
+            for (std::size_t symbol = 0u;
+                 symbol < encoded.payload_symbols.size(); ++symbol) {
+                const auto values = openisac::SquareQAM::max_log_llrs(
+                    encoded.payload_symbols[symbol], variances[symbol], bits);
+                for (unsigned bit = 0u; bit < bits; ++bit) {
+                    soft_bits[symbol * bits + bit] = values[bit];
+                }
+            }
             openisac::PreparedDynamicFrame prepared;
-            openisac::prepare_dynamic_frame_payload_llrs(
-                encoded.header, 1.0f, mode, encoded.payload_symbols,
-                variances, prepared);
+            openisac::prepare_dynamic_frame_payload_soft_bits(
+                encoded.header, 1.0f, mode, {}, {}, soft_bits, prepared);
             decoded = openisac::decode_prepared_dynamic_frame(prepared, codec);
         } else {
             decoded = openisac::decode_dynamic_frame(

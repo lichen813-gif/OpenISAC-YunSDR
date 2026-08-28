@@ -163,6 +163,73 @@ void periodic_linear_grid_nxn(
     }
 }
 
+void periodic_linear_grid_nxn_all(
+    const std::array<
+        std::array<
+            std::vector<FdmPilotChannelEstimatorWorkspaceNxN::Point>,
+            maximum_spatial_streams>,
+        maximum_spatial_streams>& estimates,
+    int period,
+    std::size_t time,
+    std::size_t ports,
+    std::vector<ChannelNxN>& output) {
+    std::array<std::size_t, maximum_spatial_streams> upper{};
+    for (int target = -period / 2; target < period / 2; ++target) {
+        const std::size_t native = target < 0
+            ? static_cast<std::size_t>(target + period)
+            : static_cast<std::size_t>(target);
+        auto& channel = output[
+            time * static_cast<std::size_t>(period) + native];
+        for (std::size_t tx = 0u; tx < ports; ++tx) {
+            const auto& reference = estimates[0u][tx];
+            if (reference.empty()) {
+                throw std::invalid_argument(
+                    "channel interpolation requires pilot estimates");
+            }
+            if (reference.size() == 1u) {
+                for (std::size_t rx = 0u; rx < ports; ++rx) {
+                    channel.values[rx * maximum_spatial_streams + tx] =
+                        estimates[rx][tx].front().second;
+                }
+                continue;
+            }
+            while (upper[tx] < reference.size() &&
+                   reference[upper[tx]].first <= target) {
+                ++upper[tx];
+            }
+            std::size_t left_index = 0u;
+            std::size_t right_index = 0u;
+            int left_frequency = 0;
+            int right_frequency = 0;
+            if (upper[tx] == 0u) {
+                left_index = reference.size() - 1u;
+                right_index = 0u;
+                left_frequency = reference[left_index].first - period;
+                right_frequency = reference[right_index].first;
+            } else if (upper[tx] == reference.size()) {
+                left_index = reference.size() - 1u;
+                right_index = 0u;
+                left_frequency = reference[left_index].first;
+                right_frequency = reference[right_index].first + period;
+            } else {
+                left_index = upper[tx] - 1u;
+                right_index = upper[tx];
+                left_frequency = reference[left_index].first;
+                right_frequency = reference[right_index].first;
+            }
+            const float fraction =
+                static_cast<float>(target - left_frequency) /
+                static_cast<float>(right_frequency - left_frequency);
+            for (std::size_t rx = 0u; rx < ports; ++rx) {
+                const auto left = estimates[rx][tx][left_index].second;
+                const auto right = estimates[rx][tx][right_index].second;
+                channel.values[rx * maximum_spatial_streams + tx] =
+                    left + fraction * (right - left);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 std::vector<Channel2x2> estimate_fdm_pilot_channel_linear_2x2(
@@ -301,7 +368,12 @@ void estimate_fdm_pilot_channel_linear_nxn(
         throw std::invalid_argument(
             "invalid generic FDM pilot channel-estimation dimensions");
     }
-    output.assign(time_symbols * fft_size, ChannelNxN{});
+    // Reuse the large generic NxN channel buffer across continuous frames.
+    // ChannelNxN reserves 8x8 storage, while this estimator overwrites every
+    // active [rx][tx] component below. Re-value-initializing the entire vector
+    // would clear roughly 1 MiB per 4-port frame, including 48 inactive matrix
+    // entries per RE, and is a measurable receive-front-end cost.
+    output.resize(time_symbols * fft_size);
     for (auto& channel : output) {
         channel.streams = ports;
     }
@@ -363,11 +435,10 @@ void estimate_fdm_pilot_channel_linear_nxn(
                     throw std::invalid_argument(
                         "FDM pilot allocation misses one Tx port");
                 }
-                periodic_linear_grid_nxn(
-                    points, static_cast<int>(fft_size), time,
-                    rx, tx, output);
             }
         }
+        periodic_linear_grid_nxn_all(
+            estimates, static_cast<int>(fft_size), time, ports, output);
     }
 }
 
@@ -485,7 +556,10 @@ void estimate_nr_dmrs_channel_linear_nxn(
         }
     }
 
-    output.assign(data_time_symbols * fft_size, ChannelNxN{});
+    // The interpolation below overwrites every active channel component.
+    // Preserve capacity and inactive storage instead of clearing the generic
+    // 8x8 matrix payload on every continuous 1/2/4-port frame.
+    output.resize(data_time_symbols * fft_size);
     for (auto& channel : output) {
         channel.streams = ports;
     }

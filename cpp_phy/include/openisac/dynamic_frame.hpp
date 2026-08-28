@@ -88,6 +88,26 @@ void prepare_dynamic_frame_payload_llrs(
     const std::vector<float>& effective_noise_variances,
     PreparedDynamicFrame& prepared);
 
+// GPU fast path: soft_bits is [payload_symbol][bit] before the existing LDPC
+// deinterleaver and descrambler. Equalized symbols are retained for shape
+// validation, EVM and telemetry.
+void prepare_dynamic_frame_payload_soft_bits(
+    const MiniHeader& decoded_header,
+    float marker_metric,
+    const LinkMode& configured_mode,
+    const std::vector<std::complex<float>>& equalized_payload_symbols,
+    const std::vector<float>& effective_noise_variances,
+    const std::vector<float>& soft_bits,
+    PreparedDynamicFrame& prepared);
+
+// Finalize frame metadata when a compute backend has already written
+// deinterleaved and descrambled LLRs directly into prepared.llrs.
+void prepare_dynamic_frame_decoder_llrs(
+    const MiniHeader& decoded_header,
+    float marker_metric,
+    const LinkMode& configured_mode,
+    PreparedDynamicFrame& prepared);
+
 // Four-port Rank-2 uses the same over-air Rank/MCS header bits as ordinary
 // Rank-2; the configured physical-port profile supplies the resource layout.
 void prepare_dynamic_frame_payload_llrs(
