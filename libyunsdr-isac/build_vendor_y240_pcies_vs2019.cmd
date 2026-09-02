@@ -23,7 +23,7 @@ if not defined VSROOT (
 )
 set "CMAKE_EXE=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 set "CMAKE_BIN=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
-set "PATH=%CMAKE_BIN%;%PATH%"
+set "Path=%CMAKE_BIN%;%Path%"
 
 if exist "%SOURCE_DIR%\CMakeLists.txt" goto source_found
 if /I not "%SOURCE_DIR%"=="%DEFAULT_SOURCE%" goto source_missing
