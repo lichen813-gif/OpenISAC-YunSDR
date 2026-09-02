@@ -24,11 +24,12 @@ At 64QAM/FDM the measured application payload capacities are:
 From the repository's `libyunsdr-isac` directory:
 
 ```powershell
-.\build_vs2019.cmd
+.\build_vendor_y240_pcies_vs2019.cmd
+.\build_hardware_vs2019.cmd
 ```
 
-The VS2019 bundled CMake and Ninja are used. Executables and required DLLs are
-under `build\ninja-vs2019`.
+The VS2019 bundled CMake and Ninja are used. Hardware executables and required
+DLLs are under `build\ninja-vs2019-hardware`.
 
 ## Deterministic PHY tests
 
@@ -36,15 +37,15 @@ The following commands use the user-confirmed cabled-loopback TX setting of
 60 and do not raise it:
 
 ```powershell
-build\ninja-vs2019\yunsdr_phy_loopback.exe --device pcies:0.0 --mode siso  --modulation 64qam --pilot fdm --frames 20 --frequency-mhz 1500 --tx-gain 60 --rx-gain 20
-build\ninja-vs2019\yunsdr_phy_loopback.exe --device pcies:0.0 --mode mimo2 --modulation 64qam --pilot fdm --frames 20 --frequency-mhz 1500 --tx-gain 60 --rx-gain 24
-build\ninja-vs2019\yunsdr_phy_loopback.exe --device pcies:0.0 --mode stbc  --modulation 64qam --pilot fdm --frames 20 --frequency-mhz 1500 --tx-gain 60 --rx-gain 18
+build\ninja-vs2019-hardware\yunsdr_phy_loopback.exe --device pcies:0.0 --mode siso  --modulation 64qam --pilot fdm --frames 20 --frequency-mhz 1500 --tx-gain 60 --rx-gain 20
+build\ninja-vs2019-hardware\yunsdr_phy_loopback.exe --device pcies:0.0 --mode mimo2 --modulation 64qam --pilot fdm --frames 20 --frequency-mhz 1500 --tx-gain 60 --rx-gain 24
+build\ninja-vs2019-hardware\yunsdr_phy_loopback.exe --device pcies:0.0 --mode stbc  --modulation 64qam --pilot fdm --frames 20 --frequency-mhz 1500 --tx-gain 60 --rx-gain 18
 ```
 
 For a video-sized fragmentation/reassembly test without VLC:
 
 ```powershell
-build\ninja-vs2019\yunsdr_video_bridge.exe --device pcies:0.0 --mode siso --modulation 64qam --pilot fdm --frequency-mhz 1500 --tx-gain 60 --rx-gain 20 --self-test 64 --batch-packets 8 --lead-blocks 48 --retries 8
+build\ninja-vs2019-hardware\yunsdr_video_bridge.exe --device pcies:0.0 --mode siso --modulation 64qam --pilot fdm --frequency-mhz 1500 --tx-gain 60 --rx-gain 20 --self-test 64 --batch-packets 8 --lead-blocks 48 --retries 8
 ```
 
 Replace `siso` with `mimo2` or `stbc` and use the recommended RX gains above.

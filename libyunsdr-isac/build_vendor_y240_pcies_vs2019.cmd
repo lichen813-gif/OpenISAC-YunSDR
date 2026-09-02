@@ -22,16 +22,30 @@ if not defined VSROOT (
     exit /b 2
 )
 set "CMAKE_EXE=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+set "CMAKE_BIN=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+set "PATH=%CMAKE_BIN%;%PATH%"
 
 if exist "%SOURCE_DIR%\CMakeLists.txt" goto source_found
-echo libyunsdr source was not found:
+if /I not "%SOURCE_DIR%"=="%DEFAULT_SOURCE%" goto source_missing
+echo YunSDR source is not staged; checking the ignored import directory...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%prepare_vendor_y240_sdk.ps1"
+if errorlevel 1 exit /b 3
+if exist "%SOURCE_DIR%\CMakeLists.txt" goto source_found
+
+:source_missing
+echo ERROR: libyunsdr source was not found:
 echo %SOURCE_DIR%
+echo.
+echo The vendor SDK is intentionally not stored in public Git.
+echo See README_zh.md and docs\Y240_VENDOR_HARDWARE_TEST.md.
 exit /b 3
 
 :source_found
 if exist "%LIBUSB_DIR%\MS64\dll\libusb-1.0.lib" goto libusb_found
 echo MSVC x64 libusb was not found:
 echo %LIBUSB_DIR%
+echo Obtain the libusb 1.0.23 Windows binary package and extract it so that
+echo import\libusb-1.0.23\MS64\dll\libusb-1.0.lib exists.
 exit /b 4
 
 :libusb_found

@@ -20,5 +20,6 @@ site/node_modules/
 site/.astro/
 site/dist/
 .omx/
-/import/
+/import/*
+!/import/README.md
 /vlc-log.txt

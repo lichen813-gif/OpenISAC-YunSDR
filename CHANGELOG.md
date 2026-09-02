@@ -2,6 +2,32 @@
 
 本文件记录 OpenISAC 的重要更新。
 
+## 2026-09-02 - Y240 全新拉取与硬件视频搭建修复
+
+### Summary
+
+完成 GitHub 发布完整性复核，修复全新拉取后厂商源码定位、软件/硬件构建模式
+混用以及视频启动器仍引用旧构建目录的问题，并补齐 Y240 视频、监视与感知的一站式
+Windows 搭建说明。
+
+### Changes
+
+- 新增单层/双层 `libyunsdr-26-01-00.1` ZIP 自动展开与必需文件校验脚本；
+- 将不依赖 SDK 的软件回归与硬件桥分别构建到独立目录；
+- 厂商构建自动使用 VS2019 CMake，并暂存 PCIES + USB3 兼容 DLL 和验收工具；
+- 视频启动器改用 `build/ninja-vs2019-hardware`，优先查找仓库 `.venv`，并兼容
+  `pythonw.exe`、`python.exe` 与 `py.exe`；
+- 新增可跟踪的 `import/README.md`、监视器最小 Python 依赖和中文快速搭建文档；
+- 同步更新中英文首页、子项目说明、视频命令、产物路径和厂商依赖发布边界。
+
+### Validation
+
+- 全新 GitHub 拉取的 Windows C++ PHY 构建与 CTest 10/10 通过；Python PHY
+  测试 114/114 通过；
+- Y240 厂商 PCIES + USB3 库、`yunsdr_ss_rate` 和
+  `yunsdr_ss_txrx_multiport` 成功生成；
+- 软件基线与硬件启用构建分别 CTest 3/3 通过；PowerShell 启动器语法检查通过。
+
 ## 2026-08-28 - Windows 与 DGX Spark CPU/CUDA 阶段成果
 
 ### Summary

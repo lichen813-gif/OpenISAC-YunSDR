@@ -2,6 +2,9 @@
 
 [中文说明](README_zh.md)
 
+Chinese standalone learning manual: [libyunsdr and YunSDR Y240 guide](docs/LIBYUNSDR_LEARNING_GUIDE_zh.md).
+Fresh-clone Windows setup: [Y240 video, monitoring, and sensing quick start (Chinese)](docs/Y240_WINDOWS_QUICKSTART_zh.md).
+
 `libyunsdr-isac` is the hardware-integration subproject for OpenISAC. It keeps
 the vendor SDK, SDR device access, stream scheduling, loopback tools, and
 hardware validation separate from the reusable OFDM/LDPC/MIMO algorithms.
@@ -18,8 +21,9 @@ channel/EVM/synchronization telemetry, range-Doppler sensing, and CFAR results.
 - This project implements that contract using a verified `libyunsdr` SDK.
 - Vendor headers, import libraries, DLLs, drivers, and examples are staged
   separately and are not committed unless their license permits redistribution.
-- The first hardware milestone is a cabled SISO RF loopback; MIMO follows only
-  after timestamping and multi-channel coherence are measured.
+- The verified cabled-loopback modes are SISO, 2x2 two-layer spatial
+  multiplexing, and 2x2 Alamouti STBC; their measurements and limits are
+  recorded in `docs/Y240_HARDWARE_VIDEO.md`.
 
 ## Baseline build (Visual Studio 2019)
 
@@ -28,13 +32,33 @@ channel/EVM/synchronization telemetry, range-Doppler sensing, and CFAR results.
 build\ninja-vs2019\yunsdr_probe.exe
 ```
 
-The script uses the CMake bundled with VS2019, so a separate CMake installation
-or a global `PATH` change is not required.
+This baseline command explicitly disables the hardware backend and therefore
+does not require the YunSDR SDK. The script uses the CMake bundled with VS2019,
+so a separate CMake installation or a global `PATH` change is not required.
+
+Vendor files are not downloaded by `git clone`. Obtain libyunsdr 26-01-00.1
+from YunSDR and the libusb 1.0.23 Windows binary package, then stage:
+
+```text
+import/
+  libyunsdr-26-01-00.1.zip.zip   # a single-layer .zip is also accepted
+  libusb-1.0.23/MS64/dll/libusb-1.0.lib
+  libusb-1.0.23/MS64/dll/libusb-1.0.dll
+```
+
+The vendor build automatically expands either form of the libyunsdr archive
+into the ignored `import/vendor-y240-26-01-00.1/source/` directory. It can also
+be prepared explicitly with:
+
+```powershell
+.\prepare_vendor_y240_sdk.ps1
+```
 
 The verified Y240 vendor compatibility build (PCIES + USB3) is generated with:
 
 ```powershell
 .\build_vendor_y240_pcies_vs2019.cmd
+.\build_hardware_vs2019.cmd
 ```
 
 Its DLL and vendor acceptance tools are staged under
@@ -50,9 +74,10 @@ cmake -S . -B build -G "Visual Studio 16 2019" -A x64 `
   -DOPENISAC_ROOT="C:\path\to\OpenISAC-YunSDR"
 ```
 
-`build_vs2019.cmd` enables the hardware backend and uses the staged
-`out/y240-sdk-26-01-00.1` SDK. The vendor DLL and `libusb-1.0.dll` are copied
-beside the hardware executables automatically.
+`build_vendor_y240_pcies_vs2019.cmd` creates the staged
+`out/y240-sdk-26-01-00.1` SDK, and `build_hardware_vs2019.cmd` then creates the
+hardware-enabled OpenISAC adapter in a separate build directory. The vendor DLL
+and `libusb-1.0.dll` are copied beside the hardware executables automatically.
 
 ## Hardware tools
 

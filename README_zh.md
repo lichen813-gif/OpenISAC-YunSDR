@@ -41,12 +41,22 @@ sudo apt install -y build-essential cmake pkg-config \
 
 ## YunSDR 硬件接入
 
-Windows 硬件适配器说明见 [`libyunsdr-isac/README.md`](libyunsdr-isac/README.md)。源码包括 Y240 `pcies:0.0` 后端、正式 PHY 编解码桥、带时间戳的 SISO/2×2 收发、射频环回和 VLC/UDP 工具。已验证的厂商 SDK 需要在本机单独放置，Git 仓库不会上传或再分发该 SDK。
+Windows 硬件适配器说明见 [`libyunsdr-isac/README_zh.md`](libyunsdr-isac/README_zh.md)。源码包括 Y240 `pcies:0.0` 后端、正式 PHY 编解码桥、带时间戳的 SISO/2×2 收发、射频环回和 VLC/UDP 工具。全新拉取后的逐步搭建见 [`Y240 Windows 快速搭建`](libyunsdr-isac/docs/Y240_WINDOWS_QUICKSTART_zh.md)。已验证的厂商 SDK 需要在本机单独放置，Git 仓库不会上传或再分发该 SDK。
 
 ```powershell
 cd libyunsdr-isac
 .\build_vs2019.cmd
 ```
+
+上面的命令只构建不依赖厂商 SDK 的软件接口和算法回归。Y240 硬件版本需先把
+`libyunsdr-26-01-00.1` 与 libusb 1.0.23 放入忽略的 `import/` 目录，再运行：
+
+```powershell
+.\build_vendor_y240_pcies_vs2019.cmd
+.\build_hardware_vs2019.cmd
+```
+
+压缩包目录结构和故障排查见子项目说明；厂商文件不属于仓库缺失源码。
 
 ## Windows 与 DGX Spark CPU/CUDA
 
@@ -164,7 +174,11 @@ python scripts/plot_bi_sensing_fast.py
 
 ## libyunsdr 接入状态
 
-仓库当前没有 `libyunsdr` 源码、SDK 依赖、设备配置或接口兼容声明。后续硬件版本应基于已验证的 SDK 实现现有设备/流边界，增加硬件预设，并补充初始化、时钟、收发流、错误处理和实测结果。路线说明见[最新物理层感知验证与 libyunsdr 路线](最新物理层感知验证与libyunsdr路线.md)。
+仓库已经包含厂商无关无线接口、Y240 `pcies:0.0` 适配器、SISO/2×2/STBC
+正式 PHY、时间戳流、射频回环、VLC/UDP 桥和实机测试说明。受许可和设备安全
+约束，`libyunsdr` 厂商源码/二进制、libusb 包、驱动、固件与视频不会随 Git
+分发，必须按 [`libyunsdr-isac/README_zh.md`](libyunsdr-isac/README_zh.md)
+单独准备。路线背景见[最新物理层感知验证与 libyunsdr 路线](最新物理层感知验证与libyunsdr路线.md)。
 
 ## 测试
 

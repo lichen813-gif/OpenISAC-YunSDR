@@ -41,12 +41,24 @@ Install AFF3CT 3.0.2 or newer separately and remember its installation prefix. N
 
 ## YunSDR hardware integration
 
-The Windows hardware adapter is documented in [`libyunsdr-isac/README.md`](libyunsdr-isac/README.md). Its source includes the Y240 `pcies:0.0` backend, formal-PHY codec bridge, timestamped SISO/2x2 streams, RF loopback and VLC/UDP tools. The verified vendor SDK must be staged locally and is intentionally excluded from Git.
+The Windows hardware adapter is documented in [`libyunsdr-isac/README.md`](libyunsdr-isac/README.md). Its source includes the Y240 `pcies:0.0` backend, formal-PHY codec bridge, timestamped SISO/2x2 streams, RF loopback and VLC/UDP tools. A fresh-clone procedure is provided in the [`Y240 Windows quick start`](libyunsdr-isac/docs/Y240_WINDOWS_QUICKSTART_zh.md). The verified vendor SDK must be staged locally and is intentionally excluded from Git.
 
 ```powershell
 cd libyunsdr-isac
 .\build_vs2019.cmd
 ```
+
+This command builds only the vendor-independent software and algorithm tests.
+For Y240 hardware, stage libyunsdr 26-01-00.1 and the libusb 1.0.23 Windows
+package under the ignored `import/` directory, then run:
+
+```powershell
+.\build_vendor_y240_pcies_vs2019.cmd
+.\build_hardware_vs2019.cmd
+```
+
+See the subproject guide for the exact archive layout and troubleshooting.
+Vendor-controlled dependencies are not missing OpenISAC source files.
 
 ## Windows and DGX Spark CPU/CUDA
 
@@ -164,7 +176,13 @@ In this formal path, FFT size and the 128-control-RE layout are compatibility co
 
 ## libyunsdr integration status
 
-There is currently no `libyunsdr` source, SDK dependency, device configuration, or claimed API compatibility in this repository. A later hardware release should implement the existing stream/device boundary against the verified SDK, add hardware presets, and update this guide with real initialization, clocking, streaming, error handling, and test results. See [the current PHY and libyunsdr roadmap](最新物理层感知验证与libyunsdr路线.md).
+The repository includes the vendor-neutral radio contract, verified Y240
+`pcies:0.0` adapter, SISO/2x2/STBC formal PHY, timestamped streaming, RF
+loopback, VLC/UDP bridge, and hardware test documentation. Vendor libyunsdr
+source/binaries, libusb packages, drivers, firmware, and videos are not
+redistributed and must be staged separately as described in
+[`libyunsdr-isac/README.md`](libyunsdr-isac/README.md). See the
+[PHY and libyunsdr roadmap](最新物理层感知验证与libyunsdr路线.md) for background.
 
 ## Tests
 

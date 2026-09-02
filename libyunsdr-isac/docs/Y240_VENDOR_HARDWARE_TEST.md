@@ -5,6 +5,26 @@
 
 ## 1. 已生成程序
 
+公开仓库不包含厂商 SDK。全新 `git clone` 后，先取得与 Y240 匹配的
+`libyunsdr-26-01-00.1` 压缩包以及 libusb 1.0.23 Windows x64 二进制包，放置为：
+
+```text
+OpenISAC-YunSDR/import/
+  libyunsdr-26-01-00.1.zip.zip
+  libusb-1.0.23/MS64/dll/libusb-1.0.lib
+  libusb-1.0.23/MS64/dll/libusb-1.0.dll
+```
+
+libyunsdr 单层 `.zip` 也受支持。需要单独检查解压时可运行：
+
+```powershell
+cd C:\path\to\OpenISAC-YunSDR\libyunsdr-isac
+.\prepare_vendor_y240_sdk.ps1
+```
+
+它会把源码准备到被 Git 忽略的
+`import/vendor-y240-26-01-00.1/source/`，不会联网下载或提交厂商文件。
+
 运行目录：
 
 ```text
@@ -20,11 +40,13 @@ out/y240-sdk-26-01-00.1/bin/
 ```powershell
 cd C:\path\to\OpenISAC-YunSDR\libyunsdr-isac
 .\build_vendor_y240_pcies_vs2019.cmd
+.\build_hardware_vs2019.cmd
 ```
 
 构建脚本会强制检查 `libpcies.lib` 和 `libfirmware.lib`，构建 DLL、静态库以及
 两个厂商测试程序，并将运行文件放到同一 `bin` 目录。默认 DLL 同时兼容
 PCIES 和 USB3；`libusb-1.0.dll` 必须与 `libyunsdr_ss.dll` 保持在同一目录。
+第二条命令再使用已暂存 SDK 构建 OpenISAC 的硬件回环和视频工具。
 
 两个程序源码默认使用 `pciex:0`。Y240 验收时必须显式传入 `-a pcies:0.0`，不能
 依赖默认值。

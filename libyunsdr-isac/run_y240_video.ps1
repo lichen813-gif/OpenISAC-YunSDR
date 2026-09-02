@@ -23,32 +23,50 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$bridge = Join-Path $root 'build\ninja-vs2019\yunsdr_video_bridge.exe'
+$bridge = Join-Path $root 'build\ninja-vs2019-hardware\yunsdr_video_bridge.exe'
 $vlc = Join-Path $env:ProgramFiles 'VideoLAN\VLC\vlc.exe'
 if (-not (Test-Path -LiteralPath $VideoFile -PathType Leaf)) {
     throw "Video file not found: $VideoFile"
 }
 if (-not (Test-Path -LiteralPath $bridge -PathType Leaf)) {
-    throw "Hardware video bridge not found. Run build_vs2019.cmd first: $bridge"
+    throw "Hardware video bridge not found. Run build_vendor_y240_pcies_vs2019.cmd and build_hardware_vs2019.cmd first: $bridge"
 }
 if (-not (Test-Path -LiteralPath $vlc -PathType Leaf)) {
     throw "VLC was not found: $vlc"
 }
 
 $monitorScript = Join-Path $root '..\cpp_phy\live_phy_monitor.py'
-$pythonw = $null
+$pythonExecutable = $null
+$pythonArgumentPrefix = @()
 if (-not $NoMonitor) {
     if (-not (Test-Path -LiteralPath $monitorScript -PathType Leaf)) {
         throw "OpenISAC live monitor was not found: $monitorScript"
     }
-    $pythonCommand = Get-Command pythonw.exe -ErrorAction SilentlyContinue
+    $venvPythonw = Join-Path $root '..\.venv\Scripts\pythonw.exe'
+    $venvPython = Join-Path $root '..\.venv\Scripts\python.exe'
+    if (Test-Path -LiteralPath $venvPythonw -PathType Leaf) {
+        $pythonExecutable = $venvPythonw
+    } elseif (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+        $pythonExecutable = $venvPython
+    }
+    $pythonCommand = $null
+    if ($null -eq $pythonExecutable) {
+        $pythonCommand = Get-Command pythonw.exe -ErrorAction SilentlyContinue
+    }
     if ($null -eq $pythonCommand) {
         $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
     }
-    if ($null -ne $pythonCommand) { $pythonw = $pythonCommand.Source }
-    if ($null -eq $pythonw -or
-        -not (Test-Path -LiteralPath $pythonw -PathType Leaf)) {
-        throw 'Python with Tkinter and NumPy was not found.'
+    if ($null -ne $pythonCommand) { $pythonExecutable = $pythonCommand.Source }
+    if ($null -eq $pythonExecutable) {
+        $pythonCommand = Get-Command py.exe -ErrorAction SilentlyContinue
+        if ($null -ne $pythonCommand) {
+            $pythonExecutable = $pythonCommand.Source
+            $pythonArgumentPrefix = @('-3')
+        }
+    }
+    if ($null -eq $pythonExecutable -or
+        -not (Test-Path -LiteralPath $pythonExecutable -PathType Leaf)) {
+        throw 'Python with Tkinter and NumPy was not found. See docs\Y240_WINDOWS_QUICKSTART_zh.md.'
     }
 }
 
@@ -150,11 +168,13 @@ try {
     Write-Host 'PHY bridge hardware warmup passed.' -ForegroundColor Green
 
     if (-not $NoMonitor) {
-        $monitorProcess = Start-Process -FilePath $pythonw -ArgumentList @(
+        $monitorArguments = $pythonArgumentPrefix + @(
             (Quote-Argument $monitorScript),
             (Quote-Argument $telemetry),
             '--refresh', [string]$RefreshSeconds
-        ) -PassThru
+        )
+        $monitorProcess = Start-Process -FilePath $pythonExecutable `
+            -ArgumentList $monitorArguments -PassThru
         Start-Sleep -Milliseconds 800
         Write-Host 'Live PHY and sensing monitor started.' -ForegroundColor Green
     }

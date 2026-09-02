@@ -5,6 +5,13 @@
 `libyunsdr-isac` 是 OpenISAC 的 YunSDR 硬件接入子项目。它把厂商 SDK、
 设备访问、时间戳流调度和硬件工具与可复用的 OFDM、LDPC、MIMO 算法分离。
 
+第一次学习 `libyunsdr`、Y240 PCIES、多通道 IQ、时间戳和实机测试时，请从
+[《libyunsdr 完整学习与 YunSDR Y240 接入指南》](docs/LIBYUNSDR_LEARNING_GUIDE_zh.md)
+开始。
+
+从 GitHub 全新拉取后的完整搭建、构建、硬件验收、视频、监视和感知步骤见
+[《YunSDR Y240 Windows 视频、监视与感知快速搭建》](docs/Y240_WINDOWS_QUICKSTART_zh.md)。
+
 当前版本包含已经验证的 Y240 `pcies:0.0` 后端、正式 OpenISAC PHY 编解码、
 射频时间戳回环，以及 SISO、2x2 双层空间复用和 2x2 Alamouti STBC 的
 VLC/UDP 硬件视频桥。视频文件不属于源码发布内容。
@@ -26,13 +33,37 @@ cd libyunsdr-isac
 .\build_vs2019.cmd
 ```
 
-脚本使用 Visual Studio 2019 自带的 CMake 和 Ninja。启用真实硬件构建前，
-需要先按 [厂商硬件测试说明](docs/Y240_VENDOR_HARDWARE_TEST.md) 准备 SDK。
+此命令不需要 YunSDR SDK，也不连接硬件；脚本使用 Visual Studio 2019 自带的
+CMake 和 Ninja，并明确关闭真实硬件后端。启用真实硬件构建前，需要先按
+[厂商硬件测试说明](docs/Y240_VENDOR_HARDWARE_TEST.md) 准备 SDK。
+
+厂商文件不会随 `git clone` 下载。请取得 `libyunsdr-26-01-00.1` 和 libusb
+1.0.23 Windows 二进制包，并准备为：
+
+```text
+import/
+  libyunsdr-26-01-00.1.zip.zip   # 也支持单层 .zip
+  libusb-1.0.23/MS64/dll/libusb-1.0.lib
+  libusb-1.0.23/MS64/dll/libusb-1.0.dll
+```
+
+构建脚本会自动把单层或双层的 libyunsdr 压缩包展开到忽略目录
+`import/vendor-y240-26-01-00.1/source/`。也可以先显式执行：
+
+```powershell
+.\prepare_vendor_y240_sdk.ps1
+```
+
 兼容的 Y240 PCIES + USB3 SDK 构建命令为：
 
 ```powershell
 .\build_vendor_y240_pcies_vs2019.cmd
+.\build_hardware_vs2019.cmd
 ```
+
+第一条命令生成兼容的厂商 DLL、导入库和验收程序，第二条命令使用暂存 SDK
+构建 OpenISAC Y240 硬件桥。软件回归与硬件构建使用不同构建目录，避免 CMake
+缓存把两种模式混在一起。
 
 默认 OpenISAC 算法源码根目录为本子项目的父目录 `..`；独立使用时可通过
 `OPENISAC_ROOT` 指定其他 OpenISAC-YunSDR 源码目录。
@@ -40,9 +71,9 @@ cd libyunsdr-isac
 ## 主要工具
 
 - `yunsdr_probe`：设备与后端探测。
-- `openisac_phy_loopback`：正式 PHY 的时间戳射频回环。
-- `openisac_phy_video_bridge`：VLC/UDP 数据的硬件 PHY 桥。
-- `openisac_phy_monitor.py`：星座图、波形、信道、EVM、同步、感知和 CFAR 监视。
+- `yunsdr_phy_loopback.exe`：正式 PHY 的时间戳射频回环。
+- `yunsdr_video_bridge.exe`：VLC/UDP 数据的硬件 PHY 桥。
+- `cpp_phy/live_phy_monitor.py`：星座图、波形、信道、EVM、同步、感知和 CFAR 监视。
 
 详细接口、硬件流程、参数和验收步骤见 [docs](docs/)；默认 SISO 回环配置见
 [configs/siso_loopback.yaml](configs/siso_loopback.yaml)。

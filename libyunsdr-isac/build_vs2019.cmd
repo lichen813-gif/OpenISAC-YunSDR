@@ -21,6 +21,14 @@ set "CTEST_EXE=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\c
 set "NINJA_EXE=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
 set "BUILD_VARIANT=%~1"
 if not defined BUILD_VARIANT set "BUILD_VARIANT=ninja-vs2019"
+set "ENABLE_HARDWARE=%~2"
+if not defined ENABLE_HARDWARE set "ENABLE_HARDWARE=OFF"
+if /I "%ENABLE_HARDWARE%"=="ON" goto hardware_option_valid
+if /I "%ENABLE_HARDWARE%"=="OFF" goto hardware_option_valid
+echo ERROR: second argument must be ON or OFF.
+exit /b 2
+
+:hardware_option_valid
 set "BUILD_DIR=%PROJECT_DIR%build\%BUILD_VARIANT%"
 set "BUILD_TEMP=%BUILD_DIR%\tmp"
 
@@ -30,7 +38,7 @@ set "TMP=%BUILD_TEMP%"
 call "%VCVARS%" >nul
 if errorlevel 1 exit /b 1
 
-"%CMAKE_EXE%" -S "%PROJECT_DIR%." -B "%BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_MAKE_PROGRAM=%NINJA_EXE%" -DLIBYUNSDR_ISAC_ENABLE_HARDWARE=ON
+"%CMAKE_EXE%" -S "%PROJECT_DIR%." -B "%BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_MAKE_PROGRAM=%NINJA_EXE%" -DLIBYUNSDR_ISAC_ENABLE_HARDWARE=%ENABLE_HARDWARE%
 if errorlevel 1 exit /b %errorlevel%
 
 "%CMAKE_EXE%" --build "%BUILD_DIR%"
