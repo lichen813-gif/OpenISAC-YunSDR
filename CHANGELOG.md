@@ -28,6 +28,9 @@ Windows 搭建说明。
   `yunsdr_ss_txrx_multiport` 成功生成；
 - 软件基线与硬件启用构建分别 CTest 3/3 通过；PowerShell 启动器语法检查通过。
 
+完整审计过程、根因、文件变更和全新克隆证据见
+[`Y240_GITHUB_COMPLETENESS_UPDATE_20260902_zh.md`](libyunsdr-isac/docs/Y240_GITHUB_COMPLETENESS_UPDATE_20260902_zh.md)。
+
 ## 2026-08-28 - Windows 与 DGX Spark CPU/CUDA 阶段成果
 
 ### Summary

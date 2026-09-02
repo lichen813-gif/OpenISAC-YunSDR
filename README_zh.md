@@ -41,7 +41,7 @@ sudo apt install -y build-essential cmake pkg-config \
 
 ## YunSDR 硬件接入
 
-Windows 硬件适配器说明见 [`libyunsdr-isac/README_zh.md`](libyunsdr-isac/README_zh.md)。源码包括 Y240 `pcies:0.0` 后端、正式 PHY 编解码桥、带时间戳的 SISO/2×2 收发、射频环回和 VLC/UDP 工具。全新拉取后的逐步搭建见 [`Y240 Windows 快速搭建`](libyunsdr-isac/docs/Y240_WINDOWS_QUICKSTART_zh.md)。已验证的厂商 SDK 需要在本机单独放置，Git 仓库不会上传或再分发该 SDK。
+Windows 硬件适配器说明见 [`libyunsdr-isac/README_zh.md`](libyunsdr-isac/README_zh.md)。源码包括 Y240 `pcies:0.0` 后端、正式 PHY 编解码桥、带时间戳的 SISO/2×2 收发、射频环回和 VLC/UDP 工具。全新拉取后的逐步搭建见 [`Y240 Windows 快速搭建`](libyunsdr-isac/docs/Y240_WINDOWS_QUICKSTART_zh.md)，本次发布完整性复核见 [`Y240 GitHub 更新记录`](libyunsdr-isac/docs/Y240_GITHUB_COMPLETENESS_UPDATE_20260902_zh.md)。已验证的厂商 SDK 需要在本机单独放置，Git 仓库不会上传或再分发该 SDK。
 
 ```powershell
 cd libyunsdr-isac
