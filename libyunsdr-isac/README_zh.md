@@ -13,6 +13,8 @@
 [《YunSDR Y240 Windows 视频、监视与感知快速搭建》](docs/Y240_WINDOWS_QUICKSTART_zh.md)。
 本次 GitHub 完整性检查、问题根因、修改清单和验证证据见
 [《Y240 GitHub 完整性审计与可复现搭建更新记录》](docs/Y240_GITHUB_COMPLETENESS_UPDATE_20260902_zh.md)。
+视频启动出现 `hardware warmup batch failed` 时，使用
+[《Y240 视频预热失败排查说明》](docs/Y240_VIDEO_WARMUP_FAILURE_TROUBLESHOOTING_zh.md)。
 
 当前版本包含已经验证的 Y240 `pcies:0.0` 后端、正式 OpenISAC PHY 编解码、
 射频时间戳回环，以及 SISO、2x2 双层空间复用和 2x2 Alamouti STBC 的

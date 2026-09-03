@@ -164,5 +164,9 @@ RX 增益和 VLC 视频码率 kbit/s。模式可选 `siso`、`mimo2`、`stbc`；
 - 有星座点但 CRC 失败：先检查削顶、RX 增益、同步位置、TX timeout、端口映射和
   FDM/DMRS 是否一致，再增加视频码率或批量大小。
 
+若启动阶段连续三次报告 `hardware warmup batch failed`，请按
+[Y240 视频预热失败排查说明](Y240_VIDEO_WARMUP_FAILURE_TROUBLESHOOTING_zh.md)
+读取桥日志并依次执行厂商程序、QPSK、64QAM 和固定包自检。
+
 更完整的模式、增益实测、EVM、遥测字段和感知限制见
 [Y240_HARDWARE_VIDEO.md](Y240_HARDWARE_VIDEO.md)。

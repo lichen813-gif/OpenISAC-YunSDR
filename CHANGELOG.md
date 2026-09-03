@@ -18,6 +18,8 @@ Windows 搭建说明。
 - 视频启动器改用 `build/ninja-vs2019-hardware`，优先查找仓库 `.venv`，并兼容
   `pythonw.exe`、`python.exe` 与 `py.exe`；
 - 新增可跟踪的 `import/README.md`、监视器最小 Python 依赖和中文快速搭建文档；
+- 新增 `hardware warmup batch failed` 专项排查文档，给出日志字段判读和
+  厂商程序、QPSK、64QAM、固定包自检的分层验证流程；
 - 同步更新中英文首页、子项目说明、视频命令、产物路径和厂商依赖发布边界。
 
 ### Validation

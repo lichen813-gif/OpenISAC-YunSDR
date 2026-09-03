@@ -85,6 +85,12 @@ foreground, starts the Python PHY/sensing monitor, batches input UDP packets,
 drains the UDP queue at the end, saves the bridge log under
 `out\hardware-video`, and closes every process it started.
 
+If all three startup attempts report `hardware warmup batch failed`, VLC has
+not started yet. Use the Chinese
+[warmup troubleshooting guide](Y240_VIDEO_WARMUP_FAILURE_TROUBLESHOOTING_zh.md)
+to interpret the non-`.err` bridge log and isolate RF, PHY, timestamp, or DMA
+failures.
+
 ## Live hardware monitor and sensing
 
 The normal `run_y240_video.cmd` command now opens the existing OpenISAC live
