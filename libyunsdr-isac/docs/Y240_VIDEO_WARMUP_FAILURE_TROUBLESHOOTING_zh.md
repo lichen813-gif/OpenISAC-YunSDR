@@ -117,6 +117,17 @@ Batch decode failed; retry 1/8 (fragment 0 timing=0 header=0 crc=0)
 
 这一行比最终的 `hardware warmup batch failed` 更有诊断价值。
 
+如果错误不是随机变化，而是始终为：
+
+```text
+fragment 3 timing=1 header=0 crc=0
+```
+
+并且 SISO 日志显示 `PHY payload=439 bytes, fragment data=419 bytes`，应优先检查
+1316 字节测试包最后一个仅含 59 字节视频数据、总 PHY payload 仅 79 字节的短尾
+分片路径。详细计算、无视频复现命令、定长零填充修复方案和回归矩阵见
+[《Y240 SISO fragment 3 短尾帧失败分析与解决方案》](Y240_FRAGMENT3_SHORT_TAIL_FAILURE_SOLUTION_zh.md)。
+
 ## 6. 原因优先级
 
 ### 6.1 SISO 物理端口不匹配
@@ -299,3 +310,6 @@ git rev-parse --short HEAD
 固定预热测试包没有经过正式 PHY 和射频闭环被逐字节正确恢复。它是保护机制，
 用于阻止 VLC 在底层链路尚未闭合时启动。排查时应先读不带 `.err` 的桥日志，
 再按“厂商程序 → QPSK → 64QAM → 视频桥自检 → VLC”的顺序逐层验证。
+
+对于固定 `fragment 3 timing=1 header=0 crc=0` 的特殊现象，不要通过更换视频或
+跳过 warmup 规避；应按短尾帧专项方案验证并修复。

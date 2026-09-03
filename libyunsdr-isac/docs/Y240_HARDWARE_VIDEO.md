@@ -91,6 +91,12 @@ not started yet. Use the Chinese
 to interpret the non-`.err` bridge log and isolate RF, PHY, timestamp, or DMA
 failures.
 
+If SISO repeatedly fails specifically at
+`fragment 3 timing=1 header=0 crc=0`, use the Chinese
+[short-tail fragment analysis and solution](Y240_FRAGMENT3_SHORT_TAIL_FAILURE_SOLUTION_zh.md).
+It explains why this pre-VLC failure is independent of the selected video and
+defines the fixed-size padded-fragment implementation and acceptance tests.
+
 ## Live hardware monitor and sensing
 
 The normal `run_y240_video.cmd` command now opens the existing OpenISAC live
