@@ -15,6 +15,7 @@
 | 终端 | `UE` | 下行同步解调、可选上行发送、双站感知 |
 | 前端工具 | `scripts/` | 感知绘图、诊断、配置与控制工具 |
 | 正式 PHY | `cpp_phy/`、`python_phy/` | 跨语言帧结构、MIMO、调制、LDPC 和回归验证 |
+| YunSDR Studio PHY 集成 | [`integrations/yunsdr_studio/`](integrations/yunsdr_studio/README_zh.md) | 工作台的 816 载波正式帧收发、感知和实时 STBC 视频 |
 | CPU/CUDA 加速 | `cpp_phy/cuda/`、`results/benchmarks/` | Windows CPU 与 DGX Spark ARM64 CPU/CUDA 后端、测试、基准及发布结果 |
 | YunSDR 硬件 | `libyunsdr-isac/` | Y240 适配器、时间戳收发、射频环回、VLC/UDP 桥、诊断与硬件测试 |
 

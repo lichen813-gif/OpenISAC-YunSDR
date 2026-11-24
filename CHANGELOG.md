@@ -2,6 +2,32 @@
 
 本文件记录 OpenISAC 的重要更新。
 
+## 2026-11-24 — YunSDR Studio 816 载波集成
+
+### 改动
+
+- 发布可单独编译的 Studio C++ PHY 适配器及 OpenISAC Python 集成源码，覆盖 1×1
+  SISO、2×2／4×4／8×8 空间复用和 2×2 Alamouti STBC。
+- 正式帧固定使用 FFT 1024、CP 128、816 个活动载波和限带 ZC 前导。标称带宽为
+  采样率的 79.79%，在 122.88 MSa/s 时为 98.04 MHz。支持 FDM 和前置 DM-RS。
+- 816 载波帧使用伪随机 QPSK 填充。星座和 EVM 统计 LDPC 编码数据点。SISO 16-QAM
+  128 字节样例的整帧数字 IQ PAPR 为 8.53 dB（FDM）和 8.83 dB（前置 DM-RS）。
+- 816 载波 CSI 用于距离–多普勒和 CFAR。实时视频的仿真、单机射频回环和双机收发
+  共用 816 载波、2×2 STBC、64-QAM/FDM 的 PHY。独立 Y240/VLC 和 CPU/CUDA 基线
+  仍按原布局发布。
+
+### 验证
+
+- Windows x64 CTest 用 40 种拓扑、导频和调制组合检查发射频谱、载荷、CRC、EVM
+  和 CSI。Studio 全量离线回归 72 项通过。
+- 122.88 MSa/s 的仿真感知在五种拓扑及两种导频中正确检测 9 点延迟回波，
+  约 10.98 m。实时视频在 30 dB AWGN 下三档各跑 30 秒，1、1.5、2 Mbit/s
+  分别恢复 2,848、4,276、5,682 个数据报，均无丢包。
+- 本次验证覆盖软件仿真和模拟设备 IQ。新版真实射频视频和感知仍待上板实测。
+
+构建及集成方法见 [Studio 816 载波集成](integrations/yunsdr_studio/README_zh.md)，
+视频仿真结果见 [基准 CSV](results/benchmarks/studio_816_live_windows.csv)。
+
 ## 2026-09-02 - Y240 全新拉取与硬件视频搭建修复
 
 ### Summary

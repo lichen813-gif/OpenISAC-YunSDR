@@ -15,6 +15,7 @@ This repository contains the complete C++/Python source, configurations, and des
 | User equipment | `UE` | Downlink synchronization/demodulation, optional uplink transmitter, bistatic sensing |
 | Runtime tools | `scripts/` | Sensing plots, diagnostics, configuration and control tools |
 | Formal PHY | `cpp_phy/`, `python_phy/` | Cross-language frame, MIMO, modulation, LDPC, and regression validation |
+| YunSDR Studio PHY integration | [`integrations/yunsdr_studio/`](integrations/yunsdr_studio/README.md) | 816-carrier formal frames, sensing, and live STBC video for the Studio workbench |
 | CPU/CUDA acceleration | `cpp_phy/cuda/`, `results/benchmarks/` | Windows CPU and DGX Spark ARM64 CPU/CUDA backends, tests, benchmarks, and published results |
 | YunSDR hardware | `libyunsdr-isac/` | Y240 adapter, timestamped streams, RF loopback, VLC/UDP bridge, diagnostics, and hardware tests |
 
