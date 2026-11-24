@@ -1,0 +1,385 @@
+diff --git a/yunsdr_studio/device.py b/yunsdr_studio/device.py
+--- a/yunsdr_studio/device.py
++++ b/yunsdr_studio/device.py
+@@ -12,9 +12,16 @@
+ 
+ TRANSPORTS = ("pciex", "pcies", "usb3")
+ MAX_RF_CHANNELS = 16
+-VIDEO_DMA_SAMPLES = 30_720
++VIDEO_DMA_SAMPLES = VIDEO_SAMPLE_RATE//500
++VIDEO_SAMPLE_RATES = (VIDEO_SAMPLE_RATE, 2*VIDEO_SAMPLE_RATE, 4*VIDEO_SAMPLE_RATE)
+ VIDEO_CHANNELS = (0, 1)
+ SDK_DIRECTORY = Path(__file__).resolve().parent.parent / "new"
++
++
++def video_dma_samples(sample_rate):
++    if sample_rate not in VIDEO_SAMPLE_RATES:
++        raise ValueError("视频 IQ 采样率须为 15.36、30.72 或 61.44 MSa/s")
++    return sample_rate//500
+ 
+ 
+ @dataclass(frozen=True)
+@@ -533,6 +540,10 @@
+         if hasattr(self.sdk, "read_samples_multiport"):
+             return
+         ptrs = C.POINTER(C.c_void_p)
++        try:
++            self.sdk.bind("get_rx_sampling_freq", C.c_int32, C.c_void_p, C.c_uint8, C.POINTER(C.c_uint32))
++        except AttributeError:
++            pass  # Some SDK builds expose the RX setter and only the TX getter.
+         self.sdk.bind("set_rx_sampling_freq", C.c_int32, C.c_void_p, C.c_uint8, C.c_uint32)
+         for name in ("set_rx_ant_enable", "set_trxsw_fpga_enable"):
+             self.sdk.bind(name, C.c_int32, C.c_void_p, C.c_uint8, C.c_uint8)
+@@ -542,33 +553,49 @@
+         self.sdk.bind("read_samples_multiport", C.c_int32, C.c_void_p, ptrs, C.c_uint32, C.c_uint32,
+                       C.POINTER(C.c_uint64))
+ 
+-    def _check_video_device(self):
++    def _check_video_device(self, sample_rate):
+         if self.info.connection.transport not in ("pcies", "pciex") or self.info.channels < 2:
+             raise RuntimeError("设备视频需要支持双通道流式 IQ 的 PCIe YunSDR（CH 0 / CH 1）")
+-        if VIDEO_DMA_SAMPLES % self.info.connection.mtu:
+-            raise ValueError("当前 MTU 必须能整除视频 DMA 的 30,720 点，可使用 MTU 7,680")
++        block = video_dma_samples(sample_rate)
++        if block % self.info.connection.mtu:
++            raise ValueError(f"当前 MTU 必须能整除视频 DMA 的 {block:,} 点，可使用 MTU 7,680")
+         self._bind_video_sdk()
+ 
+-    def apply_video_rate(self):
+-        self._check_video_device()
+-        previous = self._read("tx_sampling_freq", 0)
+-        check_result(self.sdk.set_tx_sampling_freq(self.handle, 0, VIDEO_SAMPLE_RATE), "设置视频 TX 采样率")
++    def _video_rx_rate(self):
++        getter = getattr(self.sdk, "get_rx_sampling_freq", None)
++        if getter is None:
++            return None
++        rate = C.c_uint32()
++        check_result(getter(self.handle, 0, C.byref(rate)), "读取视频 RX 采样率")
++        return rate.value
++
++    def _verify_video_rate(self, tx_rate, rx_rate, requested):
++        if tx_rate != requested or rx_rate not in (None, requested):
++            rx = "未提供" if rx_rate is None else f"{rx_rate/1e6:g} MSa/s"
++            raise RuntimeError(f"视频需要 TX/RX 均为 {requested/1e6:g} MSa/s，"
++                               f"读回 TX {tx_rate/1e6:g} MSa/s，RX {rx}")
++
++    def apply_video_rate(self, sample_rate=VIDEO_SAMPLE_RATE):
++        self._check_video_device(sample_rate)
++        previous_tx = self._read("tx_sampling_freq", 0)
++        previous_rx = self._video_rx_rate()
+         try:
+-            check_result(self.sdk.set_rx_sampling_freq(self.handle, 0, VIDEO_SAMPLE_RATE), "设置视频 RX 采样率")
++            check_result(self.sdk.set_tx_sampling_freq(self.handle, 0, sample_rate), "设置视频 TX 采样率")
++            check_result(self.sdk.set_rx_sampling_freq(self.handle, 0, sample_rate), "设置视频 RX 采样率")
+             settings = self.read_settings(0)
+-            if settings.sample_rate != VIDEO_SAMPLE_RATE:
+-                raise RuntimeError(f"视频采样率读回为 {settings.sample_rate:,} Hz")
++            self._verify_video_rate(settings.sample_rate, self._video_rx_rate(), sample_rate)
+             return settings
+         except Exception:
+-            self.sdk.set_tx_sampling_freq(self.handle, 0, previous)
+-            self.sdk.set_rx_sampling_freq(self.handle, 0, previous)
++            self.sdk.set_tx_sampling_freq(self.handle, 0, previous_tx)
++            self.sdk.set_rx_sampling_freq(self.handle, 0, previous_tx if previous_rx is None else previous_rx)
+             raise
+ 
+     @contextmanager
+-    def video_stream(self):
+-        self._check_video_device()
+-        if self.cyclic or self._read("tx_sampling_freq", 0) != VIDEO_SAMPLE_RATE:
+-            raise RuntimeError("请停止循环发射，并应用视频采样率 15.36 MSa/s")
++    def video_stream(self, sample_rate=VIDEO_SAMPLE_RATE):
++        self._check_video_device(sample_rate)
++        if self.cyclic:
++            raise RuntimeError("请先停止循环发射")
++        self._verify_video_rate(self._read("tx_sampling_freq", 0), self._video_rx_rate(), sample_rate)
+         for name, value in (("set_rx_ant_enable", 1), ("set_trxsw_fpga_enable", 0), ("set_duplex_select", 1)):
+             check_result(getattr(self.sdk, name)(self.handle, 0, value), name)
+         check_result(self.sdk.tx_cyclic_enable(self.handle, 0, 0), "关闭循环发射")
+@@ -588,19 +615,21 @@
+ 
+     def video_read(self, data):
+         timestamp = C.c_uint64()
+-        count = self.sdk.read_samples_multiport(self.handle, self._video_buffers(data), VIDEO_DMA_SAMPLES,
++        samples = data.shape[1]
++        count = self.sdk.read_samples_multiport(self.handle, self._video_buffers(data), samples,
+                                                 channel_mask(VIDEO_CHANNELS), C.byref(timestamp))
+         check_result(count, "视频 RX DMA")
+-        if count != VIDEO_DMA_SAMPLES:
+-            raise RuntimeError(f"视频 RX DMA 短读 · {count}/{VIDEO_DMA_SAMPLES} 点")
++        if count != samples:
++            raise RuntimeError(f"视频 RX DMA 短读 · {count}/{samples} 点")
+         return timestamp.value
+ 
+     def video_write(self, data, timestamp):
+-        count = self.sdk.write_samples_multiport(self.handle, self._video_buffers(data), VIDEO_DMA_SAMPLES,
++        samples = data.shape[1]
++        count = self.sdk.write_samples_multiport(self.handle, self._video_buffers(data), samples,
+                                                  channel_mask(VIDEO_CHANNELS), timestamp, 0)
+         check_result(count, "视频 TX DMA")
+-        if count != VIDEO_DMA_SAMPLES:
+-            raise RuntimeError(f"视频 TX DMA 短写 · {count}/{VIDEO_DMA_SAMPLES} 点")
++        if count != samples:
++            raise RuntimeError(f"视频 TX DMA 短写 · {count}/{samples} 点")
+ 
+     def close(self):
+         if not self.handle:
+diff --git a/yunsdr_studio/session.py b/yunsdr_studio/session.py
+--- a/yunsdr_studio/session.py
++++ b/yunsdr_studio/session.py
+@@ -236,16 +236,14 @@
+         self._require_idle()
+         return self._require_device().telemetry()
+ 
+-    def _do_apply_video_rate(self, group):
++    def _do_apply_video_rate(self, group, sample_rate):
+         self._require_idle()
+         device = self._require_device()
+         if self.status.tx_active or isinstance(device, DemoDevice):
+             raise RuntimeError("请连接 PCIe 设备并停止当前发射")
+-        device.apply_video_rate()
+-        if self.waveform_rate != device.read_settings(0).sample_rate:
+-            self.waveform = self.initial_waveform = None
+-            self.waveform_channels = None
+-        return device.read_settings(group)
++        actual = device.apply_video_rate(sample_rate)
++        self._invalidate_waveform_for_rate(actual.sample_rate)
++        return actual if group == 0 else device.read_settings(group)
+ 
+     def _do_run_air_video(self, options):
+         self._require_idle()
+diff --git a/yunsdr_studio/iq.py b/yunsdr_studio/iq.py
+--- a/yunsdr_studio/iq.py
++++ b/yunsdr_studio/iq.py
+@@ -283,7 +283,7 @@
+     if isinstance(digital, OpenIsacConfig):
+         try:
+             digital.validate_capture(frame.channels, frame.sample_rate, frame.samples)
+-            result = receive_openisac(complex_iq(frame.iq), digital, csi=digital.ports in (1, 8),
++            result = receive_openisac(complex_iq(frame.iq), digital, csi=True,
+                                       sample_rate=frame.sample_rate)
+         except (ValueError, RuntimeError) as exc:
+             return replace(measure(frame, fft_points), digital_standard="OpenISAC", demod_error=str(exc))
+diff --git a/yunsdr_studio/widgets.py b/yunsdr_studio/widgets.py
+--- a/yunsdr_studio/widgets.py
++++ b/yunsdr_studio/widgets.py
+@@ -3,8 +3,10 @@
+ from PySide6.QtCore import Signal, Qt
+ from PySide6.QtGui import QColor, QFont
+ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDoubleSpinBox, QFrame, QGridLayout,
+-                               QHeaderView, QHBoxLayout, QLabel, QPushButton, QSpinBox, QStackedWidget,
++                               QHeaderView, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSpinBox, QStackedWidget,
+                                QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
++
++from .openisac import csi_frequency_response
+ 
+ PALETTE = ("#52d6e6", "#f5bd67", "#9db9ff", "#e783b6", "#94e2a5", "#dcacf7", "#ed8f80", "#dbde7d")
+ PLOT_BG = "#11283c"
+@@ -149,15 +151,19 @@
+         return tuple(index for index, box in enumerate(self.boxes) if box.isChecked())
+ 
+ 
+-def plot_card(title, x_label, y_label, *, compact=False, control=None):
++def plot_card(title, x_label, y_label, *, compact=False, control=None, constrain_caption=False):
+     outer, layout = card(0)
+     layout.setSpacing(0)
+     top = QHBoxLayout()
+     top.setContentsMargins(13, 8, 13, 8)
+     top.addWidget(label(title, "section"))
+-    top.addStretch()
+     caption = label("", "muted")
+-    top.addWidget(caption)
++    if constrain_caption:
++        caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
++        top.addWidget(caption, 1)
++    else:
++        top.addStretch()
++        top.addWidget(caption)
+     if control is not None:
+         top.addWidget(control)
+     layout.addLayout(top)
+@@ -191,18 +197,19 @@
+ class Measurements(QWidget):
+     BASE_COLUMNS = ["通道", "峰值频率", "峰值幅度", "相对相位", "有效样点"]
+ 
+-    def __init__(self, spectrum_title="实时频谱"):
++    def __init__(self, spectrum_title="实时频谱", *, channel_panel=False):
+         super().__init__()
+         layout = QVBoxLayout(self)
+         layout.setContentsMargins(0, 0, 0, 0)
+         layout.setSpacing(12)
+ 
+-        spectrum_card, self.spectrum, self.spectrum_caption = plot_card(spectrum_title, "RF 频率 (MHz)", "dBFS")
+-        self.spectrum_caption.setWordWrap(True)
++        spectrum_card, self.spectrum, self.spectrum_caption = plot_card(
++            spectrum_title, "RF 频率 (MHz)", "dBFS", constrain_caption=channel_panel)
++        self.spectrum_caption.setWordWrap(not channel_panel)
+         self.spectrum_caption.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+         self.spectrum.setYRange(-120, 6, padding=0)
+         self.spectrum.getAxis("left").setTickSpacing(20, 10)
+-        self.spectrum.setMinimumHeight(165)
++        self.spectrum.setMinimumHeight(126 if channel_panel else 165)
+         self.curves = {}
+         self.marker = pg.ScatterPlotItem(size=7, brush=PALETTE[0], pen=None)
+         self.spectrum.addItem(self.marker)
+@@ -215,10 +222,6 @@
+         self.last_time_scale = None
+         self.last_iq_view = None
+         self.time_measurement = None
+-        layout.addWidget(spectrum_card, 5)
+-
+-        charts = QHBoxLayout()
+-        charts.setSpacing(12)
+         self.time_scope = QComboBox()
+         self.time_scope.setAccessibleName("时域显示范围")
+         self.time_scope.addItems(("信号细节", "整块概览"))
+@@ -237,12 +240,12 @@
+         self.time.setYRange(-1.05, 1.05, padding=0)
+         self.i_plot = self.time.plot(pen=pg.mkPen(PALETTE[0], width=1))
+         self.q_plot = self.time.plot(pen=pg.mkPen(PALETTE[2], width=1))
+-        charts.addWidget(time_card, 1)
+         self.iq_channel = QComboBox()
+         self.iq_channel.setAccessibleName("IQ 散点通道")
+         self.iq_channel.currentIndexChanged.connect(self._show_iq)
+         iq_card, self.iq_plot, self.iq_caption = plot_card("IQ 散点", "I / FS", "Q / FS",
+-                                                          control=self.iq_channel, compact=True)
++                                                          control=self.iq_channel, compact=not channel_panel)
++        self.iq_plot.setMinimumHeight(126 if channel_panel else 0)
+         self.scatter_equalized = False
+         self.iq_plot.setAspectLocked(True)
+         self.iq_plot.setYRange(-1.05, 1.05, padding=0)
+@@ -254,8 +257,37 @@
+         trace_card, self.analysis_plot, self.analysis_caption = plot_card("分析结果", "", "", compact=True)
+         self.analysis_curve = self.analysis_plot.plot(pen=pg.mkPen(PALETTE[0], width=2))
+         self.analysis_views.addWidget(trace_card)
+-        charts.addWidget(self.analysis_views, 1)
+-        layout.addLayout(charts, 3)
++        self.channel_plot = None
++        if channel_panel:
++            self.channel_picker = QComboBox()
++            self.channel_picker.setAccessibleName("信道估计接收通道")
++            self.channel_picker.currentIndexChanged.connect(self._show_channel_response)
++            self.channel_picker.hide()
++            channel_card, self.channel_plot, self.channel_caption = plot_card(
++                "信道估计", "基带频率 (MHz)", "|H| (dB)", control=self.channel_picker)
++            self.channel_plot.setMinimumHeight(126)
++            self.channel_caption.setText("等待 OpenISAC 帧")
++            self.channel_legend = self.channel_plot.addLegend(offset=(-7, 7), colCount=2, labelTextSize="8pt")
++            self.channel_curves = {}
++            self.channel_rate = None
++
++            charts = QGridLayout()
++            charts.setSpacing(12)
++            charts.addWidget(spectrum_card, 0, 0)
++            charts.addWidget(channel_card, 0, 1)
++            charts.addWidget(time_card, 1, 0)
++            charts.addWidget(self.analysis_views, 1, 1)
++            for index in range(2):
++                charts.setRowStretch(index, 1)
++                charts.setColumnStretch(index, 1)
++            layout.addLayout(charts, 1)
++        else:
++            charts = QHBoxLayout()
++            charts.setSpacing(12)
++            charts.addWidget(time_card, 1)
++            charts.addWidget(self.analysis_views, 1)
++            layout.addWidget(spectrum_card, 5)
++            layout.addLayout(charts, 3)
+ 
+         self.mimo_card, mimo_layout = card()
+         mimo_header = QHBoxLayout()
+@@ -323,8 +355,11 @@
+         self.mimo_card.hide()
+         self.table_caption.setText("等待接收")
+         self.spectrum_caption.clear()
++        self.spectrum_caption.setToolTip("")
+         self.iq_caption.clear()
+         self.time_caption.clear()
++        if self.channel_plot is not None:
++            self._show_channel_response()
+ 
+     def show_measurement(self, result):
+         colours = [PALETTE[channel % len(PALETTE)] for channel in result.channels]
+@@ -332,8 +367,11 @@
+             f"<span style='color:{color}'>●</span> CH {channel}"
+             for channel, color in zip(result.channels, colours))
+         count = result.spectrum.shape[1]
+-        self.spectrum_caption.setText(f"{result.spectrum_region} · FFT {count:,} 点&nbsp;&nbsp; {channels}")
+-        self.spectrum_caption.setToolTip(f"FFT 输入样点 {result.spectrum_start:,}–{result.spectrum_start+count-1:,}（从 0 计）")
++        header = f"{result.spectrum_region} · FFT {count:,} 点"
++        lines = f"{len(result.channels)} 路" if self.channel_plot is not None and len(result.channels) > 4 else channels
++        self.spectrum_caption.setText(f"{header}&nbsp;&nbsp; {lines}")
++        self.spectrum_caption.setToolTip(
++            f"{header}<br>FFT 输入样点 {result.spectrum_start:,}–{result.spectrum_start+count-1:,}（从 0 计）<br>{channels}")
+         plotted = set(result.channels)
+         for channel, curve in self.curves.items():
+             curve.setVisible(channel in plotted)
+@@ -365,6 +403,8 @@
+         self._show_mimo(result)
+         self._show_iq()
+         self._show_analysis_trace(result)
++        if self.channel_plot is not None:
++            self._show_channel_response()
+         standard = f"{result.digital_standard} · " if result.digital_standard else ""
+         self.table_caption.setText(f"{result.source} · {standard}时间戳 {result.timestamp}")
+         columns = self.BASE_COLUMNS.copy()
+@@ -482,6 +522,42 @@
+             self.analysis_curve.clear()
+             self.analysis_caption.setText(result.trace_error)
+ 
++    def _show_channel_response(self, *_):
++        measurement = self.time_measurement
++        frame = measurement.openisac if measurement is not None else None
++        if frame is None or frame.csi is None:
++            self._plot_choices(self.channel_picker, [], None)
++            self.channel_plot.clear()
++            self.channel_legend.hide()
++            self.channel_curves.clear()
++            self.channel_rate = None
++            self.channel_caption.setText("等待 OpenISAC 帧" if measurement is None else "当前块无 OpenISAC CSI")
++            return
++
++        channels = measurement.channels
++        choices = [(f"RX CH {channel}", channel) for channel in channels]
++        if len(channels) == 2:
++            choices.insert(0, ("全部 RX", "all"))
++        self._plot_choices(self.channel_picker, choices, choices[0][1])
++        selected = self.channel_picker.currentData()
++        links = [(channel, port) for channel in channels if selected in ("all", channel)
++                 for port in range(frame.csi.shape[1])]
++        if tuple(links) != tuple(self.channel_curves):
++            self.channel_plot.clear()
++            self.channel_curves = {
++                (channel, port): self.channel_plot.plot(pen=pg.mkPen(PALETTE[index], width=1),
++                                                       name=f"TX {port} → RX {channel}")
++                for index, (channel, port) in enumerate(links)
++            }
++        self.channel_legend.show()
++        frequency, magnitude = csi_frequency_response(frame.csi, frame.sample_rate)
++        for (channel, port), curve in self.channel_curves.items():
++            curve.setData(frequency, magnitude[channels.index(channel), port], connect="finite")
++        if self.channel_rate != frame.sample_rate:
++            self.channel_plot.setXRange(frequency[0], frequency[-1], padding=.02)
++            self.channel_rate = frame.sample_rate
++        self.channel_caption.setText(f"显示 {len(links)} / {frame.csi.shape[0]*frame.csi.shape[1]} 路")
++
+     def _show_mimo(self, result):
+         measurement = result.mimo
+         self.mimo_card.setVisible(measurement is not None)
+diff --git a/yunsdr_studio/window.py b/yunsdr_studio/window.py
+--- a/yunsdr_studio/window.py
++++ b/yunsdr_studio/window.py
+@@ -622,11 +622,11 @@
+         self.record_status.setWordWrap(True)
+         left.addWidget(self.record_status)
+         left.addStretch()
+-        self.rx_view = Measurements()
++        self.rx_view = Measurements(channel_panel=True)
+         self.rx_results = DemodulationResults(self)
+         self.rx_output = QTabWidget()
+         self.rx_output.setDocumentMode(True)
+-        self.rx_output.addTab(self.rx_view, "频谱与星座")
++        self.rx_output.addTab(self.rx_view, "信号预览")
+         self.rx_output.addTab(self.rx_results, "解调结果")
+         return two_columns(options, self.rx_output)
+ 

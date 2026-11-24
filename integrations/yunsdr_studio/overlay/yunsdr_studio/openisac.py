@@ -28,6 +28,15 @@ _float_ptr = C.POINTER(C.c_float)
 _u32_ptr = C.POINTER(C.c_uint32)
 
 
+def csi_frequency_response(csi, sample_rate):
+    """Return the occupied baseband bins and RX-by-TX channel magnitude in dB."""
+    half = DEFAULT_CARRIERS//2
+    bins = np.arange(-half, half+1)
+    magnitude = 20*np.log10(np.maximum(np.abs(csi[..., bins]), 1e-8))
+    magnitude[..., half] = np.nan  # DC is unused.
+    return bins*sample_rate/(FFT*1e6), magnitude
+
+
 @dataclass(frozen=True)
 class OpenIsacConfig:
     ports: int = 2

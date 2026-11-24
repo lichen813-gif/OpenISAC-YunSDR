@@ -16,6 +16,7 @@ from .openisac_video import DATAGRAM
 WIDTH, HEIGHT, FPS = 640, 360, 25
 VIDEO_CLOCK = Fraction(1, FPS)
 LIVE_RATES = (1_000_000, 1_500_000, 2_000_000)
+ROBUST_LIVE_RATES = (500_000, 750_000)
 PROFILE = OpenIsacConfig(2, True, 64)
 HEADER = Struct("!4sIIHHHBQ")
 PAYLOAD = DATAGRAM - HEADER.size
@@ -66,9 +67,28 @@ class LiveStats:
         self.display_ms = deque(maxlen=30_000)
         self.phy_queue = self.phy_queue_peak = 0
         self.air_packets = self.air_dropped = self.iq_gaps = self.iq_dropped = 0
+        self.phy_candidates = self.phy_rejected = 0
+        self.phy_snapshot = None
+        self.next_phy_sample = 0.0
         self.remote_lost = 0
         self.remote_stream = None
         self.remote_sequence = None
+
+    def claim_phy_sample(self):
+        now = perf_counter()
+        with self.lock:
+            if now < self.next_phy_sample:
+                return False
+            self.next_phy_sample = now+.25
+            return True
+
+    def publish_phy_sample(self, result):
+        with self.lock:
+            self.phy_snapshot = result
+
+    def latest_phy_sample(self):
+        with self.lock:
+            return self.phy_snapshot
 
     def send(self, seq, payload_size):
         now = perf_counter_ns()
@@ -125,6 +145,7 @@ class LiveStats:
                           self.sent-self.received if self.role in ("loop", "rf") else None,
                           invalid=self.invalid, recovered_bytes=self.recovered_bytes, air_packets=self.air_packets,
                           air_dropped=self.air_dropped, iq_gaps=self.iq_gaps, iq_dropped=self.iq_dropped,
+                          phy_candidates=self.phy_candidates, phy_rejected=self.phy_rejected,
                           in_flight=len(self.expected), in_flight_peak=self.in_flight_peak,
                           offered_mbps=self.sent*DATAGRAM*8/max(duration, 1e-6)/1e6,
                           video_packets=self.video_packets, keepalives=self.keepalives,

@@ -1,0 +1,4 @@
+sample_rate_hz,channel_count,dma_points,modulation,pilot,target_bps,seconds,sent,received,lost,iq_gaps,iq_dropped,phy_rejected,decoded,displayed,display_p95_ms
+61440000,2,122880,64-QAM,front-loaded DM-RS,1000000,30.131,2845,2845,0,0,0,0,750,749,263.44
+61440000,2,122880,64-QAM,front-loaded DM-RS,1500000,30.127,4273,4273,0,0,0,0,750,749,267.36
+61440000,2,122880,64-QAM,front-loaded DM-RS,2000000,30.146,5646,5646,0,0,0,0,750,747,271.36

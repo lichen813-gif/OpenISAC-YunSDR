@@ -1,5 +1,6 @@
 """OpenISAC sensing, burst playback and real-time video panels."""
 
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty, SimpleQueue
@@ -8,20 +9,21 @@ from time import perf_counter, perf_counter_ns
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QRectF, Qt, QTimer, QUrl
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QEvent, QRect, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QImage, QPainter
 from PySide6.QtMultimedia import (QAudioOutput, QCamera, QMediaCaptureSession, QMediaDevices, QMediaPlayer,
-                                  QVideoFrame, QVideoSink)
+                                  QVideoSink)
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLineEdit, QProgressBar,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout, QHBoxLayout, QLineEdit, QProgressBar,
                                QSlider, QStackedWidget, QTabWidget, QVBoxLayout, QWidget)
 
+from .device import VIDEO_SAMPLE_RATES
 from .iq import complex_iq
-from .openisac import DEFAULT_CARRIERS, RATE, TOPOLOGIES, OpenIsacConfig, sense_openisac, sensing_demo
-from .openisac_air import run_live_video
-from .openisac_live import HEIGHT, LIVE_RATES, WIDTH, LatestFrame, LiveStats
+from .openisac import DEFAULT_CARRIERS, FFT, RATE, TOPOLOGIES, OpenIsacConfig, sense_openisac, sensing_demo
+from .openisac_air import run_live_video, video_rates
+from .openisac_live import HEIGHT, LIVE_RATES, PROFILE, WIDTH, LatestFrame, LiveStats
 from .openisac_video import video_loopback
-from .widgets import button, card, field, float_box, label, plot_card
+from .widgets import PALETTE, button, card, field, float_box, label, plot_card
 
 
 def _choice(items):
@@ -29,6 +31,79 @@ def _choice(items):
     for name, value in items:
         result.addItem(name, value)
     return result
+
+
+class LiveVideoScreen(QWidget):
+    frame_changed = Signal(QImage)
+
+    def __init__(self):
+        super().__init__()
+        self.image = QImage()
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+
+    def set_frame(self, image):
+        self.image = image
+        self.update()
+        self.frame_changed.emit(image)
+
+    def paintEvent(self, _):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.GlobalColor.black)
+        if not self.image.isNull():
+            size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+            target = QRect(0, 0, size.width(), size.height())
+            target.moveCenter(self.rect().center())
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.drawImage(target, self.image)
+
+
+class LiveMonitorGrid(QGridLayout):
+    def __init__(self):
+        super().__init__()
+        self.setSpacing(10)
+        for index in range(2):
+            self.setRowStretch(index, 1)
+            self.setColumnStretch(index, 1)
+        self.panels = {}
+        self.dialog = None
+
+    def add_panel(self, panel, surface, row, column):
+        self.addWidget(panel, row, column)
+        for widget in (panel, surface):
+            self.panels[widget] = (panel, row, column)
+            widget.setToolTip("双击切换全屏，Esc 返回")
+            widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if (event.type() == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton
+                and watched in self.panels):
+            if self.dialog is None:
+                self._open_fullscreen(*self.panels[watched])
+            else:
+                self.dialog.reject()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _open_fullscreen(self, panel, row, column):
+        dialog = QDialog(self.parentWidget())
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(button("退出全屏 (Esc)", dialog.reject), alignment=Qt.AlignmentFlag.AlignRight)
+        self.removeWidget(panel)
+        layout.addWidget(panel, 1)
+        panel.show()
+        self.dialog = dialog
+
+        def restore(_):
+            layout.removeWidget(panel)
+            self.addWidget(panel, row, column)
+            panel.show()
+            self.dialog = None
+            dialog.deleteLater()
+
+        dialog.finished.connect(restore)
+        dialog.showFullScreen()
 
 
 class OpenIsacLab:
@@ -156,11 +231,18 @@ class OpenIsacLab:
         self.live_mode = _choice([("本机仿真回环", "loop"), ("本机射频回环", "rf"),
                                   ("设备发送", "tx"), ("设备接收", "rx")])
         layout.addWidget(field("连接方式", self.live_mode))
+        self.live_iq_rate = _choice([(f"{rate/1e6:g} MSa/s", rate) for rate in VIDEO_SAMPLE_RATES])
+        layout.addWidget(field("视频 IQ 采样率", self.live_iq_rate))
         self.live_radio_hint = label("两端设为 15.36 MSa/s · CH 0 / CH 1\n发送端 TX LO 与接收端 RX LO 设为相同频率", "muted")
         self.live_radio_hint.setWordWrap(True)
         self.live_apply_rate = button("应用视频采样率", self._apply_live_rate)
         layout.addWidget(self.live_radio_hint)
         layout.addWidget(self.live_apply_rate)
+        self.live_modulation = _choice([("QPSK", 4), ("16-QAM", 16), ("64-QAM", 64), ("256-QAM", 256)])
+        self.live_modulation.setCurrentIndex(self.live_modulation.findData(PROFILE.order))
+        self.live_pilot = _choice([("FDM", False), ("前置 DM-RS", True)])
+        layout.addWidget(field("调制 · 2×2 STBC", self.live_modulation))
+        layout.addWidget(field("导频", self.live_pilot))
         self.live_input = _choice([("本地视频", "file"), ("摄像头", "camera")])
         self.live_input_field = field("输入", self.live_input)
         layout.addWidget(self.live_input_field)
@@ -193,6 +275,9 @@ class OpenIsacLab:
         layout.addStretch()
         self.camera_device.videoInputsChanged.connect(self._refresh_cameras)
         self.live_mode.currentIndexChanged.connect(self._live_controls)
+        self.live_modulation.currentIndexChanged.connect(self._live_controls)
+        self.live_pilot.currentIndexChanged.connect(self._live_controls)
+        self.live_iq_rate.currentIndexChanged.connect(self._live_controls)
         self._refresh_cameras()
         self._live_controls()
 
@@ -203,9 +288,39 @@ class OpenIsacLab:
                                  "section")
         self.live_status.setWordWrap(True)
         view.addWidget(self.live_status)
-        self.live_screen = QVideoWidget()
-        self.live_screen.setStyleSheet("background:#10263a")
-        view.addWidget(self.live_screen, 1)
+        self.live_monitors = LiveMonitorGrid()
+        video, video_layout = card(0)
+        video_title = label("视频画面", "section")
+        video_title.setContentsMargins(13, 8, 13, 8)
+        video_layout.setSpacing(0)
+        video_layout.addWidget(video_title)
+        self.live_screen = LiveVideoScreen()
+        video_layout.addWidget(self.live_screen, 1)
+        evm_card, evm_history, self.live_evm_caption = plot_card("EVM 趋势", "接收时间 (s)", "RMS EVM (%)")
+        self.live_evm_curve = evm_history.plot(pen=pg.mkPen(PALETTE[0], width=2))
+        self.live_evm_history = deque(maxlen=120)
+
+        constellation_card, constellation, self.live_constellation_caption = plot_card("接收星座", "I", "Q")
+        constellation.setAspectLocked(True)
+        constellation.setRange(xRange=(-1.5, 1.5), yRange=(-1.5, 1.5), padding=0)
+        self.live_scatter = pg.ScatterPlotItem(size=4, brush=pg.mkBrush(82, 214, 230, 145), pen=None)
+        constellation.addItem(self.live_scatter)
+        channel_card, channel, self.live_csi_caption = plot_card("信道估计", "基带频率 (MHz)", "|H| (dB)")
+        self.live_channel_legend = channel.addLegend(offset=(7, 5), colCount=2, labelTextSize="8pt")
+        self.live_channel_traces = tuple(channel.plot(pen=pg.mkPen(PALETTE[2*rx+tx], width=1),
+                                                      name=f"RX{rx}←TX{tx}")
+                                         for rx in range(2) for tx in range(2))
+        half = DEFAULT_CARRIERS//2
+        self.live_csi_bins = np.arange(-half, half+1)
+        self.live_csi_plot = channel
+        self._set_live_csi_rate(RATE)
+        for surface in (self.live_screen, constellation, evm_history, channel):
+            surface.setMinimumHeight(130)
+        self.live_monitors.add_panel(video, self.live_screen, 0, 0)
+        self.live_monitors.add_panel(constellation_card, constellation.viewport(), 0, 1)
+        self.live_monitors.add_panel(evm_card, evm_history.viewport(), 1, 0)
+        self.live_monitors.add_panel(channel_card, channel.viewport(), 1, 1)
+        view.addLayout(self.live_monitors, 1)
         self.live_counters = label("", "muted")
         self.live_counters.setWordWrap(True)
         view.addWidget(self.live_counters)
@@ -226,18 +341,38 @@ class OpenIsacLab:
         self.live_loop.setVisible(sending and self.live_input.currentData() == "file")
         self.live_snr_field.setVisible(mode == "loop")
         self.live_radio_hint.setVisible(mode != "loop")
+        iq_rate = self.live_iq_rate.currentText()
         self.live_radio_hint.setText(
-            "15.36 MSa/s · CH 0 / CH 1\nTX LO 与 RX LO 相同\n"
+            f"{iq_rate} · CH 0 / CH 1\nTX LO 与 RX LO 相同\n"
             "两路 TX 各经匹配衰减器接到对应 RX" if mode == "rf" else
-            "两端 15.36 MSa/s · CH 0 / CH 1\n两端的 TX LO 与 RX LO 对准")
+            f"两端 {iq_rate} · CH 0 / CH 1\n两端的 TX LO 与 RX LO 对准")
         self.live_apply_rate.setVisible(mode != "loop")
         self.live_start.setText({"loop": "开始仿真回环", "rf": "开始射频回环",
                                  "tx": "开始设备发送", "rx": "开始设备接收"}[mode])
+        try:
+            rates = video_rates(self._live_profile(), self.live_iq_rate.currentData())
+        except (RuntimeError, OSError):
+            rates = LIVE_RATES
+        prior = self.live_rate.currentData() or LIVE_RATES[0]
+        if rates != tuple(self.live_rate.itemData(i) for i in range(self.live_rate.count())):
+            self.live_rate.clear()
+            for rate in rates:
+                self.live_rate.addItem(f"{rate/1e6:g} Mbit/s", rate)
+            valid = max((rate for rate in rates if rate <= prior), default=rates[0])
+            self.live_rate.setCurrentIndex(self.live_rate.findData(valid))
+
+    def _live_profile(self):
+        return OpenIsacConfig(2, True, self.live_modulation.currentData(), self.live_pilot.currentData())
+
+    def _live_phy_text(self):
+        return (f"2×2 STBC · {self.live_modulation.currentText()}／{self.live_pilot.currentText()} · "
+                f"{DEFAULT_CARRIERS} 载波 · {self.live_iq_rate.currentText()}")
 
     def _apply_live_rate(self):
         window = self.window
         group = window.rf_group.currentData()
-        window._submit("apply_video_rate", group, callback=lambda settings: window._read_back(group, settings),
+        window._submit("apply_video_rate", group, self.live_iq_rate.currentData(),
+                       callback=lambda settings: window._read_back(group, settings),
                        error_callback=lambda error: self.live_status.setText(str(error)))
 
     def _refresh_cameras(self):
@@ -267,8 +402,8 @@ class OpenIsacLab:
             if info is None or info.connection.transport not in ("pcies", "pciex"):
                 self.live_status.setText("请先在设备设置中连接本机的 PCIe YunSDR")
                 return
-            if self.window.settings.sample_rate != RATE:
-                self.live_status.setText("请先应用视频采样率 15.36 MSa/s")
+            if self.window.settings.sample_rate != self.live_iq_rate.currentData():
+                self.live_status.setText(f"请先应用视频采样率 {self.live_iq_rate.currentText()}")
                 return
         if role == "rx":
             self.start_live(role=role)
@@ -290,22 +425,35 @@ class OpenIsacLab:
         self.live_mode.setCurrentIndex(self.live_mode.findData(role))
         self.video_modes.setCurrentIndex(self.live_tab)
         self.pages.setCurrentIndex(self.live_page)
-        self.live_screen.videoSink().setVideoFrame(QVideoFrame())
+        self.live_screen.set_frame(QImage())
         if self.player is not None:
             self.player.stop()
         self.live_stats = LiveStats(role)
+        sample_rate = self.live_iq_rate.currentData()
+        self._set_live_csi_rate(sample_rate)
+        self.live_phy_displayed = None
+        self.live_scatter.clear()
+        self.live_evm_history.clear()
+        self.live_evm_curve.clear()
+        self.live_evm_caption.setText("等待有效 PHY 帧" if role != "tx" else "接收端显示")
+        self.live_evm_caption.setToolTip("")
+        self.live_constellation_caption.clear()
+        self.live_csi_caption.clear()
+        for trace in self.live_channel_traces:
+            trace.clear()
         self.live_output = LatestFrame()
         self.live_camera = LatestFrame() if device is not None else camera_feed
         self.live_cancel.clear()
         self.live_start.setEnabled(False)
         for control in (self.live_mode, self.live_apply_rate, self.live_input_field, self.live_inputs,
-                        self.live_loop, self.live_rate_field, self.live_snr_field):
+                        self.live_loop, self.live_rate_field, self.live_snr_field,
+                        self.live_modulation, self.live_pilot, self.live_iq_rate):
             control.setEnabled(False)
         self.live_stop.setEnabled(True)
         self.next_live_status = 0
         self.live_failure = ""
         self.live_counters.clear()
-        self.live_status.setText("正在启动 · 2×2 STBC · 64-QAM／FDM")
+        self.live_status.setText(f"正在启动 · {self._live_phy_text()}")
         rate, snr = self.live_rate.currentData(), self.live_snr.value()
         if device is not None:
             self.camera = QCamera(device, self.live_screen)
@@ -316,7 +464,8 @@ class OpenIsacLab:
             self.capture.setCamera(self.camera)
             self.capture.setVideoSink(self.camera_sink)
         options = dict(source=source, camera=self.live_camera, output=self.live_output, stats=self.live_stats,
-                       cancel=self.live_cancel, wire_rate=rate, loop=loop)
+                       cancel=self.live_cancel, wire_rate=rate, loop=loop, profile=self._live_profile(),
+                       sample_rate=sample_rate)
         if role == "loop":
             self.live_future = self.executor.submit(run_live_video, **options, snr=snr)
         else:
@@ -366,12 +515,13 @@ class OpenIsacLab:
             rgb, stamp = sample
             h, w = rgb.shape[:2]
             image = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
-            self.live_screen.videoSink().setVideoFrame(QVideoFrame(image))
+            self.live_screen.set_frame(image)
             self.live_stats.show(stamp)
         active = not self.live_future.done()
         if active and perf_counter() < self.next_live_status:
             return
         self.next_live_status = perf_counter()+.25
+        self._show_live_phy(self.live_stats.latest_phy_sample())
         stats = self.live_stats.snapshot(detail=not active)
         wire = stats["offered_mbps"]
         drops = str(stats["lost"]) if not active else "待排空"
@@ -400,8 +550,10 @@ class OpenIsacLab:
                         f"编码队列 {stats['source_queue']}/{stats['source_queue_peak']} · 在途 {stats['in_flight']} · "
                         f"显示 {stats['displayed']:,} 帧 · 编码 / 显示丢帧 {stats['encode_drop']} / {display_drop}{delay}")
             phase = ("实时接收" if stats["displayed"] else "等待首帧") if active else "回环结束"
+        if self.live_role in ("rx", "rf"):
+            counters += f" · PHY 拒绝 {stats['phy_rejected']:,}/{stats['phy_candidates']:,} 帧"
         self.live_counters.setText(counters)
-        self.live_status.setText(f"{phase} · 2×2 STBC · 64-QAM／FDM · {DEFAULT_CARRIERS} 载波")
+        self.live_status.setText(f"{phase} · {self._live_phy_text()}")
         if not active:
             self.live_timer.stop()
             self.stop_live()
@@ -414,10 +566,37 @@ class OpenIsacLab:
             self.live_future = None
             self.live_start.setEnabled(True)
             for control in (self.live_mode, self.live_apply_rate, self.live_input_field, self.live_inputs,
-                            self.live_loop, self.live_rate_field, self.live_snr_field):
+                            self.live_loop, self.live_rate_field, self.live_snr_field,
+                            self.live_modulation, self.live_pilot, self.live_iq_rate):
                 control.setEnabled(True)
             self.live_stop.setEnabled(False)
             self.window._update_state()
+
+    def _show_live_phy(self, sample):
+        if sample is None or sample is self.live_phy_displayed:
+            return
+        self.live_phy_displayed = sample
+        points = sample.payload_constellations[0]
+        self.live_scatter.setData(points.real, points.imag)
+        evm = sample.evm[0]
+        evm_db = 20*np.log10(max(evm/100, 1e-12))
+        self.live_evm_caption.setText(f"RMS EVM {evm:.2f}%（{evm_db:.1f} dB）")
+        now = perf_counter()
+        self.live_evm_history.append((now-(self.live_stats.started or now), evm))
+        elapsed, errors = zip(*self.live_evm_history)
+        self.live_evm_curve.setData(elapsed, errors)
+        self.live_evm_caption.setToolTip(f"物理层帧 {sample.sequence:,} · {len(errors)} 个样点")
+        self.live_constellation_caption.setText(f"STBC 数据流 · {points.size:,} 点")
+        csi = sample.csi[..., self.live_csi_bins]
+        amplitudes = 20*np.log10(np.maximum(np.abs(csi), 1e-8))
+        amplitudes[..., DEFAULT_CARRIERS//2] = np.nan
+        for trace, values in zip(self.live_channel_traces, amplitudes.reshape(4, -1)):
+            trace.setData(self.live_csi_frequency, values, connect="finite")
+        self.live_csi_caption.setText(f"2×2 CSI · {DEFAULT_CARRIERS} 载波")
+
+    def _set_live_csi_rate(self, sample_rate):
+        self.live_csi_frequency = self.live_csi_bins*sample_rate/(FFT*1e6)
+        self.live_csi_plot.setXRange(self.live_csi_frequency[0], self.live_csi_frequency[-1], padding=.02)
 
     def config(self):
         return OpenIsacConfig.from_topology(self.topology.currentData(), self.modulation.currentData(),
