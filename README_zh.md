@@ -1,6 +1,6 @@
 # OpenISAC-YunSDR：搭建与使用说明
 
-[English](README.md) | [设计文档](docs/design/README.md) | [更新日志](CHANGELOG.md)
+[English](README.md) | [设计文档](docs/design/README.md) | [更新日志](CHANGELOG.md) | [v1.2.0 发布说明](RELEASE_NOTES_v1.2.0.md)
 
 本仓库当前版本包含完整的 C++/Python 程序源码、配置文件和中英文设计说明，不包含视频文件。
 

@@ -1,6 +1,6 @@
 # OpenISAC-YunSDR: build and usage guide
 
-[中文说明](README_zh.md) | [Design documents](docs/design/README.md) | [Changelog](CHANGELOG.md)
+[中文说明](README_zh.md) | [Design documents](docs/design/README.md) | [Changelog](CHANGELOG.md) | [v1.2.0 release notes](RELEASE_NOTES_v1.2.0.md)
 
 This repository contains the complete C++/Python source, configurations, and design documents for the current release. Video files are intentionally excluded.
 
